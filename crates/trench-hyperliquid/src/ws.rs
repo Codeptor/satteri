@@ -3,7 +3,7 @@
 //! The runtime is added alongside the wire decoder. This module already keeps
 //! its configuration constrained to the documented public connection budgets.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -32,7 +32,6 @@ const MAX_OUTPUT_CHANNEL_CAPACITY: usize = 4_096;
 const OFFICIAL_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 const WEBSOCKET_WRITE_BUFFER_BYTES: usize = 8 * 1024;
 const WEBSOCKET_MAX_WRITE_BUFFER_BYTES: usize = 16 * 1024;
-const MAX_TRADE_IDENTITIES: usize = 4_096;
 const MAX_L2_LEVELS_PER_SIDE: usize = 20;
 
 /// Validated, finite limits for one public market-data WebSocket connection.
@@ -349,7 +348,11 @@ impl WsClient {
 /// A bounded stream of normalized public market facts and control records.
 ///
 /// Dropping the stream or calling [`WsStream::cancel`] stops the single
-/// associated connection task. The receiver is bounded by [`WsLimits`].
+/// associated connection task. The receiver is bounded by [`WsLimits`]. Trade
+/// identities are retained exactly for the lifetime of this stream and never
+/// evicted, so memory grows with distinct accepted trades. A replacement
+/// stream needs durable downstream identity retention when continuity across
+/// stream lifetimes is required.
 pub struct WsStream {
     receiver: mpsc::Receiver<WsOutput>,
     cancellation: CancellationToken,
@@ -708,8 +711,7 @@ async fn run_client(
             }
         };
         state.record_reconnect_connection();
-        retry = 0;
-        match run_connection(
+        let connection = run_connection(
             socket,
             &config,
             &output,
@@ -717,8 +719,12 @@ async fn run_client(
             &mut state,
             &mut decoder,
         )
-        .await
-        {
+        .await;
+        if connection.healthy {
+            retry = 0;
+            backoff = ReconnectBackoff::new(random());
+        }
+        match connection.end {
             ConnectionEnd::Cancelled | ConnectionEnd::OutputClosed => return,
             end @ (ConnectionEnd::Closed
             | ConnectionEnd::ReadTimeout
@@ -830,7 +836,7 @@ async fn run_connection(
     cancellation: &CancellationToken,
     state: &mut StreamState,
     decoder: &mut Decoder,
-) -> ConnectionEnd {
+) -> ConnectionOutcome {
     let (mut sink, mut source) = socket.split();
     for market in config.markets() {
         for kind in ["l2Book", "trades", "bbo"] {
@@ -848,22 +854,25 @@ async fn run_connection(
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     tracing::warn!(error = %error, "public WebSocket subscription write failed");
-                    return ConnectionEnd::TransportError;
+                    return ConnectionOutcome::unhealthy(ConnectionEnd::TransportError);
                 }
                 Err(_) => {
                     tracing::warn!("public WebSocket subscription write timed out");
-                    return ConnectionEnd::TransportError;
+                    return ConnectionOutcome::unhealthy(ConnectionEnd::TransportError);
                 }
             }
         }
     }
 
     decoder.begin_connection();
+    let mut healthy = false;
     let mut heartbeat_due = Box::pin(tokio::time::sleep(config.limits.heartbeat_interval()));
     let mut read_deadline = Box::pin(tokio::time::sleep(config.limits.read_timeout()));
     loop {
         tokio::select! {
-            _ = cancellation.cancelled() => return ConnectionEnd::Cancelled,
+            _ = cancellation.cancelled() => {
+                return ConnectionOutcome { end: ConnectionEnd::Cancelled, healthy };
+            }
             _ = &mut heartbeat_due => {
                 match timeout(
                     config.limits.connect_timeout(),
@@ -874,28 +883,28 @@ async fn run_connection(
                     }
                     Ok(Err(error)) => {
                         tracing::warn!(error = %error, "public WebSocket heartbeat write failed");
-                        return ConnectionEnd::TransportError;
+                        return ConnectionOutcome { end: ConnectionEnd::TransportError, healthy };
                     }
                     Err(_) => {
                         tracing::warn!("public WebSocket heartbeat write timed out");
-                        return ConnectionEnd::TransportError;
+                        return ConnectionOutcome { end: ConnectionEnd::TransportError, healthy };
                     }
                 }
             }
             _ = &mut read_deadline => {
                 tracing::warn!("public WebSocket read deadline elapsed");
-                return ConnectionEnd::ReadTimeout;
+                return ConnectionOutcome { end: ConnectionEnd::ReadTimeout, healthy };
             }
             frame = source.next() => {
                 read_deadline.as_mut().reset(Instant::now() + config.limits.read_timeout());
                 let Some(frame) = frame else {
-                    return ConnectionEnd::Closed;
+                    return ConnectionOutcome { end: ConnectionEnd::Closed, healthy };
                 };
                 let frame = match frame {
                     Ok(frame) => frame,
                     Err(error) => {
                         tracing::warn!(error = %error, "public WebSocket transport failed");
-                        return ConnectionEnd::TransportError;
+                        return ConnectionOutcome { end: ConnectionEnd::TransportError, healthy };
                     }
                 };
                 match handle_frame(
@@ -907,9 +916,16 @@ async fn run_connection(
                     state,
                 ).await {
                     FrameOutcome::Continue => {}
-                    FrameOutcome::Closed => return ConnectionEnd::Closed,
-                    FrameOutcome::TransportError => return ConnectionEnd::TransportError,
-                    FrameOutcome::OutputClosed => return ConnectionEnd::OutputClosed,
+                    FrameOutcome::FreshL2 => healthy = true,
+                    FrameOutcome::Closed => {
+                        return ConnectionOutcome { end: ConnectionEnd::Closed, healthy };
+                    }
+                    FrameOutcome::TransportError => {
+                        return ConnectionOutcome { end: ConnectionEnd::TransportError, healthy };
+                    }
+                    FrameOutcome::OutputClosed => {
+                        return ConnectionOutcome { end: ConnectionEnd::OutputClosed, healthy };
+                    }
                 }
             }
         }
@@ -941,6 +957,12 @@ async fn handle_frame(
             }
             match decoder.decode(&frame, received_at) {
                 Ok(DecodedFrame::MarketEvents(events)) => {
+                    let received_fresh_l2 = events.iter().any(|event| {
+                        matches!(
+                            event.kind(),
+                            trench_core::event::MarketEventKind::BookSnapshot(_)
+                        )
+                    });
                     for event in events {
                         let gap = state.record_event(&event);
                         if output.send(WsOutput::MarketEvent(event)).await.is_err() {
@@ -952,7 +974,11 @@ async fn handle_frame(
                             return FrameOutcome::OutputClosed;
                         }
                     }
-                    FrameOutcome::Continue
+                    if received_fresh_l2 {
+                        FrameOutcome::FreshL2
+                    } else {
+                        FrameOutcome::Continue
+                    }
                 }
                 Ok(DecodedFrame::SubscriptionAck(ack)) => {
                     tracing::debug!(market = ack.market().as_str(), kind = ?ack.kind(), "public WebSocket subscription acknowledged");
@@ -1028,9 +1054,24 @@ enum ConnectionEnd {
     OutputClosed,
 }
 
+struct ConnectionOutcome {
+    end: ConnectionEnd,
+    healthy: bool,
+}
+
+impl ConnectionOutcome {
+    const fn unhealthy(end: ConnectionEnd) -> Self {
+        Self {
+            end,
+            healthy: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum FrameOutcome {
     Continue,
+    FreshL2,
     Closed,
     TransportError,
     OutputClosed,
@@ -1273,8 +1314,9 @@ impl SubscriptionAck {
 
 struct Decoder {
     markets: BTreeSet<Market>,
+    /// Exact identities retained for this stream's full lifetime so reconnect
+    /// replays cannot become duplicate market facts.
     trades: BTreeSet<TradeIdentity>,
-    trade_order: VecDeque<TradeIdentity>,
     last_book_times: BTreeMap<Market, TimestampNs>,
 }
 
@@ -1283,7 +1325,6 @@ impl Decoder {
         Self {
             markets: markets.into_iter().collect(),
             trades: BTreeSet::new(),
-            trade_order: VecDeque::new(),
             last_book_times: BTreeMap::new(),
         }
     }
@@ -1377,13 +1418,7 @@ impl Decoder {
                 .map_err(|_| DecodeError::InvalidDecimal)?;
             let event = MarketEvent::trade(event_time, received_at, market, trade)
                 .map_err(|_| DecodeError::InvalidTimestamp)?;
-            if self.trades.len() == MAX_TRADE_IDENTITIES
-                && let Some(expired) = self.trade_order.pop_front()
-            {
-                self.trades.remove(&expired);
-            }
-            self.trades.insert(identity.clone());
-            self.trade_order.push_back(identity);
+            self.trades.insert(identity);
             events.push(event);
         }
         Ok(DecodedFrame::MarketEvents(events))
@@ -1563,17 +1598,39 @@ fn validate_l2_side(levels: &[BookLevel], descending: bool) -> Result<(), Decode
 }
 
 fn decode_price(value: &str) -> Result<Price, DecodeError> {
-    Decimal::from_str(value)
-        .ok()
-        .and_then(|value| Price::new(value).ok())
-        .ok_or(DecodeError::InvalidDecimal)
+    Price::new(parse_plain_decimal(value)?).map_err(|_| DecodeError::InvalidDecimal)
 }
 
 fn decode_quantity(value: &str) -> Result<Quantity, DecodeError> {
-    Decimal::from_str(value)
-        .ok()
-        .and_then(|value| Quantity::new(value).ok())
-        .ok_or(DecodeError::InvalidDecimal)
+    Quantity::new(parse_plain_decimal(value)?).map_err(|_| DecodeError::InvalidDecimal)
+}
+
+fn parse_plain_decimal(value: &str) -> Result<Decimal, DecodeError> {
+    if !is_plain_decimal(value) {
+        return Err(DecodeError::InvalidDecimal);
+    }
+    Decimal::from_str(value).map_err(|_| DecodeError::InvalidDecimal)
+}
+
+fn is_plain_decimal(value: &str) -> bool {
+    let unsigned = match value.strip_prefix('-') {
+        Some(value) => value,
+        None => value,
+    };
+    let mut parts = unsigned.split('.');
+    let Some(integer) = parts.next() else {
+        return false;
+    };
+    if integer.is_empty() || !integer.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    match (parts.next(), parts.next()) {
+        (None, None) => true,
+        (Some(fraction), None) => {
+            !fraction.is_empty() && fraction.bytes().all(|byte| byte.is_ascii_digit())
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -1807,6 +1864,48 @@ mod tests {
     }
 
     #[test]
+    fn wire_decimals_require_plain_finite_base_ten_lexemes() {
+        for value in [
+            "1e-3",
+            "1E3",
+            "+1",
+            " 1",
+            "1 ",
+            "NaN",
+            "nan",
+            "Infinity",
+            "inf",
+            "-Infinity",
+            "-inf",
+            "",
+            ".",
+            "1.2.3",
+        ] {
+            assert_eq!(
+                super::decode_price(value),
+                Err(DecodeError::InvalidDecimal),
+                "price `{value}` must be rejected before decimal parsing"
+            );
+            assert_eq!(
+                super::decode_quantity(value),
+                Err(DecodeError::InvalidDecimal),
+                "quantity `{value}` must be rejected before decimal parsing"
+            );
+        }
+
+        for value in ["1", "1.0", "0.000001", "64120.5", "0.75"] {
+            assert!(
+                super::decode_price(value).is_ok(),
+                "plain exchange price `{value}` must be accepted"
+            );
+            assert!(
+                super::decode_quantity(value).is_ok(),
+                "plain exchange quantity `{value}` must be accepted"
+            );
+        }
+    }
+
+    #[test]
     fn decoder_rejects_timestamp_overflow_and_out_of_order_books() {
         let received_at =
             TimestampNs::new(i128::from(i64::MAX)).expect("maximum receipt timestamp is valid");
@@ -1929,6 +2028,52 @@ mod tests {
         };
         assert!(duplicates.is_empty());
         assert!(decoder.decode(&book, received_at).is_ok());
+    }
+
+    #[test]
+    fn decoder_never_reemits_a_trade_identity_past_the_legacy_cache_capacity() {
+        const LEGACY_CACHE_CAPACITY: usize = 4_096;
+
+        let received_at =
+            TimestampNs::new(i128::from(i64::MAX)).expect("maximum receipt timestamp is valid");
+        let mut decoder = Decoder::new([market("BTC")]);
+        let initial = json!({
+            "channel": "trades",
+            "data": (0..=LEGACY_CACHE_CAPACITY)
+                .map(|trade_id| json!({
+                    "coin": "BTC", "side": "B", "px": "1", "sz": "1",
+                    "time": 1_700_000_000_000_i64, "tid": trade_id
+                }))
+                .collect::<Vec<_>>(),
+        })
+        .to_string();
+        let DecodedFrame::MarketEvents(events) = decoder
+            .decode(&initial, received_at)
+            .expect("unique trade identities must decode")
+        else {
+            panic!("trade frame must produce normalized market events");
+        };
+        assert_eq!(events.len(), LEGACY_CACHE_CAPACITY + 1);
+
+        decoder.begin_connection();
+        let replay = json!({
+            "channel": "trades",
+            "data": [{
+                "coin": "BTC", "side": "B", "px": "1", "sz": "1",
+                "time": 1_700_000_000_000_i64, "tid": 0
+            }]
+        })
+        .to_string();
+        let DecodedFrame::MarketEvents(events) = decoder
+            .decode(&replay, received_at)
+            .expect("a replayed trade remains a valid wire frame")
+        else {
+            panic!("trade frame must remain a market frame");
+        };
+        assert!(
+            events.is_empty(),
+            "a trade identity cannot be re-emitted after reconnect"
+        );
     }
 
     #[test]
@@ -2210,6 +2355,178 @@ mod tests {
                 .is_none()
         );
         server.await.expect("server task must complete");
+    }
+
+    #[tokio::test]
+    async fn acknowledged_connections_without_l2_exhaust_the_reconnect_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback WebSocket server");
+        let endpoint = format!(
+            "ws://{}",
+            listener
+                .local_addr()
+                .expect("loopback address is available")
+        );
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (socket, _) = listener.accept().await.expect("accept reconnect");
+                let mut socket = accept_async(socket)
+                    .await
+                    .expect("accept WebSocket handshake");
+                for kind in ["l2Book", "trades", "bbo"] {
+                    let Some(Ok(Message::Text(subscription))) = socket.next().await else {
+                        panic!("client must send every intended subscription");
+                    };
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(&subscription)
+                            .expect("subscription must be JSON"),
+                        json!({"method":"subscribe","subscription":{"type":kind,"coin":"BTC"}})
+                    );
+                    socket
+                        .send(Message::Text(
+                            json!({
+                                "channel": "subscriptionResponse",
+                                "data": {
+                                    "method": "subscribe",
+                                    "subscription": {"type": kind, "coin": "BTC"}
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .expect("acknowledge subscription");
+                }
+                socket
+                    .send(Message::Close(None))
+                    .await
+                    .expect("close acknowledged but unhealthy connection");
+            }
+            assert!(
+                timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "an acknowledged connection without a valid L2 must not renew the reconnect budget"
+            );
+        });
+
+        let config = WsConfig::with_limits(vec![market("BTC")], WsLimits::fast_for_test())
+            .expect("test configuration is valid");
+        let mut stream = WsClient::new_for_test(config, endpoint).start();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), stream.recv())
+                .await
+                .expect("initial gap must arrive"),
+            Some(WsOutput::Gap(GapEvent::Opened(_)))
+        ));
+        let terminal = timeout(Duration::from_secs(1), stream.recv())
+            .await
+            .expect("reconnect budget must be exhausted")
+            .expect("terminal record must precede stream closure");
+        let WsOutput::Gap(GapEvent::ReconnectExhausted(exhausted)) = terminal else {
+            panic!("unhealthy acknowledged connections must terminate with a typed gap");
+        };
+        assert_eq!(exhausted.reconnect_attempts(), 2);
+        assert!(
+            timeout(Duration::from_secs(1), stream.recv())
+                .await
+                .expect("stream must terminate after exhaustion")
+                .is_none()
+        );
+        server
+            .await
+            .expect("server task must not observe a fourth reconnect");
+    }
+
+    #[tokio::test]
+    async fn a_fresh_l2_snapshot_renews_the_reconnect_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback WebSocket server");
+        let endpoint = format!(
+            "ws://{}",
+            listener
+                .local_addr()
+                .expect("loopback address is available")
+        );
+        let server = tokio::spawn(async move {
+            for connection in 0..4 {
+                let (socket, _) = listener.accept().await.expect("accept reconnect");
+                let mut socket = accept_async(socket)
+                    .await
+                    .expect("accept WebSocket handshake");
+                for kind in ["l2Book", "trades", "bbo"] {
+                    let Some(Ok(Message::Text(subscription))) = socket.next().await else {
+                        panic!("client must send every intended subscription");
+                    };
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(&subscription)
+                            .expect("subscription must be JSON"),
+                        json!({"method":"subscribe","subscription":{"type":kind,"coin":"BTC"}})
+                    );
+                }
+                if connection == 1 {
+                    socket
+                        .send(Message::Text(
+                            json!({
+                                "channel": "l2Book",
+                                "data": {
+                                    "coin": "BTC", "time": 1_700_000_000_000_i64,
+                                    "levels": [
+                                        [{"px": "1", "sz": "1", "n": 1}],
+                                        [{"px": "2", "sz": "1", "n": 1}]
+                                    ]
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .expect("send healthy fresh L2");
+                }
+                socket
+                    .send(Message::Close(None))
+                    .await
+                    .expect("force reconnect");
+            }
+            assert!(
+                timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "a healthy L2 must renew exactly one full reconnect budget"
+            );
+        });
+
+        let config = WsConfig::with_limits(vec![market("BTC")], WsLimits::fast_for_test())
+            .expect("test configuration is valid");
+        let mut stream = WsClient::new_for_test(config, endpoint).start();
+        let mut fresh_l2s = 0;
+        let mut recovered_gaps = 0;
+        let terminal = loop {
+            let output = timeout(Duration::from_secs(1), stream.recv())
+                .await
+                .expect("expected output before timeout")
+                .expect("terminal record must precede stream closure");
+            match output {
+                WsOutput::MarketEvent(_) => fresh_l2s += 1,
+                WsOutput::Gap(GapEvent::Closed(_)) => recovered_gaps += 1,
+                WsOutput::Gap(GapEvent::ReconnectExhausted(exhausted)) => break exhausted,
+                WsOutput::Gap(GapEvent::Opened(_)) | WsOutput::Rejected(_) => {}
+            }
+        };
+        assert_eq!(fresh_l2s, 1);
+        assert_eq!(recovered_gaps, 1);
+        assert_eq!(terminal.reconnect_attempts(), 2);
+        assert!(
+            timeout(Duration::from_secs(1), stream.recv())
+                .await
+                .expect("stream must terminate after exhaustion")
+                .is_none()
+        );
+        server
+            .await
+            .expect("server must observe the renewed reconnect budget");
     }
 
     #[tokio::test]
