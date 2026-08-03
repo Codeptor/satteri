@@ -25,7 +25,7 @@ const FEATURE_SCHEMA: &str = concat!(
     "donchian=20;volume_robust_z=20\n",
     "premium;open_interest_change=1,4,16;funding=level,percentile:30\n",
     "spread_bps;depth=sided:10,25,50;trade_imbalance=5m,15m\n",
-    "cross_return_rank=liquidity_adjusted:4,16;hourly_regime\n"
+    "cross_return_rank=liquidity_adjusted:4,16,96;hourly_regime\n"
 );
 const MAX_BAR_LOOKBACK: usize = 97;
 const FIFTEEN_MINUTE_BARS_PER_DAY: usize = 24 * 4;
@@ -47,7 +47,6 @@ const MAX_CANDLE_HISTORY: usize = DERIVATIVE_15_MINUTE_BARS + MAX_OPEN_INTEREST_
 const MAX_HOURLY_CANDLE_HISTORY: usize =
     HOURLY_REALIZED_VOLATILITY_WINDOW + HOURLY_REALIZED_VOLATILITY_HISTORY + 1;
 const CONTEXT_WINDOW: usize = 30;
-const FUNDING_WINDOW: usize = 30;
 const MAX_MARKETS: usize = 128;
 const POINT_EVENT_HISTORY: usize = 64;
 // Raw source events are retained only long enough to attach observations to
@@ -117,6 +116,7 @@ pub struct InputEventSpan {
     first_event_time: TimestampNs,
     last_event_time: TimestampNs,
     available_at: TimestampNs,
+    sampled_at: Option<TimestampNs>,
 }
 
 impl InputEventSpan {
@@ -164,6 +164,7 @@ impl InputEventSpan {
             first_event_time: event.event_time(),
             last_event_time: event.event_time(),
             available_at: event.received_at(),
+            sampled_at: None,
         }
     }
 
@@ -175,6 +176,14 @@ impl InputEventSpan {
             first_event_time: candle.first_event_time(),
             last_event_time: candle.last_event_time(),
             available_at: candle.source_available_at(),
+            sampled_at: None,
+        }
+    }
+
+    fn sampled_event(kind: FeatureInputKind, event: &MarketEvent, sampled_at: TimestampNs) -> Self {
+        Self {
+            sampled_at: Some(sampled_at),
+            ..Self::event(kind, event)
         }
     }
 }
@@ -286,6 +295,15 @@ fn input_digest(spans: &[InputEventSpan], universe_digest: Option<&str>) -> Stri
         hasher.update(span.last_event_id.as_str().as_bytes());
         hasher.update(&[0]);
         hasher.update(&span.available_at.value().to_be_bytes());
+        match span.sampled_at {
+            Some(sampled_at) => {
+                hasher.update(&[1]);
+                hasher.update(&sampled_at.value().to_be_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
     }
     if let Some(universe_digest) = universe_digest {
         hasher.update(b"universe\0");
@@ -1315,13 +1333,13 @@ impl CommonFeatureEngine {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let funding_events = self.funding_events(&market, as_of_time);
-        let funding_events = trailing_window(&funding_events, FUNDING_WINDOW);
+        let funding_events = self.canonical_funding_samples(&market, sleeve, as_of_time);
         let funding_history = funding_events
-            .map(|events| {
-                events
+            .as_ref()
+            .map(|samples| {
+                samples
                     .iter()
-                    .filter_map(|event| match event.kind() {
+                    .filter_map(|(_, event)| match event.kind() {
                         MarketEventKind::Funding(funding) => Some(funding),
                         _ => None,
                     })
@@ -1396,7 +1414,7 @@ impl CommonFeatureEngine {
                     feature_history,
                     hourly_history,
                     context_events,
-                    funding_events,
+                    &funding_events,
                     bbo_event,
                     book_event,
                     &trades,
@@ -1464,11 +1482,29 @@ impl CommonFeatureEngine {
             .unwrap_or_default()
     }
 
-    fn funding_events(&self, market: &Market, as_of_time: TimestampNs) -> Vec<&MarketEvent> {
-        self.events
-            .get(market)
-            .map(|history| available_events(&history.fundings, as_of_time))
-            .unwrap_or_default()
+    fn canonical_funding_samples(
+        &self,
+        market: &Market,
+        sleeve: CandleInterval,
+        as_of_time: TimestampNs,
+    ) -> Option<Vec<(TimestampNs, &MarketEvent)>> {
+        let count = derivative_history_bars(sleeve);
+        let interval_ns = sleeve.duration().value();
+        let span_ns =
+            i128::from(interval_ns).checked_mul(i128::try_from(count.checked_sub(1)?).ok()?)?;
+        let first = i128::from(as_of_time.value()).checked_sub(span_ns)?;
+        let by_boundary = self.funding_samples.get(&(market.clone(), sleeve))?;
+        (0..count)
+            .map(|offset| {
+                let boundary_ns = first.checked_add(
+                    i128::from(interval_ns).checked_mul(i128::try_from(offset).ok()?)?,
+                )?;
+                let boundary = TimestampNs::new(boundary_ns).ok()?;
+                let event = by_boundary.get(&boundary)?;
+                matches!(event.kind(), MarketEventKind::Funding(_)).then_some(())?;
+                event_is_available(event, boundary).then_some((boundary, event))
+            })
+            .collect()
     }
 
     fn latest_bbo(&self, market: &Market, as_of_time: TimestampNs) -> Option<&MarketEvent> {
@@ -1783,7 +1819,7 @@ fn add_cross_sectional_ranks(
     sleeve: CandleInterval,
     universe: &TradeableUniverse,
 ) {
-    for lookback in [4_usize, 16] {
+    for lookback in [4_usize, 16, 96] {
         let name = format!("liquidity_adjusted_return_{lookback}");
         let rank_name = format!("cross_return_{lookback}_rank");
         let mut ranked = complete
@@ -1818,7 +1854,7 @@ fn add_cross_sectional_ranks(
     }
 
     let primary_candle_kind = candle_input_kind(sleeve);
-    let peer_candle_spans = complete
+    let peer_causal_spans = complete
         .iter()
         .filter_map(|market| {
             let range = bases
@@ -1831,7 +1867,14 @@ fn add_cross_sectional_ranks(
                 range
                     .spans()
                     .iter()
-                    .filter(|span| span.kind() == primary_candle_kind)
+                    .filter(|span| {
+                        matches!(
+                            span.kind(),
+                            kind if kind == primary_candle_kind
+                                || kind == FeatureInputKind::Bbo
+                                || kind == FeatureInputKind::Book
+                        )
+                    })
                     .cloned()
                     .collect::<Vec<_>>(),
             ))
@@ -1841,7 +1884,7 @@ fn add_cross_sectional_ranks(
         .iter_mut()
         .filter(|base| complete.contains(&base.market))
     {
-        let additional = peer_candle_spans
+        let additional = peer_causal_spans
             .iter()
             .filter(|(market, _)| *market != base.market)
             .flat_map(|(_, spans)| spans.iter().cloned())
@@ -1959,8 +2002,6 @@ fn build_values(inputs: &SnapshotInputs<'_>) -> Option<BTreeMap<String, Decimal>
             &inputs
                 .fundings
                 .iter()
-                .rev()
-                .take(FUNDING_WINDOW)
                 .map(|funding| funding.rate().value())
                 .collect::<Vec<_>>(),
             funding.rate().value(),
@@ -1980,7 +2021,7 @@ fn build_values(inputs: &SnapshotInputs<'_>) -> Option<BTreeMap<String, Decimal>
     let liquidity_factor = values
         .get("depth_50bps")?
         .checked_div(values.get("depth_50bps")?.checked_add(Decimal::from(500))?)?;
-    for lookback in [4_usize, 16] {
+    for lookback in [4_usize, 16, 96] {
         values.insert(
             format!("liquidity_adjusted_return_{lookback}"),
             values
@@ -2003,7 +2044,7 @@ fn input_range(
     feature_history: &[&Candle],
     hourly_history: &[&Candle],
     context_events: &[&MarketEvent],
-    funding_events: &[&MarketEvent],
+    funding_events: &[(TimestampNs, &MarketEvent)],
     bbo_event: &MarketEvent,
     book_event: &MarketEvent,
     trades: &[&MarketEvent],
@@ -2019,11 +2060,9 @@ fn input_range(
                 .iter()
                 .map(|event| InputEventSpan::event(FeatureInputKind::AssetContext, event)),
         )
-        .chain(
-            funding_events
-                .iter()
-                .map(|event| InputEventSpan::event(FeatureInputKind::Funding, event)),
-        )
+        .chain(funding_events.iter().map(|(boundary, event)| {
+            InputEventSpan::sampled_event(FeatureInputKind::Funding, event, *boundary)
+        }))
         .chain(std::iter::once(InputEventSpan::event(
             FeatureInputKind::Bbo,
             bbo_event,
@@ -2572,8 +2611,17 @@ mod tests {
     use crate::universe::TradeableUniverse;
 
     const FIFTEEN_MINUTES_NS: i128 = 900_000_000_000;
+    const THIRTY_DAYS_NS: i128 = 30 * 24 * 60 * 60 * 1_000_000_000;
 
     fn timestamp(value: i128) -> TimestampNs {
+        absolute_timestamp(
+            value
+                .checked_add(THIRTY_DAYS_NS)
+                .expect("test timestamp offset must fit"),
+        )
+    }
+
+    fn absolute_timestamp(value: i128) -> TimestampNs {
         TimestampNs::new(value).expect("test timestamp must be valid")
     }
 
@@ -2628,6 +2676,47 @@ mod tests {
         MarketEvent::book_snapshot(
             timestamp(event_time),
             timestamp(received_at),
+            market,
+            BookSnapshot::new(
+                sequence,
+                vec![BookLevel::new(price(bid), quantity(dec!(1)))],
+                vec![BookLevel::new(price(bid + dec!(1)), quantity(dec!(1)))],
+            ),
+        )
+        .expect("test book event must be valid")
+    }
+
+    fn bbo_at_absolute(
+        market: Market,
+        event_time: i128,
+        received_at: i128,
+        sequence: u64,
+        bid: Decimal,
+    ) -> MarketEvent {
+        MarketEvent::bbo(
+            absolute_timestamp(event_time),
+            absolute_timestamp(received_at),
+            market,
+            Bbo::new(
+                sequence,
+                BookLevel::new(price(bid), quantity(dec!(1))),
+                BookLevel::new(price(bid + dec!(1)), quantity(dec!(1))),
+            )
+            .expect("test BBO must be valid"),
+        )
+        .expect("test BBO event must be valid")
+    }
+
+    fn book_at_absolute(
+        market: Market,
+        event_time: i128,
+        received_at: i128,
+        sequence: u64,
+        bid: Decimal,
+    ) -> MarketEvent {
+        MarketEvent::book_snapshot(
+            absolute_timestamp(event_time),
+            absolute_timestamp(received_at),
             market,
             BookSnapshot::new(
                 sequence,
@@ -2823,12 +2912,66 @@ mod tests {
         }
     }
 
+    fn complete_with_canonical_funding_history(
+        engine: &mut CommonFeatureEngine,
+        aggregator: &mut CandleAggregator,
+        close: TimestampNs,
+    ) {
+        complete(engine, aggregator, close);
+        let markets = engine.markets.iter().cloned().collect::<Vec<_>>();
+        for market in markets {
+            for sleeve in [
+                crate::event::CandleInterval::FifteenMinutes,
+                crate::event::CandleInterval::OneHour,
+            ] {
+                let count = super::derivative_history_bars(sleeve);
+                let interval = i128::from(sleeve.duration().value());
+                let start = i128::from(close.value())
+                    .checked_sub(
+                        interval
+                            .checked_mul(
+                                i128::try_from(count - 1).expect("fixed history length must fit"),
+                            )
+                            .expect("fixed history span must fit"),
+                    )
+                    .expect("test epoch must cover canonical funding history");
+                let samples = engine
+                    .funding_samples
+                    .entry((market.clone(), sleeve))
+                    .or_default();
+                for offset in 0..count {
+                    let boundary = absolute_timestamp(
+                        start
+                            .checked_add(
+                                interval
+                                    .checked_mul(
+                                        i128::try_from(offset)
+                                            .expect("fixed history index must fit"),
+                                    )
+                                    .expect("fixed sample offset must fit"),
+                            )
+                            .expect("fixed sample boundary must fit"),
+                    );
+                    let event = MarketEvent::funding(
+                        boundary,
+                        boundary,
+                        market.clone(),
+                        Funding::new(FundingRate::new(Decimal::from(offset)), price(dec!(100))),
+                    )
+                    .expect("canonical funding sample must be valid");
+                    samples.insert(boundary, event);
+                }
+            }
+        }
+    }
+
     fn tradeable_universe(
         decision: TimestampNs,
         markets: impl IntoIterator<Item = Market>,
     ) -> TradeableUniverse {
-        let completed_hour =
-            timestamp(i128::from(decision.value() / 3_600_000_000_000) * 3_600_000_000_000);
+        let completed_hour = absolute_timestamp(
+            i128::from(decision.value() / 3_600_000_000_000) * 3_600_000_000_000,
+        );
         TradeableUniverse::new(completed_hour, markets).expect("test universe must be valid")
     }
 
@@ -3066,7 +3209,7 @@ mod tests {
             dec!(1),
         );
         let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
-        complete(&mut engine, &mut aggregator, decision);
+        complete_with_canonical_funding_history(&mut engine, &mut aggregator, decision);
         let before = frozen_snapshots(
             &engine,
             crate::event::CandleInterval::FifteenMinutes,
@@ -3128,20 +3271,13 @@ mod tests {
         let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
         complete(&mut engine, &mut aggregator, decision);
 
-        for snapshot in frozen_snapshots(
-            &engine,
-            crate::event::CandleInterval::FifteenMinutes,
-            decision,
-        ) {
-            assert!(snapshot.is_ready(), "unexpected snapshot: {snapshot:#?}");
-            assert!(
-                snapshot
-                    .input_range()
-                    .expect("ready snapshot must retain provenance")
-                    .spans()
-                    .iter()
-                    .all(|span| span.available_at() <= decision)
+        for snapshot in engine.snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision)
+        {
+            assert_eq!(
+                snapshot.unready_reason(),
+                Some(FeatureUnreadyReason::StaleBboOrBook)
             );
+            assert!(snapshot.values().is_empty());
         }
     }
 
@@ -3199,7 +3335,7 @@ mod tests {
             dec!(1),
         );
         let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
-        complete(&mut engine, &mut aggregator, decision);
+        complete_with_canonical_funding_history(&mut engine, &mut aggregator, decision);
 
         let snapshots = frozen_snapshots(
             &engine,
@@ -3228,6 +3364,7 @@ mod tests {
                 "trade_imbalance_15m",
                 "cross_return_4_rank",
                 "cross_return_16_rank",
+                "cross_return_96_rank",
             ] {
                 assert!(
                     snapshot.values().contains_key(name),
@@ -3258,7 +3395,7 @@ mod tests {
             );
         }
         let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
-        complete(&mut engine, &mut aggregator, decision);
+        complete_with_canonical_funding_history(&mut engine, &mut aggregator, decision);
 
         let without_membership = engine.snapshots_at_with_universe(
             crate::event::CandleInterval::FifteenMinutes,
@@ -3325,7 +3462,7 @@ mod tests {
         }
         let hour = timestamp(128 * FIFTEEN_MINUTES_NS);
         let decision = timestamp(129 * FIFTEEN_MINUTES_NS);
-        complete(&mut engine, &mut aggregator, decision);
+        complete_with_canonical_funding_history(&mut engine, &mut aggregator, decision);
         let universe = tradeable_universe(hour, markets);
 
         let snapshots = engine.snapshots_at_with_universe(
@@ -3357,20 +3494,21 @@ mod tests {
             );
         }
         let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
-        complete(&mut engine, &mut aggregator, decision);
+        complete_with_canonical_funding_history(&mut engine, &mut aggregator, decision);
         let btc = market("BTC");
         let reset_market = |engine: &mut CommonFeatureEngine| {
             let sources = engine.events.get_mut(&btc).expect("BTC sources must exist");
             sources.bbo.clear();
             sources.books.clear();
         };
-        let observe_pair =
-            |engine: &mut CommonFeatureEngine, event_time: i128, received_at: i128| {
-                let bbo = bbo_at_time(btc.clone(), event_time, received_at, 10_000, dec!(227));
-                let book = book_at_time(btc.clone(), event_time, received_at, 10_000, dec!(227));
-                engine.observe(&bbo).expect("BBO must be observed");
-                engine.observe(&book).expect("book must be observed");
-            };
+        let observe_pair = |engine: &mut CommonFeatureEngine,
+                            event_time: i128,
+                            received_at: i128| {
+            let bbo = bbo_at_absolute(btc.clone(), event_time, received_at, 10_000, dec!(227));
+            let book = book_at_absolute(btc.clone(), event_time, received_at, 10_000, dec!(227));
+            engine.observe(&bbo).expect("BBO must be observed");
+            engine.observe(&book).expect("book must be observed");
+        };
         let universe = tradeable_universe(decision, [btc.clone(), market("ETH")]);
 
         reset_market(&mut engine);
@@ -3438,6 +3576,49 @@ mod tests {
     }
 
     #[test]
+    fn funding_percentile_requires_thirty_calendar_days_of_canonical_boundary_samples() {
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        let btc = market("BTC");
+        populate(
+            &mut engine,
+            &mut aggregator,
+            btc.clone(),
+            0,
+            128,
+            dec!(100),
+            dec!(1),
+        );
+        let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
+        for sequence in 0..super::SOURCE_EVENT_HISTORY {
+            let source_time = i128::from(decision.value())
+                - i128::try_from(super::SOURCE_EVENT_HISTORY).expect("bounded source count fits")
+                + i128::try_from(sequence).expect("bounded source index fits");
+            let funding = MarketEvent::funding(
+                timestamp(source_time),
+                timestamp(source_time),
+                btc.clone(),
+                Funding::new(FundingRate::new(Decimal::from(sequence)), price(dec!(227))),
+            )
+            .expect("funding event must be valid");
+            engine.observe(&funding).expect("funding must be observed");
+        }
+        complete(&mut engine, &mut aggregator, decision);
+
+        let snapshot = engine
+            .snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision)
+            .into_iter()
+            .find(|snapshot| snapshot.market() == &btc)
+            .expect("BTC snapshot must exist");
+
+        assert!(!snapshot.completeness().funding());
+        assert_eq!(
+            snapshot.unready_reason(),
+            Some(FeatureUnreadyReason::FundingHistory)
+        );
+    }
+
+    #[test]
     fn rising_ema_has_a_positive_four_bar_slope() {
         let mut engine = CommonFeatureEngine::new();
         let mut aggregator = CandleAggregator::new();
@@ -3453,7 +3634,7 @@ mod tests {
             );
         }
         let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
-        complete(&mut engine, &mut aggregator, decision);
+        complete_with_canonical_funding_history(&mut engine, &mut aggregator, decision);
 
         for snapshot in frozen_snapshots(
             &engine,
@@ -3490,7 +3671,7 @@ mod tests {
             );
         }
         let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
-        complete(&mut engine, &mut aggregator, decision);
+        complete_with_canonical_funding_history(&mut engine, &mut aggregator, decision);
 
         let snapshot = frozen_snapshots(
             &engine,
@@ -3739,7 +3920,7 @@ mod tests {
             );
         }
         let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
-        complete(&mut engine, &mut aggregator, decision);
+        complete_with_canonical_funding_history(&mut engine, &mut aggregator, decision);
 
         for snapshot in frozen_snapshots(
             &engine,
@@ -3843,7 +4024,7 @@ mod tests {
             dec!(0),
         );
         let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
-        complete(&mut engine, &mut aggregator, decision);
+        complete_with_canonical_funding_history(&mut engine, &mut aggregator, decision);
 
         for snapshot in frozen_snapshots(
             &engine,
@@ -3883,7 +4064,7 @@ mod tests {
             dec!(1),
         );
         let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
-        complete(&mut engine, &mut aggregator, decision);
+        complete_with_canonical_funding_history(&mut engine, &mut aggregator, decision);
 
         let snapshot = engine
             .snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision)
@@ -3923,7 +4104,7 @@ mod tests {
             dec!(1),
         );
         let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
-        complete(&mut engine, &mut aggregator, decision);
+        complete_with_canonical_funding_history(&mut engine, &mut aggregator, decision);
 
         let before = frozen_snapshots(
             &engine,
@@ -3946,9 +4127,9 @@ mod tests {
         assert_eq!(count(FeatureInputKind::FifteenMinuteCandle), 194);
         assert_eq!(count(FeatureInputKind::OneHourCandle), 32);
         assert_eq!(count(FeatureInputKind::AssetContext), 30);
-        assert_eq!(count(FeatureInputKind::Funding), 30);
-        assert_eq!(count(FeatureInputKind::Bbo), 1);
-        assert_eq!(count(FeatureInputKind::Book), 1);
+        assert_eq!(count(FeatureInputKind::Funding), 30 * 24 * 4);
+        assert_eq!(count(FeatureInputKind::Bbo), 2);
+        assert_eq!(count(FeatureInputKind::Book), 2);
         assert_eq!(count(FeatureInputKind::MicrostructureTrade), 1);
         assert!(!range.digest().is_empty());
 
@@ -3993,7 +4174,7 @@ mod tests {
             );
         }
         let decision = timestamp(388 * FIFTEEN_MINUTES_NS);
-        complete(&mut engine, &mut aggregator, decision);
+        complete_with_canonical_funding_history(&mut engine, &mut aggregator, decision);
 
         for snapshot in frozen_snapshots(&engine, crate::event::CandleInterval::OneHour, decision) {
             let candle_kinds = snapshot
