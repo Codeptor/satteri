@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "version_policy": "reject_unknown",
+  "encoding": "MessagePack",
+  "timestamp_unit": "nanoseconds_since_unix_epoch_utc",
+  "probability_order": ["short", "flat", "long"],
+  "probability_sum_tolerance": 1e-9,
+  "supported_sleeves": ["15m", "1h"],
+  "maxima": {
+    "frame_bytes": 1048576,
+    "identifier_bytes": 128,
+    "rows": 256,
+    "features_per_row": 512,
+    "artifacts": 16
+  },
+  "envelope_fields": [
+    "schema_version",
+    "event_id",
+    "event_time_ns",
+    "as_of_time_ns",
+    "producer_version",
+    "run_id",
+    "config_hash",
+    "payload_type",
+    "payload"
+  ],
+  "envelope_types": [
+    "integer",
+    "string",
+    "integer",
+    "integer",
+    "string",
+    "string",
+    "string",
+    "closed_enum",
+    "closed_union"
+  ],
+  "payload_variants": {
+    "inference_request": {
+      "fields": ["feature_schema_hash", "artifact_ids", "rows"],
+      "types": ["string", "array<string>", "array<FeatureRow>"],
+      "row_fields": ["market", "sleeve", "values"],
+      "row_types": ["string", "closed_enum", "array<float64>"]
+    },
+    "inference_response": {
+      "fields": ["correlation_id", "config_hash", "feature_schema_hash", "rows"],
+      "types": ["string", "string", "string", "array<ForecastRow>"],
+      "row_fields": [
+        "correlation_id",
+        "market",
+        "sleeve",
+        "artifact_id",
+        "probabilities",
+        "regression_point_estimate",
+        "directional_conformal_lower_bound"
+      ],
+      "row_types": [
+        "string",
+        "string",
+        "closed_enum",
+        "string",
+        "tuple<float64,float64,float64>",
+        "float64",
+        "float64"
+      ]
+    }
+  },
+  "validation_rules": [
+    "All structures reject unknown fields.",
+    "Payload type must match its closed payload variant.",
+    "Frames contain exactly one MessagePack object and no trailing bytes.",
+    "All identifiers are nonempty and bounded by UTF-8 byte length.",
+    "Timestamps are nonnegative integers and as_of_time_ns does not exceed event_time_ns.",
+    "Staleness uses only an explicit caller-supplied decision time and request deadline.",
+    "Request rows have unique (market,sleeve) keys and equal nonempty feature lengths.",
+    "Features, probabilities, and scalar outputs are finite float64 values; integers and booleans are invalid.",
+    "Artifact identifiers are unique and request and response digests correspond exactly.",
+    "Response rows are the exact request row and artifact Cartesian product.",
+    "Probability vectors are finite, within [0,1], ordered [short,flat,long], and sum to one within the declared tolerance."
+  ]
+}

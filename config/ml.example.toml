@@ -1,0 +1,35 @@
+[paths]
+feature_dataset = "./data/ml/features"
+label_dataset = "./data/ml/labels"
+artifact_dir = "./models"
+report_dir = "./reports/generated"
+
+[runtime]
+unix_socket_path = "/run/trench/trench-ml.sock"
+request_deadline_ms = 250
+deterministic_seed = 20260803
+thread_count = 1
+max_frame_bytes = 1048576
+max_rows = 256
+max_features = 512
+max_artifacts = 16
+shadow_artifact_limit = 2
+
+[folds]
+start_date = "2021-01-01"
+end_date = "2026-07-31"
+outer_train_days = 730
+outer_test_days = 90
+outer_step_days = 90
+inner_train_days = 365
+inner_validation_days = 60
+inner_step_days = 60
+calibration_days = 60
+embargo_bars = 4
+
+[lightgbm_grid]
+num_leaves = [15, 31]
+learning_rate = [0.03, 0.05]
+min_child_samples = [50, 100]
+feature_fraction = [0.8, 1.0]
+bagging_fraction = [0.8, 1.0]
