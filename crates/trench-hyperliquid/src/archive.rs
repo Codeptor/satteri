@@ -14,7 +14,7 @@ use time::OffsetDateTime;
 use trench_core::domain::{EventId, Market};
 use trench_core::event::{BookLevel, MarketEvent, MarketEventKind, TimestampNs};
 
-use crate::ws::{normalize_bbo_wire_for_market, normalize_l2_book_wire_for_market};
+use crate::ws::normalize_l2_book_wire_for_market;
 
 const HOUR_MILLIS: i64 = 3_600_000;
 const MAX_COMPRESSED_SOURCE_BYTES: u64 = 1_073_741_824;
@@ -29,26 +29,25 @@ const CONTENT_DIGEST_DOMAIN: &str = "trench.archive.content.v1";
 pub enum ArchiveDataKind {
     /// Full L2 snapshots from the documented `l2Book` archive directory.
     L2Book,
-    /// Best-bid/best-ask records encoded with the live public `bbo` wire shape.
+    /// A completeness requirement unavailable from the documented archive.
+    ///
+    /// This variant may be required or reported missing, but it cannot name a
+    /// historical source object because the official archive documents L2 only.
     Bbo,
 }
 
 impl ArchiveDataKind {
-    const fn directory(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
             Self::L2Book => "l2Book",
             Self::Bbo => "bbo",
         }
     }
-
-    const fn channel(self) -> &'static str {
-        self.directory()
-    }
 }
 
 impl fmt::Display for ArchiveDataKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.directory())
+        formatter.write_str(self.label())
     }
 }
 
@@ -113,6 +112,9 @@ impl ArchiveSpan {
     }
 
     fn official_relative_path(&self) -> Result<PathBuf, ArchiveError> {
+        if self.data_kind != ArchiveDataKind::L2Book {
+            return Err(ArchiveError::UnsupportedArchiveDataKind { span: self.clone() });
+        }
         let timestamp_ns = i128::from(self.start_ms) * 1_000_000;
         let time = OffsetDateTime::from_unix_timestamp_nanos(timestamp_ns).map_err(|_| {
             ArchiveError::InvalidSpan {
@@ -127,7 +129,7 @@ impl ArchiveSpan {
             u8::from(date.month()),
             date.day(),
             time.hour(),
-            self.data_kind.directory(),
+            "l2Book",
             self.market.as_str(),
         )))
     }
@@ -269,6 +271,11 @@ impl ArchiveManifest {
         }
         let mut supplied = BTreeSet::new();
         for source in &sources {
+            if source.span.data_kind != ArchiveDataKind::L2Book {
+                return Err(ArchiveError::UnsupportedArchiveDataKind {
+                    span: source.span.clone(),
+                });
+            }
             if !requested.contains(&source.span) {
                 return Err(ArchiveError::UndeclaredSource {
                     span: source.span.clone(),
@@ -472,6 +479,9 @@ pub enum ArchiveError {
     /// A source did not belong to a requested span.
     #[error("archive source was not declared as a requirement: `{span}")]
     UndeclaredSource { span: ArchiveSpan },
+    /// A manifest tried to source data unavailable from the documented archive.
+    #[error("the official historical archive has no source object for `{span}")]
+    UnsupportedArchiveDataKind { span: ArchiveSpan },
     /// A required source object was not named in the manifest.
     #[error("missing required archive source for `{span}")]
     MissingRequiredSource { span: ArchiveSpan },
@@ -576,6 +586,8 @@ pub enum ArchiveError {
 
 #[derive(Debug)]
 struct ResolvedSource {
+    compressed_bytes: u64,
+    compressed_digest: ArchiveDigest,
     file: File,
     path: PathBuf,
     span: ArchiveSpan,
@@ -656,6 +668,8 @@ fn resolve_source(root: &Path, source: &ArchiveSource) -> Result<ResolvedSource,
             source,
         })?;
     Ok(ResolvedSource {
+        compressed_bytes: source.compressed_bytes,
+        compressed_digest: source.compressed_digest,
         file,
         path: canonical,
         span: source.span.clone(),
@@ -698,8 +712,14 @@ fn read_source(
     as_of_ms: i64,
     received_at: TimestampNs,
 ) -> Result<Vec<MarketEvent>, ArchiveError> {
-    let ResolvedSource { file, path, span } = source;
-    let decoder = FrameDecoder::new(BufReader::with_capacity(DIGEST_BUFFER_BYTES, file));
+    let ResolvedSource {
+        compressed_bytes,
+        compressed_digest,
+        file,
+        path,
+        span,
+    } = source;
+    let decoder = FrameDecoder::new(DigestingReader::new(file));
     let mut reader = BufReader::with_capacity(DIGEST_BUFFER_BYTES, decoder);
     let mut decoded_bytes = 0_usize;
     let mut line_number = 0_usize;
@@ -723,7 +743,62 @@ fn read_source(
         }
         events.push(event);
     }
+    let compressed = reader.into_inner().into_inner();
+    verify_streamed_source(&path, compressed_bytes, compressed_digest, compressed)?;
     Ok(events)
+}
+
+struct DigestingReader<R> {
+    bytes_read: u64,
+    hasher: Hasher,
+    inner: R,
+}
+
+impl<R> DigestingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            bytes_read: 0,
+            hasher: Hasher::new(),
+            inner,
+        }
+    }
+
+    fn finish(self) -> (u64, ArchiveDigest) {
+        (self.bytes_read, ArchiveDigest::from_hasher(self.hasher))
+    }
+}
+
+impl<R: Read> Read for DigestingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.bytes_read = self.bytes_read.saturating_add(read as u64);
+        self.hasher.update(&buffer[..read]);
+        Ok(read)
+    }
+}
+
+fn verify_streamed_source(
+    path: &Path,
+    expected_bytes: u64,
+    expected_digest: ArchiveDigest,
+    compressed: DigestingReader<File>,
+) -> Result<(), ArchiveError> {
+    let (actual_bytes, actual_digest) = compressed.finish();
+    if actual_bytes != expected_bytes {
+        return Err(ArchiveError::CompressedLengthMismatch {
+            path: path.to_path_buf(),
+            expected: expected_bytes,
+            actual: actual_bytes,
+        });
+    }
+    if actual_digest != expected_digest {
+        return Err(ArchiveError::CompressedDigestMismatch {
+            path: path.to_path_buf(),
+            expected: expected_digest,
+            actual: actual_digest,
+        });
+    }
+    Ok(())
 }
 
 fn read_bounded_line<R: BufRead>(
@@ -814,16 +889,15 @@ fn decode_record(
             span: span.clone(),
         });
     }
-    match span.data_kind {
-        ArchiveDataKind::L2Book => {
-            normalize_l2_book_wire_for_market(data, &span.market, received_at)
-        }
-        ArchiveDataKind::Bbo => normalize_bbo_wire_for_market(data, &span.market, received_at),
+    if span.data_kind != ArchiveDataKind::L2Book {
+        return Err(ArchiveError::UnsupportedArchiveDataKind { span: span.clone() });
     }
-    .map_err(|_| ArchiveError::InvalidRecord {
-        path: path.to_path_buf(),
-        line,
-        kind: span.data_kind,
+    normalize_l2_book_wire_for_market(data, &span.market, received_at).map_err(|_| {
+        ArchiveError::InvalidRecord {
+            path: path.to_path_buf(),
+            line,
+            kind: span.data_kind,
+        }
     })
 }
 
@@ -837,7 +911,7 @@ fn extract_record_data(
     let Some(channel) = record.get("channel") else {
         return Ok(record);
     };
-    if channel.as_str() != Some(span.data_kind.channel()) {
+    if channel.as_str() != Some("l2Book") {
         return Err(ArchiveError::InvalidRecord {
             path: path.to_path_buf(),
             line,
@@ -895,12 +969,6 @@ fn content_digest(events: &[MarketEvent]) -> Result<ArchiveDigest, ArchiveError>
                     .iter()
                     .for_each(|level| update_book_level_digest(&mut hasher, level));
             }
-            MarketEventKind::Bbo(bbo) => {
-                hasher.update(&[1]);
-                update_digest_field(&mut hasher, &bbo.sequence().to_be_bytes());
-                update_book_level_digest(&mut hasher, &bbo.bid());
-                update_book_level_digest(&mut hasher, &bbo.ask());
-            }
             _ => {
                 return Err(ArchiveError::UnexpectedEventKind {
                     event_id: event.event_id().as_str().to_owned(),
@@ -919,4 +987,94 @@ fn update_book_level_digest(hasher: &mut Hasher, level: &BookLevel) {
 fn update_digest_field(hasher: &mut Hasher, field: &[u8]) {
     hasher.update(&(field.len() as u64).to_be_bytes());
     hasher.update(field);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use tempfile::TempDir;
+    use trench_core::domain::Market;
+    use trench_core::event::MarketEventKind;
+
+    use super::{
+        ArchiveDataKind, ArchiveDigest, ArchiveError, ArchiveManifest, ArchiveReader,
+        ArchiveRequirement, ArchiveSource, ArchiveSpan,
+    };
+
+    const HOUR_START_MS: i64 = 1_694_854_800_000;
+    const HOUR_END_MS: i64 = 1_694_858_400_000;
+    const AS_OF_MS: i64 = 1_694_862_000_000;
+    const L2_FIXTURE: &[u8] = include_bytes!("../../../tests/fixtures/archive/l2-sample.lz4");
+
+    fn market() -> Market {
+        Market::new("SOL").expect("fixture market must be valid")
+    }
+
+    fn span(data_kind: ArchiveDataKind) -> ArchiveSpan {
+        ArchiveSpan::new(market(), data_kind, HOUR_START_MS, HOUR_END_MS)
+            .expect("fixture span must be valid")
+    }
+
+    fn installed_l2_source(root: &TempDir) -> ArchiveSource {
+        let relative_path = PathBuf::from("market_data/20230916/9/l2Book/SOL.lz4");
+        let destination = root.path().join(&relative_path);
+        fs::create_dir_all(
+            destination
+                .parent()
+                .expect("fixture archive path must have a parent"),
+        )
+        .expect("create fixture archive directories");
+        fs::write(&destination, L2_FIXTURE).expect("write immutable L2 fixture");
+        ArchiveSource::new(
+            span(ArchiveDataKind::L2Book),
+            relative_path,
+            u64::try_from(L2_FIXTURE.len()).expect("fixture length fits u64"),
+            ArchiveDigest::of_bytes(L2_FIXTURE),
+        )
+    }
+
+    #[test]
+    fn reader_normalizes_the_documented_l2_fixture() {
+        let root = TempDir::new().expect("create archive root");
+        let source = installed_l2_source(&root);
+        let manifest = ArchiveManifest::new(
+            AS_OF_MS,
+            [ArchiveRequirement::required(span(ArchiveDataKind::L2Book))],
+            [source],
+        )
+        .expect("fixture manifest must be valid");
+
+        let batch = ArchiveReader::open(root.path(), manifest)
+            .expect("fixture source must open")
+            .read_all()
+            .expect("fixture source must decode");
+
+        assert_eq!(batch.events().len(), 2);
+        assert!(matches!(
+            batch.events()[0].kind(),
+            MarketEventKind::BookSnapshot(_)
+        ));
+    }
+
+    #[test]
+    fn manifest_rejects_an_undocumented_bbo_object() {
+        let bbo_span = span(ArchiveDataKind::Bbo);
+        let source = ArchiveSource::new(
+            bbo_span.clone(),
+            PathBuf::from("market_data/20230916/9/bbo/SOL.lz4"),
+            0,
+            ArchiveDigest::of_bytes(b""),
+        );
+
+        let error =
+            ArchiveManifest::new(AS_OF_MS, [ArchiveRequirement::required(bbo_span)], [source])
+                .expect_err("the documented archive has no BBO object path");
+
+        assert!(matches!(
+            error,
+            ArchiveError::UnsupportedArchiveDataKind { .. }
+        ));
+    }
 }

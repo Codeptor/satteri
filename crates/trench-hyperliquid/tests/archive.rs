@@ -421,6 +421,22 @@ fn reader_rejects_a_missing_required_bbo_source() {
 }
 
 #[test]
+fn manifest_rejects_an_undocumented_bbo_archive_object() {
+    let bbo = bbo_span();
+    let source = ArchiveSource::new(
+        bbo.clone(),
+        PathBuf::from("market_data/20230916/9/bbo/SOL.lz4"),
+        0,
+        ArchiveDigest::of_bytes(b""),
+    );
+
+    assert!(
+        ArchiveManifest::new(AS_OF_MS, [ArchiveRequirement::required(bbo)], [source],).is_err(),
+        "the official historical archive documents L2 objects only"
+    );
+}
+
+#[test]
 fn reader_reports_an_optional_absent_bbo_span_exactly() {
     let root = TempDir::new().expect("create archive root");
     let (_, l2_source) = install_fixture(&root);
@@ -474,6 +490,55 @@ fn reader_decodes_the_file_verified_at_open_not_a_later_path_replacement() {
     assert_eq!(
         snapshot.bids()[0].price().value(),
         Decimal::new(1_912_345, 5)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn reader_rejects_a_same_inode_mutation_after_open() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = TempDir::new().expect("create archive root");
+    let (destination, source) = install_lz4(
+        &root,
+        br#"{"coin":"SOL","time":1694854800000,"levels":[[{"px":"19.12345","sz":"1.2500","n":2}],[{"px":"19.22345","sz":"2.5000","n":3}]]}
+"#,
+    );
+    let original_inode = fs::metadata(&destination)
+        .expect("inspect original fixture")
+        .ino();
+    let manifest = ArchiveManifest::new(
+        AS_OF_MS,
+        [ArchiveRequirement::required(l2_span())],
+        [source],
+    )
+    .expect("fixture manifest must be valid");
+    let reader = ArchiveReader::open(root.path(), manifest)
+        .expect("original compressed source must verify at open time");
+
+    write_lz4(
+        &destination,
+        br#"{"coin":"SOL","time":1694854800000,"levels":[[{"px":"19.12345","sz":"1.2500","n":3}],[{"px":"19.22345","sz":"2.5000","n":3}]]}
+"#,
+    );
+    assert_eq!(
+        fs::metadata(&destination)
+            .expect("inspect mutated fixture")
+            .ino(),
+        original_inode,
+        "the test must overwrite the original inode rather than replace its path"
+    );
+
+    let error = reader
+        .read_all()
+        .expect_err("bytes consumed by decompression must match the verified digest");
+
+    assert!(
+        matches!(
+            error,
+            trench_hyperliquid::ArchiveError::CompressedDigestMismatch { .. }
+        ),
+        "unexpected mutation error: {error:?}"
     );
 }
 

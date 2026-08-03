@@ -1852,16 +1852,6 @@ pub(crate) fn normalize_bbo_wire(
     normalize_bbo(bbo, market, received_at)
 }
 
-pub(crate) fn normalize_bbo_wire_for_market(
-    data: Value,
-    expected_market: &Market,
-    received_at: TimestampNs,
-) -> Result<MarketEvent, DecodeError> {
-    let bbo: RawWsBbo = serde_json::from_value(data).map_err(|_| DecodeError::Malformed)?;
-    let market = parse_expected_market(&bbo.coin, expected_market)?;
-    normalize_bbo(bbo, market, received_at)
-}
-
 fn normalize_bbo(
     bbo: RawWsBbo,
     market: Market,
