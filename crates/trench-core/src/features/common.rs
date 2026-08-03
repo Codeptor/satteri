@@ -2944,9 +2944,9 @@ fn verify_candle_provenance_history(
         if candle.open_time_ns != expected_open {
             return Err(LongHorizonHistoryError::NonContiguous { field });
         }
-        let expected_close = expected_open
-            .checked_add(interval_ns)
-            .ok_or(LongHorizonHistoryError::TimeArithmetic)?;
+        let expected_close = checked_history_timestamp(expected_open, "candle expected open time")?
+            .checked_add(interval.duration())
+            .map_err(|_| LongHorizonHistoryError::TimeArithmetic)?;
         for (timestamp, timestamp_field) in [
             (candle.open_time_ns, "candle open time"),
             (candle.first_event_time_ns, "candle first event time"),
@@ -2967,6 +2967,11 @@ fn verify_candle_provenance_history(
                 field: "candle last event ID",
             }
         })?;
+        let candle_open_time = checked_history_timestamp(candle.open_time_ns, "candle open time")?;
+        let first_event_time =
+            checked_history_timestamp(candle.first_event_time_ns, "candle first event time")?;
+        let last_event_time =
+            checked_history_timestamp(candle.last_event_time_ns, "candle last event time")?;
         let first = (
             candle.first_event_time_ns,
             candle.first_received_at_ns,
@@ -2980,9 +2985,12 @@ fn verify_candle_provenance_history(
         if candle.first_event_time_ns > candle.first_received_at_ns
             || candle.last_event_time_ns > candle.last_received_at_ns
             || first > last
+            || candle_open_time > first_event_time
+            || first_event_time > last_event_time
+            || last_event_time >= expected_close
             || candle.source_available_at_ns < candle.first_received_at_ns
             || candle.source_available_at_ns < candle.last_received_at_ns
-            || candle.source_available_at_ns > expected_close
+            || candle.source_available_at_ns > expected_close.value()
             || candle.source_available_at_ns > as_of_time.value()
         {
             return Err(LongHorizonHistoryError::InvalidCandleProvenance { field });
@@ -3918,6 +3926,33 @@ mod tests {
             }
         }
         timestamp(i128::from(BARS) * FIFTEEN_MINUTES_NS)
+    }
+
+    fn resign_long_horizon_history(history: &mut super::LongHorizonFeatureHistory) {
+        let market = Market::new(history.market.clone()).expect("history market must be valid");
+        let sleeve =
+            super::parse_history_sleeve(&history.sleeve).expect("history sleeve must be valid");
+        let as_of_time =
+            super::checked_history_timestamp(history.as_of_time_ns, "snapshot boundary")
+                .expect("history snapshot boundary must be valid");
+        let hourly_as_of_time = super::checked_history_timestamp(
+            history.hourly_as_of_time_ns,
+            "hourly snapshot boundary",
+        )
+        .expect("history hourly snapshot boundary must be valid");
+        history.input_digest = super::long_horizon_input_digest(&super::LongHorizonDigestInputs {
+            market: &market,
+            sleeve,
+            as_of_time,
+            hourly_as_of_time,
+            primary_candle_provenance: &history.primary_candle_provenance,
+            hourly_candle_provenance: &history.hourly_candle_provenance,
+            hourly_volatility: &history.hourly_realized_volatility_20_history,
+            current_hourly_volatility: history.current_hourly_realized_volatility_20,
+            premium: &history.premium_history,
+            open_interest_change: &history.open_interest_change_4_history,
+            funding: &history.funding_history,
+        });
     }
 
     #[test]
@@ -5012,6 +5047,91 @@ mod tests {
         assert!(
             serde_json::from_value::<super::LongHorizonFeatureHistory>(unknown_nested).is_err(),
             "unknown nested long-horizon fields must fail closed"
+        );
+    }
+
+    #[test]
+    fn long_horizon_history_json_rejects_a_trade_before_its_candle_opens() {
+        let market = market("BTC");
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        let decision = populate_long_history(
+            &mut engine,
+            &mut aggregator,
+            market.clone(),
+            ReceiptDelays::default(),
+        );
+        let mut forged = engine
+            .long_horizon_history_at(
+                &market,
+                crate::event::CandleInterval::FifteenMinutes,
+                decision,
+            )
+            .expect("fully retained long-horizon history must be available");
+        let candle = forged
+            .primary_candle_provenance
+            .first_mut()
+            .expect("primary history must have a first candle");
+        candle.first_event_time_ns = candle
+            .open_time_ns
+            .checked_sub(1)
+            .expect("test candle open time must not be the epoch");
+        resign_long_horizon_history(&mut forged);
+
+        let error = serde_json::from_value::<super::LongHorizonFeatureHistory>(
+            serde_json::to_value(forged).expect("forged history must serialize"),
+        )
+        .expect_err("a trade before its candle opens must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("long-horizon history primary candle provenance is invalid")
+        );
+    }
+
+    #[test]
+    fn long_horizon_history_json_rejects_a_trade_at_its_candle_close() {
+        let market = market("BTC");
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        let decision = populate_long_history(
+            &mut engine,
+            &mut aggregator,
+            market.clone(),
+            ReceiptDelays::default(),
+        );
+        let mut forged = engine
+            .long_horizon_history_at(
+                &market,
+                crate::event::CandleInterval::FifteenMinutes,
+                decision,
+            )
+            .expect("fully retained long-horizon history must be available");
+        let candle = forged
+            .primary_candle_provenance
+            .first_mut()
+            .expect("primary history must have a first candle");
+        let close = candle
+            .open_time_ns
+            .checked_add(
+                crate::event::CandleInterval::FifteenMinutes
+                    .duration()
+                    .value(),
+            )
+            .expect("test candle close must fit");
+        candle.last_event_time_ns = close;
+        candle.last_received_at_ns = close;
+        candle.source_available_at_ns = candle.source_available_at_ns.max(close);
+        resign_long_horizon_history(&mut forged);
+
+        let error = serde_json::from_value::<super::LongHorizonFeatureHistory>(
+            serde_json::to_value(forged).expect("forged history must serialize"),
+        )
+        .expect_err("a trade at its candle close must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("long-horizon history primary candle provenance is invalid")
         );
     }
 
