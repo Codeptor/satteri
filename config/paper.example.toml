@@ -1,0 +1,39 @@
+[endpoints]
+info_url = "https://api.hyperliquid.xyz/info"
+websocket_url = "wss://api.hyperliquid.xyz/ws"
+archive_url = "https://hyperliquid-archive.s3.amazonaws.com"
+
+[storage]
+sqlite_path = "state/trench.sqlite"
+parquet_path = "data/parquet"
+
+[feeds]
+universe_refresh_seconds = 3600
+required_history_days = 30
+required_bar_coverage = 0.995
+coverage_window_days = 7
+max_effective_spread_bps = 15
+minimum_daily_notional_usdc = 5_000_000
+depth_probe_notional_usdc = 500
+minimum_depth_multiple = 100
+tradeable_market_count = 20
+warm_buffer_market_count = 10
+
+[risk]
+initial_equity_usdc = 100.00
+max_planned_loss_fraction = 0.005
+daily_loss_breaker_fraction = 0.015
+weekly_loss_breaker_fraction = 0.04
+hard_drawdown_fraction = 0.08
+consecutive_loss_limit = 3
+cooldown_hours = 12
+max_entries_per_day = 6
+max_open_positions = 1
+margin_mode = "isolated"
+minimum_leverage = 5
+max_leverage = 20
+max_margin_fraction = 0.25
+fixed_fee_bps_per_side = 7.5
+
+[rules]
+mode = "collect_only"
