@@ -3605,6 +3605,7 @@ mod tests {
                 .local_addr()
                 .expect("loopback address is available")
         );
+        let (client_terminated, await_client_termination) = oneshot::channel();
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.expect("accept client");
             let mut socket = accept_async(socket)
@@ -3634,6 +3635,10 @@ mod tests {
                     .await
                     .expect("send public trade frame");
             }
+            timeout(Duration::from_secs(1), await_client_termination)
+                .await
+                .expect("client must terminate after the identity-cap record")
+                .expect("test client completion signal must be delivered");
         });
 
         let limits = WsLimits::fast_with_trade_identity_limit_for_test(1);
@@ -3661,6 +3666,9 @@ mod tests {
                 .expect("stream must stop at its exact identity cap")
                 .is_none()
         );
+        client_terminated
+            .send(())
+            .expect("server must wait for client termination");
         server.await.expect("server task must complete");
     }
 
