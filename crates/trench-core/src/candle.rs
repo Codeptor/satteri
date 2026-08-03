@@ -509,13 +509,19 @@ impl CandleAggregator {
         let complete = self
             .pending
             .keys()
-            .filter(|key| {
+            .map(|key| {
                 key.open_time
                     .checked_add(key.interval.duration())
-                    .is_ok_and(|close| close <= watermark)
+                    .map(|close| (key.clone(), close))
+                    .map_err(CandleError::from)
             })
-            .cloned()
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()
+            .map(|pending| {
+                pending
+                    .into_iter()
+                    .filter_map(|(key, close)| (close <= watermark).then_some(key))
+                    .collect::<Vec<_>>()
+            })?;
         let candles = complete
             .iter()
             .map(|key| {
@@ -602,7 +608,7 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use crate::domain::{Market, Price, Quantity, Side};
-    use crate::event::{CandleInterval, MarketEvent, TimestampNs, Trade};
+    use crate::event::{CandleInterval, EventError, MarketEvent, TimestampNs, Trade};
 
     use super::{CandleAggregator, CandleError};
 
@@ -741,6 +747,32 @@ mod tests {
         );
         assert_eq!(aggregator.pending, pending_before);
         assert_eq!(aggregator.seen, seen_before);
+        assert_eq!(aggregator.watermark, None);
+    }
+
+    #[test]
+    fn unrepresentable_bucket_close_leaves_finalization_state_unchanged() {
+        let mut aggregator = CandleAggregator::new();
+        aggregator
+            .ingest(&trade(i128::from(i64::MAX), 1, dec!(100)))
+            .expect("near-limit trade must be buffered before finalization");
+        let pending_before = aggregator.pending.clone();
+        let seen_before = aggregator.seen.clone();
+        let pending_counts_before = aggregator.pending_counts.clone();
+        let hourly_trade_ids_before = aggregator.hourly_trade_ids.clone();
+        let finalized_before = aggregator.finalized.clone();
+        let finalized_order_before = aggregator.finalized_order.clone();
+
+        assert!(matches!(
+            aggregator.complete_through(timestamp(i128::from(i64::MAX))),
+            Err(CandleError::Event(EventError::TimestampArithmetic))
+        ));
+        assert_eq!(aggregator.pending, pending_before);
+        assert_eq!(aggregator.seen, seen_before);
+        assert_eq!(aggregator.pending_counts, pending_counts_before);
+        assert_eq!(aggregator.hourly_trade_ids, hourly_trade_ids_before);
+        assert_eq!(aggregator.finalized, finalized_before);
+        assert_eq!(aggregator.finalized_order, finalized_order_before);
         assert_eq!(aggregator.watermark, None);
     }
 
