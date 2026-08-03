@@ -16,8 +16,8 @@ use crate::event::{
 use crate::universe::TradeableUniverse;
 
 const FEATURE_SCHEMA: &str = concat!(
-    "trench.common-features.v2\n",
-    "warmup.bars=97;context_observations=30;funding_observations=30\n",
+    "trench.common-features.v3\n",
+    "warmup.bars=97;context_observations=30:canonical-boundary;funding_observations=30\n",
     "rule_history=derivatives:30d;hourly_realized_volatility_20:90d\n",
     "returns=1,2,4,8,16,32,96\n",
     "ema=8,20,32;ema_slope=8:4;close_ema_20_residual;high_low=10\n",
@@ -1780,13 +1780,13 @@ impl CommonFeatureEngine {
             && self
                 .pruned_candle_through
                 .contains_key(&(market.clone(), sleeve));
-        let context_events = self.context_events(&market, as_of_time);
-        let context_events = trailing_window(&context_events, CONTEXT_WINDOW);
+        let context_events = self.canonical_context_samples(&market, sleeve, as_of_time);
         let context_history = context_events
+            .as_ref()
             .map(|events| {
                 events
                     .iter()
-                    .filter_map(|event| match event.kind() {
+                    .filter_map(|(_, event)| match event.kind() {
                         MarketEventKind::AssetContext(context) => Some(context),
                         _ => None,
                     })
@@ -1887,7 +1887,7 @@ impl CommonFeatureEngine {
                 let range = input_range(
                     feature_history,
                     hourly_history,
-                    context_events,
+                    &context_events,
                     &funding_events,
                     bbo_event,
                     book_event,
@@ -1949,11 +1949,29 @@ impl CommonFeatureEngine {
             .unwrap_or_default()
     }
 
-    fn context_events(&self, market: &Market, as_of_time: TimestampNs) -> Vec<&MarketEvent> {
-        self.events
-            .get(market)
-            .map(|history| available_events(&history.contexts, as_of_time))
-            .unwrap_or_default()
+    fn canonical_context_samples(
+        &self,
+        market: &Market,
+        sleeve: CandleInterval,
+        as_of_time: TimestampNs,
+    ) -> Option<Vec<(TimestampNs, &MarketEvent)>> {
+        let count = CONTEXT_WINDOW;
+        let interval_ns = sleeve.duration().value();
+        let span_ns =
+            i128::from(interval_ns).checked_mul(i128::try_from(count.checked_sub(1)?).ok()?)?;
+        let first = i128::from(as_of_time.value()).checked_sub(span_ns)?;
+        let by_boundary = self.context_samples.get(&(market.clone(), sleeve))?;
+        (0..count)
+            .map(|offset| {
+                let boundary_ns = first.checked_add(
+                    i128::from(interval_ns).checked_mul(i128::try_from(offset).ok()?)?,
+                )?;
+                let boundary = TimestampNs::new(boundary_ns).ok()?;
+                let event = by_boundary.get(&boundary)?;
+                matches!(event.kind(), MarketEventKind::AssetContext(_)).then_some(())?;
+                event_is_available(event, boundary).then_some((boundary, event))
+            })
+            .collect()
     }
 
     fn canonical_funding_samples(
@@ -2294,13 +2312,6 @@ fn candle_duplicate_result(existing: &Candle, incoming: &Candle) -> Result<(), F
     })
 }
 
-fn available_events(events: &EventHistory, as_of_time: TimestampNs) -> Vec<&MarketEvent> {
-    events
-        .values()
-        .filter(|event| event_is_available(event, as_of_time))
-        .collect()
-}
-
 fn event_is_available(event: &MarketEvent, as_of_time: TimestampNs) -> bool {
     event.event_time() <= as_of_time && event.received_at() <= as_of_time
 }
@@ -2321,13 +2332,6 @@ struct BaseSnapshot {
     unready_reason: Option<FeatureUnreadyReason>,
     values: BTreeMap<String, Decimal>,
     regime: Option<RegimeInputs>,
-}
-
-fn trailing_window<T>(values: &[T], count: usize) -> Option<&[T]> {
-    values
-        .len()
-        .checked_sub(count)
-        .and_then(|start| values.get(start..))
 }
 
 fn hourly_regime(history: &[&Candle]) -> Option<RegimeInputs> {
@@ -2583,7 +2587,7 @@ fn build_values(inputs: &SnapshotInputs<'_>) -> Option<BTreeMap<String, Decimal>
 fn input_range(
     feature_history: &[&Candle],
     hourly_history: &[&Candle],
-    context_events: &[&MarketEvent],
+    context_events: &[(TimestampNs, &MarketEvent)],
     funding_events: &[(TimestampNs, &MarketEvent)],
     bbo_event: &MarketEvent,
     book_event: &MarketEvent,
@@ -2595,11 +2599,9 @@ fn input_range(
         .chain(hourly_history.iter().map(|candle| {
             InputEventSpan::candle(candle_input_kind(candle.candle().interval()), candle)
         }))
-        .chain(
-            context_events
-                .iter()
-                .map(|event| InputEventSpan::event(FeatureInputKind::AssetContext, event)),
-        )
+        .chain(context_events.iter().map(|(boundary, event)| {
+            InputEventSpan::sampled_event(FeatureInputKind::AssetContext, event, *boundary)
+        }))
         .chain(funding_events.iter().map(|(boundary, event)| {
             InputEventSpan::sampled_event(FeatureInputKind::Funding, event, *boundary)
         }))
@@ -5096,6 +5098,86 @@ mod tests {
         assert_eq!(
             snapshot.values().get("trade_imbalance_15m"),
             Some(&Decimal::ONE)
+        );
+    }
+
+    #[test]
+    fn open_interest_lookbacks_use_receipt_aware_boundary_samples_not_raw_context_bursts() {
+        let btc = market("BTC");
+        let eth = market("ETH");
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        for (market, offset) in [(btc.clone(), dec!(100)), (eth.clone(), dec!(200))] {
+            populate(
+                &mut engine,
+                &mut aggregator,
+                market,
+                0,
+                128,
+                offset,
+                dec!(1),
+            );
+        }
+        let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
+        complete_with_canonical_funding_history(&mut engine, &mut aggregator, decision);
+        let universe = tradeable_universe(decision, [btc.clone(), eth]);
+        let before = engine
+            .snapshots_at_with_universe(
+                crate::event::CandleInterval::FifteenMinutes,
+                decision,
+                Some(&universe),
+            )
+            .into_iter()
+            .find(|snapshot| snapshot.market() == &btc)
+            .expect("BTC snapshot must exist");
+
+        for sequence in 0..(super::SOURCE_EVENT_HISTORY - 128) {
+            let rate = FundingRate::new(Decimal::from(sequence));
+            let source_time = TimestampNs::new(
+                i128::from(decision.value()) - i128::try_from(sequence).expect("sequence fits") - 1,
+            )
+            .expect("burst source time must be valid");
+            let burst = MarketEvent::asset_context(
+                source_time,
+                source_time,
+                btc.clone(),
+                AssetContext::new(
+                    price(dec!(10_000) + Decimal::from(sequence)),
+                    price(dec!(9_999) + Decimal::from(sequence)),
+                    Some(price(dec!(10_000) + Decimal::from(sequence))),
+                    quantity(dec!(128)),
+                    Usdc::new(dec!(1_000_000)).expect("test USDC must be valid"),
+                    rate,
+                ),
+            )
+            .expect("burst context must be valid");
+            engine
+                .observe(&burst)
+                .expect("burst context must be accepted");
+        }
+
+        let after = engine
+            .snapshots_at_with_universe(
+                crate::event::CandleInterval::FifteenMinutes,
+                decision,
+                Some(&universe),
+            )
+            .into_iter()
+            .find(|snapshot| snapshot.market() == &btc)
+            .expect("BTC snapshot must exist");
+
+        for lookback in [1, 4, 16] {
+            let name = format!("open_interest_change_{lookback}");
+            assert_eq!(after.values().get(&name), before.values().get(&name));
+        }
+        assert!(
+            after
+                .input_range()
+                .expect("ready snapshot must retain provenance")
+                .spans()
+                .iter()
+                .filter(|span| span.kind() == FeatureInputKind::AssetContext)
+                .all(|span| span.sampled_at.is_some())
         );
     }
 }
