@@ -20,7 +20,7 @@ const FEATURE_SCHEMA: &str = concat!(
     "warmup.bars=97;context_observations=30:canonical-boundary;funding_observations=30\n",
     "rule_history=derivatives:30d;hourly_realized_volatility_20:90d\n",
     "returns=1,2,4,8,16,32,96\n",
-    "ema=8,20,32;ema_slope=8:4;close_ema_20_residual;high_low=10\n",
+    "ema=8,20,32;ema_slope=8:4;close_ema_20_residual;close_ema_20_residual_robust_z=20;high_low=10\n",
     "rsi=14;atr=14;adx=14;realized_volatility=8,20,64\n",
     "donchian=20;volume_robust_z=20\n",
     "premium;open_interest_change=1,4,16;funding=level,percentile:30\n",
@@ -1237,7 +1237,7 @@ impl AggressiveTradeWindow {
 }
 
 /// Bounded, source-specific point-in-time histories for one market.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct MarketEventHistory {
     contexts: EventHistory,
     fundings: EventHistory,
@@ -1343,7 +1343,7 @@ const fn sleeve_name(interval: CandleInterval) -> &'static str {
 /// Active source and candle windows are bounded. Identities evicted from those
 /// windows remain idempotent only for [`FINALIZED_EVENT_ID_HORIZON`] or
 /// [`FINALIZED_CANDLE_ID_HORIZON`] canonical ordering positions, respectively.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct CommonFeatureEngine {
     seen_events: BTreeMap<EventId, MarketEvent>,
     finalized_events: BTreeMap<EventId, MarketEvent>,
@@ -1380,6 +1380,7 @@ impl CommonFeatureEngine {
     /// Returns [`FeatureError::ConflictingEvent`] for a reused identity with a
     /// nonidentical immutable payload, or rejects input before its retained
     /// source horizon instead of silently changing a bounded feature window.
+    /// Any error leaves all retained source and aggregate state unchanged.
     pub fn observe(&mut self, event: &MarketEvent) -> Result<(), FeatureError> {
         if let Some(existing) = self.seen_events.get(event.event_id()) {
             return event_duplicate_result(existing, event);
@@ -1387,6 +1388,13 @@ impl CommonFeatureEngine {
         if let Some(existing) = self.finalized_events.get(event.event_id()) {
             return event_duplicate_result(existing, event);
         }
+        let mut staged = self.clone();
+        staged.observe_new(event)?;
+        *self = staged;
+        Ok(())
+    }
+
+    fn observe_new(&mut self, event: &MarketEvent) -> Result<(), FeatureError> {
         self.ensure_market_capacity(event.market())?;
         let accepts = self
             .events
@@ -2487,6 +2495,10 @@ fn build_values(inputs: &SnapshotInputs<'_>) -> Option<BTreeMap<String, Decimal>
         "close_ema_20_residual".to_owned(),
         close.checked_sub(ema_20)?,
     );
+    values.insert(
+        "close_ema_20_residual_robust_z_20".to_owned(),
+        ema_residual_robust_z(&close_values, 20, 20)?,
+    );
     values.insert("ema_8_32_ratio".to_owned(), ema_8.checked_div(ema_32)?);
     values.insert(
         "ema_8_slope_4".to_owned(),
@@ -3122,6 +3134,18 @@ fn robust_z(values: &[Decimal]) -> Option<Decimal> {
         .and_then(|value| value.checked_div(Decimal::from(3)))
 }
 
+fn ema_residual_robust_z(
+    close_values: &[Decimal],
+    ema_period: usize,
+    robust_z_window: usize,
+) -> Option<Decimal> {
+    let start = close_values.len().checked_sub(robust_z_window)?;
+    let residuals = (start..close_values.len())
+        .map(|end| close_values[end].checked_sub(ema(close_values.get(..=end)?, ema_period)?))
+        .collect::<Option<Vec<_>>>()?;
+    robust_z(&residuals)
+}
+
 fn median(values: &[Decimal]) -> Option<Decimal> {
     let mut sorted = values.to_vec();
     sorted.sort();
@@ -3272,6 +3296,8 @@ const fn unready_reason_tag(reason: Option<FeatureUnreadyReason>) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
@@ -5158,6 +5184,57 @@ mod tests {
     }
 
     #[test]
+    fn observe_rolls_back_both_sleeve_aggregates_when_the_second_sleeve_rejects() {
+        let btc = market("BTC");
+        let event = MarketEvent::trade(
+            absolute_timestamp(3_600_000_000_000),
+            absolute_timestamp(3_600_000_000_000),
+            btc.clone(),
+            Trade::new(10_001, Side::Buy, price(dec!(100)), quantity(dec!(1)))
+                .expect("test trade must be valid"),
+        )
+        .expect("test trade event must be valid");
+        let candidate_bucket = super::bucket_close(event.event_time(), super::MICRO_5_MINUTES_NS)
+            .expect("candidate bucket must be valid");
+        let aggregate = super::AggressiveTradeAggregate::from_trade(&event)
+            .expect("test aggregate must be valid");
+        let mut engine = CommonFeatureEngine::new();
+        engine.markets.insert(btc.clone());
+        for (sleeve, before_candidate) in [
+            (crate::event::CandleInterval::FifteenMinutes, true),
+            (crate::event::CandleInterval::OneHour, false),
+        ] {
+            let aggregates = (0..super::TRADE_AGGREGATE_HISTORY)
+                .map(|index| {
+                    let offset = i128::try_from(index + 1).expect("fixed capacity fits");
+                    let bucket = if before_candidate {
+                        absolute_timestamp(i128::from(candidate_bucket.value()) - offset)
+                    } else {
+                        absolute_timestamp(i128::from(candidate_bucket.value()) + offset)
+                    };
+                    ((bucket, event.received_at()), aggregate.clone())
+                })
+                .collect::<BTreeMap<_, _>>();
+            engine
+                .trade_aggregates
+                .insert((btc.clone(), sleeve), aggregates);
+        }
+        let before_aggregates = engine.trade_aggregates.clone();
+
+        let first = engine
+            .observe(&event)
+            .expect_err("the one-hour retention boundary must reject");
+        let second = engine
+            .observe(&event)
+            .expect_err("a retry must fail identically");
+
+        assert_eq!(first, second);
+        assert_eq!(engine.trade_aggregates, before_aggregates);
+        assert!(engine.seen_events.is_empty());
+        assert!(engine.events.is_empty());
+    }
+
+    #[test]
     fn open_interest_lookbacks_use_receipt_aware_boundary_samples_not_raw_context_bursts() {
         let btc = market("BTC");
         let eth = market("ETH");
@@ -5234,6 +5311,52 @@ mod tests {
                 .iter()
                 .filter(|span| span.kind() == FeatureInputKind::AssetContext)
                 .all(|span| span.sampled_at.is_some())
+        );
+    }
+
+    #[test]
+    fn rules_can_read_exact_close_ema_residual_robust_z_from_the_public_snapshot() {
+        let btc = market("BTC");
+        let eth = market("ETH");
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        for (market, offset) in [(btc.clone(), dec!(100)), (eth, dec!(200))] {
+            populate(
+                &mut engine,
+                &mut aggregator,
+                market,
+                0,
+                128,
+                offset,
+                dec!(1),
+            );
+        }
+        let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
+        complete_with_canonical_funding_history(&mut engine, &mut aggregator, decision);
+        let snapshot = engine
+            .snapshots_at_with_universe(
+                crate::event::CandleInterval::FifteenMinutes,
+                decision,
+                Some(&tradeable_universe(decision, [btc.clone(), market("ETH")])),
+            )
+            .into_iter()
+            .find(|snapshot| snapshot.market() == &btc)
+            .expect("BTC snapshot must exist");
+        let history =
+            engine.candle_history(&btc, crate::event::CandleInterval::FifteenMinutes, decision);
+        let closes = super::closes(&history);
+        let residuals = (closes.len() - 20..closes.len())
+            .map(|end| {
+                closes[end]
+                    .checked_sub(super::ema(&closes[..=end], 20).expect("EMA must exist"))
+                    .expect("residual must be representable")
+            })
+            .collect::<Vec<_>>();
+        let expected = super::robust_z(&residuals).expect("robust z must exist");
+
+        assert_eq!(
+            snapshot.values().get("close_ema_20_residual_robust_z_20"),
+            Some(&expected)
         );
     }
 }
