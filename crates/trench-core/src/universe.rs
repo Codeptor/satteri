@@ -1,6 +1,9 @@
 //! Immutable tradeable-universe contracts shared by point-in-time feature consumers.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+};
 
 use blake3::Hasher;
 use rust_decimal::Decimal;
@@ -21,7 +24,6 @@ const MAX_EFFECTIVE_SPREAD_BPS: Decimal = Decimal::from_parts(15, 0, 0, false, 0
 const MINIMUM_DAILY_NOTIONAL_USDC: Decimal = Decimal::from_parts(5_000_000, 0, 0, false, 0);
 const FIXED_DEPTH_PROBE_USDC: Decimal = Decimal::from_parts(500, 0, 0, false, 0);
 const MINIMUM_DEPTH_MULTIPLE: Decimal = Decimal::from_parts(100, 0, 0, false, 0);
-const MINIMUM_EXECUTABLE_DEPTH_USDC: Decimal = Decimal::from_parts(50_000, 0, 0, false, 0);
 const WARM_BUFFER_MARKETS: usize = 10;
 const VOLUME_WEIGHT: Decimal = Decimal::from_parts(30, 0, 0, false, 2);
 const OPEN_INTEREST_WEIGHT: Decimal = Decimal::from_parts(20, 0, 0, false, 2);
@@ -44,8 +46,19 @@ pub enum UniverseError {
         limit: usize,
     },
     /// Serialized membership did not match its deterministic content digest.
-    #[error("tradeable universe digest does not match its serialized membership")]
+    #[error("universe digest does not match its serialized contents")]
     DigestMismatch,
+    /// Serialized snapshot inputs or derived fields differed from canonical selector output.
+    #[error("universe snapshot contents do not match canonical selector output")]
+    SnapshotContentMismatch,
+    /// A snapshot field was malformed or not encoded canonically.
+    #[error("invalid universe snapshot wire field `{field}`: {message}")]
+    InvalidSnapshotWire {
+        /// The rejected field name.
+        field: &'static str,
+        /// The validation failure.
+        message: String,
+    },
     /// A universe must freeze at a completed UTC hour.
     #[error("tradeable universe boundary {as_of_time} is not a completed UTC hour")]
     NotCompletedHour {
@@ -83,6 +96,28 @@ pub enum UniverseError {
         decision_time: TimestampNs,
         /// The later snapshot boundary.
         snapshot_time: TimestampNs,
+    },
+    /// A completed hourly snapshot was no longer the latest one available to a decision.
+    #[error(
+        "strategy decision {decision_time} requires a newer universe than snapshot {snapshot_time}"
+    )]
+    SnapshotNotCurrent {
+        /// The stale hourly universe boundary.
+        snapshot_time: TimestampNs,
+        /// The strategy decision that must use a newer completed hour.
+        decision_time: TimestampNs,
+    },
+    /// Current membership was created after the snapshot or strategy decision that would consume it.
+    #[error(
+        "current universe {current_time} is after snapshot {snapshot_time} or decision {decision_time}"
+    )]
+    CurrentUniverseFromFuture {
+        /// The future membership boundary.
+        current_time: TimestampNs,
+        /// The hourly snapshot boundary being activated.
+        snapshot_time: TimestampNs,
+        /// The strategy decision boundary.
+        decision_time: TimestampNs,
     },
     /// Checked arithmetic could not preserve an exact deterministic selector value.
     #[error("checked arithmetic failed while calculating {operation}")]
@@ -641,6 +676,347 @@ impl UniverseSnapshot {
     pub fn digest(&self) -> &str {
         &self.digest
     }
+
+    fn to_wire(&self) -> UniverseSnapshotWire {
+        UniverseSnapshotWire {
+            as_of_time_ns: self.as_of_time.value(),
+            entries: self
+                .entries
+                .values()
+                .map(UniverseEntryWire::from_entry)
+                .collect(),
+            digest: self.digest.clone(),
+        }
+    }
+
+    fn from_wire(wire: UniverseSnapshotWire) -> Result<Self, UniverseError> {
+        let as_of_time = TimestampNs::new(i128::from(wire.as_of_time_ns)).map_err(|error| {
+            UniverseError::InvalidSnapshotWire {
+                field: "as_of_time_ns",
+                message: error.to_string(),
+            }
+        })?;
+        let candidates = wire
+            .entries
+            .iter()
+            .map(UniverseEntryWire::to_candidate)
+            .collect::<Result<Vec<_>, _>>()?;
+        let snapshot = UniverseSelector::select(as_of_time, candidates)?;
+        if snapshot.digest != wire.digest {
+            return Err(UniverseError::DigestMismatch);
+        }
+        let canonical = snapshot.to_wire();
+        if canonical.entries != wire.entries {
+            return Err(UniverseError::SnapshotContentMismatch);
+        }
+        Ok(snapshot)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UniverseSnapshotWire {
+    as_of_time_ns: i64,
+    entries: Vec<UniverseEntryWire>,
+    digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UniverseEntryWire {
+    market: String,
+    native_perpetual: bool,
+    listing_state: ListingStateWire,
+    live_mid: bool,
+    live_mark: bool,
+    live_metadata: bool,
+    venue_max_leverage: u16,
+    usable_calendar_days: u16,
+    trailing_seven_day_coverage: String,
+    detailed_feed_fresh: bool,
+    feed_continuity: String,
+    trailing_day_notional_usdc: String,
+    open_interest_notional_usdc: String,
+    effective_spread_bps: String,
+    bid_depth: SidedDepthWire,
+    ask_depth: SidedDepthWire,
+    exclusion_reasons: Vec<UniverseExclusionReasonWire>,
+    score: Option<LiquidityScoreWire>,
+    rank: Option<u64>,
+    membership: MembershipWire,
+}
+
+impl UniverseEntryWire {
+    fn from_entry(entry: &UniverseEntry) -> Self {
+        let candidate = entry.candidate();
+        let availability = candidate.availability();
+        let history = candidate.history();
+        let liquidity = candidate.liquidity();
+        Self {
+            market: candidate.market().as_str().to_owned(),
+            native_perpetual: candidate.is_native_perpetual(),
+            listing_state: availability.listing_state().into(),
+            live_mid: availability.has_live_mid(),
+            live_mark: availability.has_live_mark(),
+            live_metadata: availability.has_live_metadata(),
+            venue_max_leverage: availability.venue_max_leverage(),
+            usable_calendar_days: history.usable_calendar_days(),
+            trailing_seven_day_coverage: canonical_decimal(history.trailing_seven_day_coverage()),
+            detailed_feed_fresh: history.detailed_feed_fresh(),
+            feed_continuity: canonical_decimal(history.feed_continuity()),
+            trailing_day_notional_usdc: canonical_decimal(
+                liquidity.trailing_day_notional().value(),
+            ),
+            open_interest_notional_usdc: canonical_decimal(
+                liquidity.open_interest_notional().value(),
+            ),
+            effective_spread_bps: canonical_decimal(liquidity.effective_spread().value()),
+            bid_depth: SidedDepthWire::from_depth(liquidity.depth().bid()),
+            ask_depth: SidedDepthWire::from_depth(liquidity.depth().ask()),
+            exclusion_reasons: entry
+                .exclusion_reasons()
+                .iter()
+                .copied()
+                .map(Into::into)
+                .collect(),
+            score: entry.liquidity_score().map(LiquidityScoreWire::from_score),
+            rank: entry.rank(),
+            membership: entry.membership().into(),
+        }
+    }
+
+    fn to_candidate(&self) -> Result<UniverseCandidate, UniverseError> {
+        let market = Market::new(self.market.clone())
+            .map_err(|error| invalid_snapshot_wire("market", error))?;
+        let availability = MarketDataAvailability::new(
+            self.listing_state.into(),
+            self.live_mid,
+            self.live_mark,
+            self.live_metadata,
+            self.venue_max_leverage,
+        );
+        let history = HistoryQuality::new(
+            self.usable_calendar_days,
+            parse_canonical_decimal(
+                &self.trailing_seven_day_coverage,
+                "trailing_seven_day_coverage",
+            )?,
+            self.detailed_feed_fresh,
+            parse_canonical_decimal(&self.feed_continuity, "feed_continuity")?,
+        )?;
+        let liquidity = UniverseLiquidity::new(
+            Usdc::new(parse_canonical_decimal(
+                &self.trailing_day_notional_usdc,
+                "trailing_day_notional_usdc",
+            )?)
+            .map_err(|error| invalid_snapshot_wire("trailing_day_notional_usdc", error))?,
+            Usdc::new(parse_canonical_decimal(
+                &self.open_interest_notional_usdc,
+                "open_interest_notional_usdc",
+            )?)
+            .map_err(|error| invalid_snapshot_wire("open_interest_notional_usdc", error))?,
+            Bps::new(parse_canonical_decimal(
+                &self.effective_spread_bps,
+                "effective_spread_bps",
+            )?)
+            .map_err(|error| invalid_snapshot_wire("effective_spread_bps", error))?,
+            DepthProfile::new(
+                self.bid_depth.to_depth("bid_depth")?,
+                self.ask_depth.to_depth("ask_depth")?,
+            ),
+        );
+        Ok(UniverseCandidate::new(
+            market,
+            self.native_perpetual,
+            availability,
+            history,
+            liquidity,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SidedDepthWire {
+    at_10_bps_usdc: String,
+    at_25_bps_usdc: String,
+    at_50_bps_usdc: String,
+}
+
+impl SidedDepthWire {
+    fn from_depth(depth: &SidedDepth) -> Self {
+        Self {
+            at_10_bps_usdc: canonical_decimal(depth.at_10_bps().value()),
+            at_25_bps_usdc: canonical_decimal(depth.at_25_bps().value()),
+            at_50_bps_usdc: canonical_decimal(depth.at_50_bps().value()),
+        }
+    }
+
+    fn to_depth(&self, field: &'static str) -> Result<SidedDepth, UniverseError> {
+        SidedDepth::new(
+            Usdc::new(parse_canonical_decimal(&self.at_10_bps_usdc, field)?)
+                .map_err(|error| invalid_snapshot_wire(field, error))?,
+            Usdc::new(parse_canonical_decimal(&self.at_25_bps_usdc, field)?)
+                .map_err(|error| invalid_snapshot_wire(field, error))?,
+            Usdc::new(parse_canonical_decimal(&self.at_50_bps_usdc, field)?)
+                .map_err(|error| invalid_snapshot_wire(field, error))?,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ListingStateWire {
+    Active,
+    Delisted,
+    Paused,
+}
+
+impl From<ListingState> for ListingStateWire {
+    fn from(value: ListingState) -> Self {
+        match value {
+            ListingState::Active => Self::Active,
+            ListingState::Delisted => Self::Delisted,
+            ListingState::Paused => Self::Paused,
+        }
+    }
+}
+
+impl From<ListingStateWire> for ListingState {
+    fn from(value: ListingStateWire) -> Self {
+        match value {
+            ListingStateWire::Active => Self::Active,
+            ListingStateWire::Delisted => Self::Delisted,
+            ListingStateWire::Paused => Self::Paused,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum UniverseExclusionReasonWire {
+    NotNativePerpetual,
+    Delisted,
+    Paused,
+    MissingLiveMid,
+    MissingLiveMark,
+    MissingLiveMetadata,
+    VenueMaxLeverageBelowMinimum,
+    InsufficientLocalHistory,
+    InsufficientRequiredBarCoverage,
+    StaleDetailedFeed,
+    InsufficientDailyNotional,
+    ExcessiveEffectiveSpread,
+    InsufficientExecutableDepth,
+}
+
+impl From<UniverseExclusionReason> for UniverseExclusionReasonWire {
+    fn from(value: UniverseExclusionReason) -> Self {
+        match value {
+            UniverseExclusionReason::NotNativePerpetual => Self::NotNativePerpetual,
+            UniverseExclusionReason::Delisted => Self::Delisted,
+            UniverseExclusionReason::Paused => Self::Paused,
+            UniverseExclusionReason::MissingLiveMid => Self::MissingLiveMid,
+            UniverseExclusionReason::MissingLiveMark => Self::MissingLiveMark,
+            UniverseExclusionReason::MissingLiveMetadata => Self::MissingLiveMetadata,
+            UniverseExclusionReason::VenueMaxLeverageBelowMinimum => {
+                Self::VenueMaxLeverageBelowMinimum
+            }
+            UniverseExclusionReason::InsufficientLocalHistory => Self::InsufficientLocalHistory,
+            UniverseExclusionReason::InsufficientRequiredBarCoverage => {
+                Self::InsufficientRequiredBarCoverage
+            }
+            UniverseExclusionReason::StaleDetailedFeed => Self::StaleDetailedFeed,
+            UniverseExclusionReason::InsufficientDailyNotional => Self::InsufficientDailyNotional,
+            UniverseExclusionReason::ExcessiveEffectiveSpread => Self::ExcessiveEffectiveSpread,
+            UniverseExclusionReason::InsufficientExecutableDepth => {
+                Self::InsufficientExecutableDepth
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MembershipWire {
+    Tradeable,
+    Warm,
+    Absent,
+}
+
+impl From<Membership> for MembershipWire {
+    fn from(value: Membership) -> Self {
+        match value {
+            Membership::Tradeable => Self::Tradeable,
+            Membership::Warm => Self::Warm,
+            Membership::Absent => Self::Absent,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiquidityScoreWire {
+    volume_percentile: String,
+    open_interest_percentile: String,
+    inverse_spread_percentile: String,
+    depth_percentile: String,
+    continuity_percentile: String,
+    total: String,
+}
+
+impl LiquidityScoreWire {
+    fn from_score(score: LiquidityScore) -> Self {
+        Self {
+            volume_percentile: canonical_decimal(score.volume_percentile()),
+            open_interest_percentile: canonical_decimal(score.open_interest_percentile()),
+            inverse_spread_percentile: canonical_decimal(score.inverse_spread_percentile()),
+            depth_percentile: canonical_decimal(score.depth_percentile()),
+            continuity_percentile: canonical_decimal(score.continuity_percentile()),
+            total: canonical_decimal(score.total()),
+        }
+    }
+}
+
+fn canonical_decimal(value: Decimal) -> String {
+    value.normalize().to_string()
+}
+
+fn parse_canonical_decimal(value: &str, field: &'static str) -> Result<Decimal, UniverseError> {
+    let decimal = Decimal::from_str(value).map_err(|error| invalid_snapshot_wire(field, error))?;
+    if canonical_decimal(decimal) != value {
+        return Err(UniverseError::InvalidSnapshotWire {
+            field,
+            message: "decimal must use canonical normalized syntax".to_owned(),
+        });
+    }
+    Ok(decimal)
+}
+
+fn invalid_snapshot_wire(field: &'static str, error: impl std::fmt::Display) -> UniverseError {
+    UniverseError::InvalidSnapshotWire {
+        field,
+        message: error.to_string(),
+    }
+}
+
+impl Serialize for UniverseSnapshot {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.to_wire().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for UniverseSnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = UniverseSnapshotWire::deserialize(deserializer)?;
+        Self::from_wire(wire).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Stateless deterministic selector for the dynamically ranked native-perp universe.
@@ -673,8 +1049,8 @@ impl UniverseSelector {
 
         let exclusions = candidates_by_market
             .iter()
-            .map(|(market, candidate)| (market.clone(), exclusion_reasons(candidate)))
-            .collect::<BTreeMap<_, _>>();
+            .map(|(market, candidate)| Ok((market.clone(), exclusion_reasons(candidate)?)))
+            .collect::<Result<BTreeMap<_, _>, UniverseError>>()?;
         let eligible = candidates_by_market
             .values()
             .filter(|candidate| {
@@ -759,6 +1135,27 @@ impl UniverseSelector {
                 snapshot_time: snapshot.as_of_time(),
             });
         }
+        let next_hour = snapshot.as_of_time().value().checked_add(HOUR_NS).ok_or(
+            UniverseError::Arithmetic {
+                operation: "next universe refresh boundary",
+            },
+        )?;
+        if decision_time.value() >= next_hour {
+            return Err(UniverseError::SnapshotNotCurrent {
+                snapshot_time: snapshot.as_of_time(),
+                decision_time,
+            });
+        }
+        if let Some(current) = current
+            && (current.as_of_time() > snapshot.as_of_time()
+                || current.as_of_time() > decision_time)
+        {
+            return Err(UniverseError::CurrentUniverseFromFuture {
+                current_time: current.as_of_time(),
+                snapshot_time: snapshot.as_of_time(),
+                decision_time,
+            });
+        }
         let next_activation = snapshot
             .as_of_time()
             .value()
@@ -795,7 +1192,9 @@ fn validate_fraction(value: Decimal, field: &'static str) -> Result<(), Universe
     Ok(())
 }
 
-fn exclusion_reasons(candidate: &UniverseCandidate) -> Vec<UniverseExclusionReason> {
+fn exclusion_reasons(
+    candidate: &UniverseCandidate,
+) -> Result<Vec<UniverseExclusionReason>, UniverseError> {
     let mut reasons = Vec::new();
     if !candidate.is_native_perpetual() {
         reasons.push(UniverseExclusionReason::NotNativePerpetual);
@@ -837,11 +1236,19 @@ fn exclusion_reasons(candidate: &UniverseCandidate) -> Vec<UniverseExclusionReas
         .depth()
         .minimum_executable_50_bps()
         .value()
-        < MINIMUM_EXECUTABLE_DEPTH_USDC
+        < minimum_executable_depth_usdc()?
     {
         reasons.push(UniverseExclusionReason::InsufficientExecutableDepth);
     }
-    reasons
+    Ok(reasons)
+}
+
+fn minimum_executable_depth_usdc() -> Result<Decimal, UniverseError> {
+    FIXED_DEPTH_PROBE_USDC
+        .checked_mul(MINIMUM_DEPTH_MULTIPLE)
+        .ok_or(UniverseError::Arithmetic {
+            operation: "minimum executable depth threshold",
+        })
 }
 
 fn score_eligible(
@@ -1264,8 +1671,8 @@ mod tests {
 
     use super::{
         DepthProfile, HistoryQuality, ListingState, MarketDataAvailability, Membership, SidedDepth,
-        TradeableUniverse, UniverseCandidate, UniverseExclusionReason, UniverseLiquidity,
-        UniverseSelector,
+        TradeableUniverse, UniverseCandidate, UniverseError, UniverseExclusionReason,
+        UniverseLiquidity, UniverseSelector,
     };
 
     const HOUR_NS: i128 = 3_600_000_000_000;
@@ -1386,6 +1793,65 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_round_trip_preserves_all_scored_and_excluded_inputs() {
+        let snapshot = UniverseSelector::select(
+            timestamp(HOUR_NS),
+            [
+                candidate("BTC", 1),
+                UniverseCandidate::new(
+                    Market::new("PAUSED").expect("market must be valid"),
+                    true,
+                    MarketDataAvailability::new(ListingState::Paused, true, true, true, 20),
+                    history(),
+                    liquidity(2),
+                ),
+            ],
+        )
+        .expect("selection must be valid");
+
+        let encoded = serde_json::to_string(&snapshot).expect("snapshot must serialize");
+        let decoded: super::UniverseSnapshot =
+            serde_json::from_str(&encoded).expect("snapshot must deserialize");
+
+        assert_eq!(decoded, snapshot);
+        assert_eq!(
+            serde_json::to_string(&decoded).expect("decoded snapshot must serialize"),
+            encoded,
+            "snapshot wire data must be canonical for deterministic replay"
+        );
+    }
+
+    #[test]
+    fn serialized_snapshot_rejects_tampered_inputs_and_unknown_wire_fields() {
+        let snapshot = UniverseSelector::select(timestamp(HOUR_NS), [candidate("BTC", 0)])
+            .expect("selection must be valid");
+        let encoded = serde_json::to_value(snapshot).expect("snapshot must serialize");
+
+        let mut tampered = encoded.clone();
+        tampered["entries"][0]["trailing_day_notional_usdc"] = Value::String("5000001".into());
+        assert!(
+            serde_json::from_value::<super::UniverseSnapshot>(tampered).is_err(),
+            "any causally relevant metric mutation must fail the snapshot digest"
+        );
+
+        let mut unknown = encoded;
+        unknown["unexpected"] = Value::Bool(true);
+        assert!(
+            serde_json::from_value::<super::UniverseSnapshot>(unknown).is_err(),
+            "snapshot wire data must reject unknown fields"
+        );
+
+        let snapshot = UniverseSelector::select(timestamp(HOUR_NS), [candidate("ETH", 0)])
+            .expect("selection must be valid");
+        let mut nested_unknown = serde_json::to_value(snapshot).expect("snapshot must serialize");
+        nested_unknown["entries"][0]["unexpected"] = Value::Bool(true);
+        assert!(
+            serde_json::from_value::<super::UniverseSnapshot>(nested_unknown).is_err(),
+            "nested snapshot wire data must reject unknown fields"
+        );
+    }
+
+    #[test]
     fn completed_hour_membership_is_current_for_each_following_fifteen_minute_decision() {
         let hour = TimestampNs::new(3_600_000_000_000).expect("timestamp must be valid");
         let universe =
@@ -1475,6 +1941,65 @@ mod tests {
         assert!(
             aaa.score().expect("AAA score") > bbb.score().expect("BBB score"),
             "the frozen depth component must use all three stated execution bands"
+        );
+    }
+
+    #[test]
+    fn depth_ranking_uses_ten_and_twenty_five_bps_when_fifty_bps_is_equal() {
+        let snapshot = UniverseSelector::select(
+            timestamp(HOUR_NS),
+            [
+                candidate_with_depth("NARROW", 100_000, 200_000, 300_000),
+                candidate_with_depth("SHALLOW", 50_000, 60_000, 300_000),
+            ],
+        )
+        .expect("selection must be valid");
+
+        let narrow = snapshot
+            .entry(&Market::new("NARROW").expect("market must be valid"))
+            .expect("NARROW must be ranked");
+        let shallow = snapshot
+            .entry(&Market::new("SHALLOW").expect("market must be valid"))
+            .expect("SHALLOW must be ranked");
+        assert!(
+            narrow
+                .liquidity_score()
+                .expect("NARROW score")
+                .depth_percentile()
+                > shallow
+                    .liquidity_score()
+                    .expect("SHALLOW score")
+                    .depth_percentile(),
+            "10/25-bps executable depth must influence the score independently of 50-bps depth"
+        );
+    }
+
+    #[test]
+    fn depth_ranking_uses_fifty_bps_when_near_bands_are_equal() {
+        let snapshot = UniverseSelector::select(
+            timestamp(HOUR_NS),
+            [
+                candidate_with_depth("DEEP", 100_000, 200_000, 400_000),
+                candidate_with_depth("THIN", 100_000, 200_000, 300_000),
+            ],
+        )
+        .expect("selection must be valid");
+
+        let deep = snapshot
+            .entry(&Market::new("DEEP").expect("market must be valid"))
+            .expect("DEEP must be ranked");
+        let thin = snapshot
+            .entry(&Market::new("THIN").expect("market must be valid"))
+            .expect("THIN must be ranked");
+        assert!(
+            deep.liquidity_score()
+                .expect("DEEP score")
+                .depth_percentile()
+                > thin
+                    .liquidity_score()
+                    .expect("THIN score")
+                    .depth_percentile(),
+            "50-bps executable depth must influence the score independently of the near bands"
         );
     }
 
@@ -1702,6 +2227,45 @@ mod tests {
         .expect("ranked universe must activate");
         assert!(after_next_bar.contains(&Market::new("NEW01").expect("market must be valid")));
         assert!(!after_next_bar.contains(&Market::new("AAA").expect("market must be valid")));
+    }
+
+    #[test]
+    fn activation_rejects_a_snapshot_at_its_next_hour_boundary_or_later() {
+        let snapshot = UniverseSelector::select(timestamp(HOUR_NS), [candidate("BTC", 0)])
+            .expect("selection must be valid");
+
+        for decision_time in [timestamp(HOUR_NS * 2), timestamp(HOUR_NS * 3)] {
+            assert!(matches!(
+                UniverseSelector::activate(&snapshot, None, decision_time),
+                Err(UniverseError::SnapshotNotCurrent {
+                    snapshot_time,
+                    decision_time: rejected_time,
+                }) if snapshot_time == snapshot.as_of_time() && rejected_time == decision_time
+            ));
+        }
+    }
+
+    #[test]
+    fn activation_rejects_current_membership_from_after_the_snapshot_or_decision() {
+        let snapshot = UniverseSelector::select(timestamp(HOUR_NS * 2), [candidate("BTC", 0)])
+            .expect("selection must be valid");
+        let future_current = TradeableUniverse::new(
+            timestamp(HOUR_NS * 3),
+            [Market::new("ETH").expect("market must be valid")],
+        )
+        .expect("future membership must be valid");
+        let decision_time = timestamp(HOUR_NS * 2 + FIFTEEN_MINUTES_NS);
+
+        assert!(matches!(
+            UniverseSelector::activate(&snapshot, Some(&future_current), decision_time),
+            Err(UniverseError::CurrentUniverseFromFuture {
+                current_time,
+                snapshot_time,
+                decision_time: rejected_time,
+            }) if current_time == future_current.as_of_time()
+                && snapshot_time == snapshot.as_of_time()
+                && rejected_time == decision_time
+        ));
     }
 
     #[test]
