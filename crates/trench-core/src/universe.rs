@@ -119,6 +119,18 @@ pub enum UniverseError {
         /// Actual source boundary carried by the supplied selector output.
         actual_snapshot_time: TimestampNs,
     },
+    /// A prior selector output did not cover the immediately following refresh hour.
+    #[error(
+        "prior selector activation must end at refresh snapshot {snapshot_time}; expected {expected_effective_until}, got {actual_effective_until}"
+    )]
+    PriorActivationExpiryMismatch {
+        /// Hourly snapshot being activated.
+        snapshot_time: TimestampNs,
+        /// Required exclusive end of the preceding activation interval.
+        expected_effective_until: TimestampNs,
+        /// Actual exclusive end carried by the supplied prior activation.
+        actual_effective_until: TimestampNs,
+    },
     /// A prior selector output no longer agrees with the digest of its frozen snapshot.
     #[error("prior selector output has invalid snapshot provenance at {snapshot_time}")]
     PriorSnapshotDigestMismatch {
@@ -134,6 +146,16 @@ pub enum UniverseError {
         snapshot_time: TimestampNs,
         /// Actual membership boundary carried by the selector output.
         membership_time: TimestampNs,
+    },
+    /// A selector activation carried an invalid bounded decision interval.
+    #[error(
+        "selector activation validity [{effective_from}, {effective_until}) is not one completed fifteen-minute decision interval"
+    )]
+    InvalidActivationValidity {
+        /// First instant at which the activation may affect a decision.
+        effective_from: TimestampNs,
+        /// Exclusive first instant after which the activation is invalid.
+        effective_until: TimestampNs,
     },
     /// Checked arithmetic could not preserve an exact deterministic selector value.
     #[error("checked arithmetic failed while calculating {operation}")]
@@ -662,6 +684,10 @@ impl UniverseEntry {
 }
 
 /// Complete immutable discovery result at one explicit completed UTC hour.
+///
+/// This is the only selector artifact that may cross a storage/replay boundary.
+/// Replay deserializes its strict wire form and calls [`UniverseSelector::activate`]
+/// for the decision bar; membership itself is never deserialized or caller-created.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UniverseSnapshot {
     as_of_time: TimestampNs,
@@ -673,20 +699,30 @@ pub struct UniverseSnapshot {
 ///
 /// This proof object is deliberately constructed only by [`UniverseSelector::activate`].
 /// Replays persist and validate `UniverseSnapshot` values, then reconstruct this short-lived
-/// transition state in order; a detached `TradeableUniverse` cannot be supplied as prior state.
+/// transition state in order. A refresh consumes only the final decision interval from the exact
+/// prior hourly snapshot; a detached `TradeableUniverse` cannot be supplied as prior state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UniverseActivation {
     snapshot: UniverseSnapshot,
     snapshot_digest: String,
     universe: Option<TradeableUniverse>,
+    effective_from: TimestampNs,
+    effective_until: TimestampNs,
 }
 
 impl UniverseActivation {
-    fn new(snapshot: UniverseSnapshot, universe: Option<TradeableUniverse>) -> Self {
+    fn new(
+        snapshot: UniverseSnapshot,
+        universe: Option<TradeableUniverse>,
+        effective_from: TimestampNs,
+        effective_until: TimestampNs,
+    ) -> Self {
         Self {
             snapshot_digest: snapshot.digest().to_owned(),
             snapshot,
             universe,
+            effective_from,
+            effective_until,
         }
     }
 
@@ -703,9 +739,22 @@ impl UniverseActivation {
     }
 
     /// Returns the active rank-1-to-20 membership, if any remains after hard removals.
+    ///
+    /// This is inspection-only. Cross-sectional feature computation accepts the
+    /// enclosing activation so its decision-time interval remains enforced.
     #[must_use]
     pub const fn universe(&self) -> Option<&TradeableUniverse> {
         self.universe.as_ref()
+    }
+
+    /// Returns whether this selector-issued activation authorizes `as_of_time`.
+    ///
+    /// Activations are valid only for the fifteen-minute decision interval that
+    /// produced them. In particular, a future rank refresh cannot be supplied
+    /// to an earlier feature computation.
+    #[must_use]
+    pub fn is_effective_for(&self, as_of_time: TimestampNs) -> bool {
+        as_of_time >= self.effective_from && as_of_time < self.effective_until
     }
 
     fn validate_provenance(&self) -> Result<(), UniverseError> {
@@ -723,6 +772,22 @@ impl UniverseActivation {
             return Err(UniverseError::PriorMembershipBoundaryMismatch {
                 snapshot_time: self.snapshot.as_of_time(),
                 membership_time: universe.as_of_time(),
+            });
+        }
+        let expected_until = self
+            .effective_from
+            .value()
+            .checked_add(STRATEGY_BAR_NS)
+            .and_then(|value| TimestampNs::new(i128::from(value)).ok())
+            .ok_or(UniverseError::Arithmetic {
+                operation: "universe activation validity boundary",
+            })?;
+        if self.effective_from.value() % STRATEGY_BAR_NS != 0
+            || self.effective_until != expected_until
+        {
+            return Err(UniverseError::InvalidActivationValidity {
+                effective_from: self.effective_from,
+                effective_until: self.effective_until,
             });
         }
         Ok(())
@@ -1197,7 +1262,7 @@ impl UniverseSelector {
     /// # Errors
     ///
     /// Rejects non-bar boundaries, stale snapshots, and prior state that lacks exact selector
-    /// snapshot provenance for the preceding hour.
+    /// snapshot provenance for the preceding hour's final decision interval.
     pub fn activate(
         snapshot: &UniverseSnapshot,
         current: Option<&UniverseActivation>,
@@ -1233,6 +1298,13 @@ impl UniverseSelector {
                     actual_snapshot_time: current.snapshot_time(),
                 });
             }
+            if current.effective_until != snapshot.as_of_time() {
+                return Err(UniverseError::PriorActivationExpiryMismatch {
+                    snapshot_time: snapshot.as_of_time(),
+                    expected_effective_until: snapshot.as_of_time(),
+                    actual_effective_until: current.effective_until,
+                });
+            }
         }
         let next_activation = snapshot
             .as_of_time()
@@ -1262,7 +1334,22 @@ impl UniverseSelector {
                 .collect::<Vec<_>>();
             frozen_membership(snapshot.as_of_time(), ranked)?
         };
-        Ok(UniverseActivation::new(snapshot.clone(), universe))
+        let effective_until = decision_time.value().checked_add(STRATEGY_BAR_NS).ok_or(
+            UniverseError::Arithmetic {
+                operation: "universe activation validity boundary",
+            },
+        )?;
+        let effective_until = TimestampNs::new(i128::from(effective_until)).map_err(|_| {
+            UniverseError::Arithmetic {
+                operation: "universe activation validity boundary",
+            }
+        })?;
+        Ok(UniverseActivation::new(
+            snapshot.clone(),
+            universe,
+            decision_time,
+            effective_until,
+        ))
     }
 }
 
@@ -1612,12 +1699,29 @@ fn hash_decimal(hasher: &mut Hasher, value: Decimal) {
     hasher.update(&[0]);
 }
 
-/// Immutable, serializable membership at one explicit UTC decision boundary.
+/// Immutable read-only membership at one explicit UTC decision boundary.
 ///
 /// It intentionally carries only the rank-1-to-20 tradeable set; warm-only or
 /// absent markets cannot leak into a strategy cross-section through this type.
 /// A membership alone is never valid prior state for [`UniverseSelector::activate`]; that
 /// transition requires its opaque [`UniverseActivation`] provenance.
+///
+/// ```compile_fail
+/// use trench_core::domain::Market;
+/// use trench_core::event::TimestampNs;
+/// use trench_core::universe::TradeableUniverse;
+///
+/// let market = Market::new("BTC").unwrap();
+/// let _ = TradeableUniverse::new(TimestampNs::new(0).unwrap(), [market]);
+/// ```
+///
+/// ```compile_fail
+/// use serde::Deserialize;
+/// use trench_core::universe::TradeableUniverse;
+///
+/// fn needs_deserializer<T: for<'de> Deserialize<'de>>() {}
+/// needs_deserializer::<TradeableUniverse>();
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TradeableUniverse {
     as_of_time: TimestampNs,
@@ -1626,12 +1730,7 @@ pub struct TradeableUniverse {
 }
 
 impl TradeableUniverse {
-    /// Creates a checked frozen tradeable universe.
-    ///
-    /// # Errors
-    ///
-    /// Rejects empty membership and more than the fixed rank-1-to-20 range.
-    pub fn new(
+    fn new(
         as_of_time: TimestampNs,
         markets: impl IntoIterator<Item = Market>,
     ) -> Result<Self, UniverseError> {
@@ -1673,70 +1772,10 @@ impl TradeableUniverse {
         self.markets.contains(market)
     }
 
-    /// Returns whether this is the sole valid completed-hour membership for a decision time.
-    ///
-    /// A Task 8 selector freezes exactly once per completed UTC hour. A 15-minute
-    /// decision uses that snapshot through the next hourly refresh, never a
-    /// future membership and never a snapshot older than the immediately
-    /// preceding completed hour.
-    #[must_use]
-    pub const fn is_current_for(&self, decision_time: TimestampNs) -> bool {
-        let delta = decision_time.value() - self.as_of_time.value();
-        delta >= 0 && delta < HOUR_NS
-    }
-
     /// Returns a stable content digest used in feature provenance and snapshot hashes.
     #[must_use]
     pub fn digest(&self) -> &str {
         &self.digest
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TradeableUniverseWire {
-    as_of_time_ns: i64,
-    markets: Vec<String>,
-    digest: String,
-}
-
-impl Serialize for TradeableUniverse {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        TradeableUniverseWire {
-            as_of_time_ns: self.as_of_time.value(),
-            markets: self
-                .markets
-                .iter()
-                .map(|market| market.as_str().to_owned())
-                .collect(),
-            digest: self.digest.clone(),
-        }
-        .serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for TradeableUniverse {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = TradeableUniverseWire::deserialize(deserializer)?;
-        let as_of_time =
-            TimestampNs::new(i128::from(wire.as_of_time_ns)).map_err(serde::de::Error::custom)?;
-        let markets = wire
-            .markets
-            .into_iter()
-            .map(Market::new)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(serde::de::Error::custom)?;
-        let universe = Self::new(as_of_time, markets).map_err(serde::de::Error::custom)?;
-        if universe.digest != wire.digest {
-            return Err(serde::de::Error::custom(UniverseError::DigestMismatch));
-        }
-        Ok(universe)
     }
 }
 
@@ -1761,8 +1800,8 @@ mod tests {
 
     use super::{
         DepthProfile, HistoryQuality, ListingState, MarketDataAvailability, Membership, SidedDepth,
-        TradeableUniverse, UniverseCandidate, UniverseError, UniverseExclusionReason,
-        UniverseLiquidity, UniverseSelector,
+        UniverseCandidate, UniverseError, UniverseExclusionReason, UniverseLiquidity,
+        UniverseSelector,
     };
 
     const HOUR_NS: i128 = 3_600_000_000_000;
@@ -1850,39 +1889,6 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_preserves_checked_membership_and_digest() {
-        let universe = TradeableUniverse::new(
-            TimestampNs::new(3_600_000_000_000).expect("timestamp must be valid"),
-            [
-                Market::new("ETH").expect("market must be valid"),
-                Market::new("BTC").expect("market must be valid"),
-            ],
-        )
-        .expect("membership must be valid");
-
-        let encoded = serde_json::to_string(&universe).expect("universe must serialize");
-        let decoded: TradeableUniverse =
-            serde_json::from_str(&encoded).expect("universe must deserialize");
-        assert_eq!(decoded, universe);
-    }
-
-    #[test]
-    fn serialized_universe_rejects_unknown_wire_fields() {
-        let universe = TradeableUniverse::new(
-            TimestampNs::new(3_600_000_000_000).expect("timestamp must be valid"),
-            [Market::new("BTC").expect("market must be valid")],
-        )
-        .expect("membership must be valid");
-        let mut encoded = serde_json::to_value(universe).expect("universe must serialize");
-        encoded["unexpected"] = serde_json::Value::Bool(true);
-
-        assert!(
-            serde_json::from_value::<TradeableUniverse>(encoded).is_err(),
-            "unknown universe wire fields must fail closed"
-        );
-    }
-
-    #[test]
     fn snapshot_round_trip_preserves_all_scored_and_excluded_inputs() {
         let snapshot = UniverseSelector::select(
             timestamp(HOUR_NS),
@@ -1938,49 +1944,6 @@ mod tests {
         assert!(
             serde_json::from_value::<super::UniverseSnapshot>(nested_unknown).is_err(),
             "nested snapshot wire data must reject unknown fields"
-        );
-    }
-
-    #[test]
-    fn completed_hour_membership_is_current_for_each_following_fifteen_minute_decision() {
-        let hour = TimestampNs::new(3_600_000_000_000).expect("timestamp must be valid");
-        let universe =
-            TradeableUniverse::new(hour, [Market::new("BTC").expect("market must be valid")])
-                .expect("membership must be valid");
-
-        for offset in [
-            0_i128,
-            900_000_000_000,
-            1_800_000_000_000,
-            2_700_000_000_000,
-        ] {
-            assert!(
-                universe.is_current_for(
-                    TimestampNs::new(i128::from(hour.value()) + offset)
-                        .expect("decision timestamp must be valid")
-                )
-            );
-        }
-    }
-
-    #[test]
-    fn completed_hour_membership_rejects_future_and_stale_decisions() {
-        let hour = TimestampNs::new(3_600_000_000_000).expect("timestamp must be valid");
-        let universe =
-            TradeableUniverse::new(hour, [Market::new("BTC").expect("market must be valid")])
-                .expect("membership must be valid");
-
-        assert!(
-            !universe.is_current_for(
-                TimestampNs::new(i128::from(hour.value()) - 900_000_000_000)
-                    .expect("decision timestamp must be valid")
-            )
-        );
-        assert!(
-            !universe.is_current_for(
-                TimestampNs::new(i128::from(hour.value()) + 3_600_000_000_000)
-                    .expect("decision timestamp must be valid")
-            )
         );
     }
 
@@ -2274,6 +2237,31 @@ mod tests {
     }
 
     #[test]
+    fn activation_rejects_prior_selector_output_that_expires_before_refresh_hour() {
+        let previous_snapshot = UniverseSelector::select(timestamp(HOUR_NS), [candidate("BTC", 0)])
+            .expect("previous selection must be valid");
+        let expired_prior = UniverseSelector::activate(
+            &previous_snapshot,
+            None,
+            timestamp(HOUR_NS + FIFTEEN_MINUTES_NS),
+        )
+        .expect("early prior selector output must activate");
+        let snapshot = UniverseSelector::select(timestamp(HOUR_NS * 2), [candidate("BTC", 0)])
+            .expect("current selection must be valid");
+
+        assert!(matches!(
+            UniverseSelector::activate(&snapshot, Some(&expired_prior), snapshot.as_of_time()),
+            Err(UniverseError::PriorActivationExpiryMismatch {
+                snapshot_time,
+                expected_effective_until,
+                actual_effective_until,
+            }) if snapshot_time == snapshot.as_of_time()
+                && expected_effective_until == snapshot.as_of_time()
+                && actual_effective_until == timestamp(HOUR_NS + 2 * FIFTEEN_MINUTES_NS)
+        ));
+    }
+
+    #[test]
     fn exact_prior_selector_output_removes_hard_failures_at_hour_and_applies_ranks_at_next_bar() {
         let previous_hour = timestamp(HOUR_NS);
         let previous_snapshot =
@@ -2282,9 +2270,9 @@ mod tests {
         let previous = UniverseSelector::activate(
             &previous_snapshot,
             None,
-            timestamp(HOUR_NS + FIFTEEN_MINUTES_NS),
+            timestamp(HOUR_NS + 3 * FIFTEEN_MINUTES_NS),
         )
-        .expect("previous selector output must activate at its next bar");
+        .expect("previous selector output must activate at its final bar");
         let refresh_hour = timestamp(HOUR_NS * 2);
         let candidates = std::iter::once(UniverseCandidate::new(
             Market::new("AAA").expect("market must be valid"),
@@ -2302,6 +2290,15 @@ mod tests {
         let before_next_bar_activation =
             UniverseSelector::activate(&snapshot, Some(&previous), refresh_hour)
                 .expect("exact prior selector output must activate");
+        assert!(
+            before_next_bar_activation.is_effective_for(refresh_hour),
+            "the hard-removal activation must apply at its decision bar"
+        );
+        assert!(
+            !before_next_bar_activation
+                .is_effective_for(timestamp(HOUR_NS * 2 + FIFTEEN_MINUTES_NS)),
+            "a hard-removal activation must not authorize the next-bar rank refresh"
+        );
         let before_next_bar = before_next_bar_activation
             .universe()
             .expect("BBB must remain active");
@@ -2326,20 +2323,15 @@ mod tests {
     }
 
     #[test]
-    fn activation_rejects_manual_same_hour_membership_without_prior_provenance() {
+    fn activation_rejects_same_hour_selector_output_as_prior_provenance() {
         let snapshot = UniverseSelector::select(timestamp(HOUR_NS * 2), [candidate("BTC", 0)])
             .expect("selection must be valid");
-        let same_hour = super::UniverseActivation {
-            snapshot: snapshot.clone(),
-            snapshot_digest: snapshot.digest().to_owned(),
-            universe: Some(
-                TradeableUniverse::new(
-                    snapshot.as_of_time(),
-                    [Market::new("ETH").expect("market must be valid")],
-                )
-                .expect("manual membership shape must be valid"),
-            ),
-        };
+        let same_hour = UniverseSelector::activate(
+            &snapshot,
+            None,
+            timestamp(HOUR_NS * 2 + FIFTEEN_MINUTES_NS),
+        )
+        .expect("same-hour selector output must activate");
 
         assert!(matches!(
             UniverseSelector::activate(&snapshot, Some(&same_hour), snapshot.as_of_time()),

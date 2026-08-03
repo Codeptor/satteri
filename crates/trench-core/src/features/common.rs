@@ -13,7 +13,7 @@ use crate::event::{
     AssetContext, Bbo, BookSnapshot, CandleInterval, Funding, MarketEvent, MarketEventKind,
     TimestampNs,
 };
-use crate::universe::TradeableUniverse;
+use crate::universe::{TradeableUniverse, UniverseActivation};
 
 const FEATURE_SCHEMA: &str = concat!(
     "trench.common-features.v4\n",
@@ -1537,20 +1537,22 @@ impl CommonFeatureEngine {
         sleeve: CandleInterval,
         as_of_time: TimestampNs,
     ) -> Vec<FeatureSnapshot> {
-        self.snapshots_at_with_universe(sleeve, as_of_time, None)
+        self.snapshots_at_with_activation(sleeve, as_of_time, None)
     }
 
-    /// Builds immutable snapshots using one explicit frozen tradeable universe.
+    /// Builds immutable snapshots using one selector-produced activation.
     ///
-    /// A missing, stale, incomplete, or mismatched membership never falls back
-    /// to all locally warm markets: it leaves cross-sectional ranks unavailable
-    /// and every affected snapshot fails closed.
+    /// An activation is accepted only inside the exact fifteen-minute interval
+    /// issued by the selector. A missing, future, expired, incomplete, or
+    /// mismatched activation never falls back to all locally warm markets: it
+    /// leaves cross-sectional ranks unavailable and every affected snapshot
+    /// fails closed.
     #[must_use]
-    pub fn snapshots_at_with_universe(
+    pub fn snapshots_at_with_activation(
         &self,
         sleeve: CandleInterval,
         as_of_time: TimestampNs,
-        universe: Option<&TradeableUniverse>,
+        activation: Option<&UniverseActivation>,
     ) -> Vec<FeatureSnapshot> {
         let mut bases = self
             .markets_at(sleeve, as_of_time)
@@ -1558,8 +1560,9 @@ impl CommonFeatureEngine {
             .map(|market| self.base_snapshot(market, sleeve, as_of_time))
             .collect::<Vec<_>>();
 
-        let complete = universe
-            .filter(|universe| universe.is_current_for(as_of_time))
+        let complete = activation
+            .filter(|activation| activation.is_effective_for(as_of_time))
+            .and_then(|activation| activation.universe())
             .and_then(|universe| {
                 let members = universe.markets().iter().cloned().collect::<Vec<_>>();
                 (members.len() >= 2
@@ -3478,9 +3481,13 @@ mod tests {
         AssetContext, Bbo, BookLevel, BookSnapshot, Funding, FundingRate, MarketEvent, TimestampNs,
         Trade,
     };
-    use crate::universe::TradeableUniverse;
+    use crate::universe::{
+        DepthProfile, HistoryQuality, ListingState, MarketDataAvailability, SidedDepth,
+        UniverseActivation, UniverseCandidate, UniverseLiquidity, UniverseSelector,
+    };
 
     const FIFTEEN_MINUTES_NS: i128 = 900_000_000_000;
+    const HOUR_NS: i128 = 3_600_000_000_000;
     const THIRTY_DAYS_NS: i128 = 30 * 24 * 60 * 60 * 1_000_000_000;
 
     fn timestamp(value: i128) -> TimestampNs {
@@ -3505,6 +3512,61 @@ mod tests {
 
     fn market(value: &str) -> Market {
         Market::new(value).expect("test market must be valid")
+    }
+
+    fn selector_candidate(market: Market) -> UniverseCandidate {
+        let depth = SidedDepth::new(
+            Usdc::new(dec!(100_000)).expect("test depth must be valid"),
+            Usdc::new(dec!(100_000)).expect("test depth must be valid"),
+            Usdc::new(dec!(100_000)).expect("test depth must be valid"),
+        )
+        .expect("test depth profile must be valid");
+        UniverseCandidate::new(
+            market,
+            true,
+            MarketDataAvailability::new(ListingState::Active, true, true, true, 20),
+            HistoryQuality::new(30, dec!(0.995), true, Decimal::ONE)
+                .expect("test history must be valid"),
+            UniverseLiquidity::new(
+                Usdc::new(dec!(5_000_000)).expect("test volume must be valid"),
+                Usdc::new(dec!(1_000_000)).expect("test open interest must be valid"),
+                crate::domain::Bps::new(dec!(15)).expect("test spread must be valid"),
+                DepthProfile::new(depth.clone(), depth),
+            ),
+        )
+    }
+
+    fn selector_activation(
+        decision: TimestampNs,
+        markets: impl IntoIterator<Item = Market>,
+    ) -> UniverseActivation {
+        let markets = markets.into_iter().collect::<Vec<_>>();
+        let snapshot_hour = absolute_timestamp(
+            i128::from(decision.value())
+                .div_euclid(HOUR_NS)
+                .saturating_mul(HOUR_NS),
+        );
+        let previous_hour = absolute_timestamp(
+            i128::from(snapshot_hour.value())
+                .checked_sub(HOUR_NS)
+                .expect("test snapshot hour must have a prior hour"),
+        );
+        let previous_snapshot = UniverseSelector::select(
+            previous_hour,
+            markets.iter().cloned().map(selector_candidate),
+        )
+        .expect("prior test universe snapshot must select");
+        let previous = UniverseSelector::activate(
+            &previous_snapshot,
+            None,
+            absolute_timestamp(i128::from(previous_hour.value()) + 3 * FIFTEEN_MINUTES_NS),
+        )
+        .expect("prior test universe must activate");
+        let snapshot =
+            UniverseSelector::select(snapshot_hour, markets.into_iter().map(selector_candidate))
+                .expect("test universe snapshot must select");
+        UniverseSelector::activate(&snapshot, Some(&previous), decision)
+            .expect("test universe activation must select")
     }
 
     fn bbo_at(market: Market, received_at: i128, sequence: u64, bid: Decimal) -> MarketEvent {
@@ -3835,23 +3897,13 @@ mod tests {
         }
     }
 
-    fn tradeable_universe(
-        decision: TimestampNs,
-        markets: impl IntoIterator<Item = Market>,
-    ) -> TradeableUniverse {
-        let completed_hour = absolute_timestamp(
-            i128::from(decision.value() / 3_600_000_000_000) * 3_600_000_000_000,
-        );
-        TradeableUniverse::new(completed_hour, markets).expect("test universe must be valid")
-    }
-
     fn frozen_snapshots(
         engine: &CommonFeatureEngine,
         sleeve: crate::event::CandleInterval,
         decision: TimestampNs,
     ) -> Vec<FeatureSnapshot> {
-        let universe = tradeable_universe(decision, engine.markets_at(sleeve, decision));
-        engine.snapshots_at_with_universe(sleeve, decision, Some(&universe))
+        let universe = selector_activation(decision, engine.markets_at(sleeve, decision));
+        engine.snapshots_at_with_activation(sleeve, decision, Some(&universe))
     }
 
     fn populate_long_history(
@@ -4225,9 +4277,9 @@ mod tests {
         }
         let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
         complete_with_canonical_funding_history(&mut engine, &mut aggregator, decision);
-        let universe = tradeable_universe(decision, [btc.clone(), eth]);
+        let universe = selector_activation(decision, [btc.clone(), eth]);
         let before = engine
-            .snapshots_at_with_universe(
+            .snapshots_at_with_activation(
                 crate::event::CandleInterval::FifteenMinutes,
                 decision,
                 Some(&universe),
@@ -4258,7 +4310,7 @@ mod tests {
         }
 
         let historical = engine
-            .snapshots_at_with_universe(
+            .snapshots_at_with_activation(
                 crate::event::CandleInterval::FifteenMinutes,
                 decision,
                 Some(&universe),
@@ -4405,7 +4457,67 @@ mod tests {
     }
 
     #[test]
-    fn rules_inputs_require_a_frozen_tradeable_universe_and_retain_exact_contract_fields() {
+    fn future_selector_activation_cannot_influence_earlier_cross_sectional_ranks() {
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        let markets = [market("BTC"), market("ETH")];
+        for (market, offset) in [
+            (markets[0].clone(), dec!(100)),
+            (markets[1].clone(), dec!(200)),
+        ] {
+            populate(
+                &mut engine,
+                &mut aggregator,
+                market,
+                0,
+                129,
+                offset,
+                dec!(1),
+            );
+        }
+        let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
+        let next_decision = timestamp(129 * FIFTEEN_MINUTES_NS);
+        complete_with_canonical_funding_history(&mut engine, &mut aggregator, next_decision);
+        let current_activation = selector_activation(decision, markets.clone());
+        let future_activation = selector_activation(next_decision, markets.clone());
+
+        let snapshots = engine.snapshots_at_with_activation(
+            crate::event::CandleInterval::FifteenMinutes,
+            decision,
+            Some(&future_activation),
+        );
+
+        assert!(
+            snapshots
+                .iter()
+                .all(|snapshot| !snapshot.completeness().cross_section())
+        );
+
+        let expired = engine.snapshots_at_with_activation(
+            crate::event::CandleInterval::FifteenMinutes,
+            next_decision,
+            Some(&current_activation),
+        );
+        assert!(
+            expired
+                .iter()
+                .all(|snapshot| !snapshot.completeness().cross_section())
+        );
+
+        let active = engine.snapshots_at_with_activation(
+            crate::event::CandleInterval::FifteenMinutes,
+            next_decision,
+            Some(&future_activation),
+        );
+        assert!(
+            active
+                .iter()
+                .all(|snapshot| snapshot.completeness().cross_section())
+        );
+    }
+
+    #[test]
+    fn rules_inputs_require_a_selector_produced_activation_and_retain_exact_contract_fields() {
         let mut engine = CommonFeatureEngine::new();
         let mut aggregator = CandleAggregator::new();
         let markets = [market("BTC"), market("ETH")];
@@ -4426,7 +4538,7 @@ mod tests {
         let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
         complete_with_canonical_funding_history(&mut engine, &mut aggregator, decision);
 
-        let without_membership = engine.snapshots_at_with_universe(
+        let without_membership = engine.snapshots_at_with_activation(
             crate::event::CandleInterval::FifteenMinutes,
             decision,
             None,
@@ -4437,8 +4549,8 @@ mod tests {
                 .all(|snapshot| !snapshot.is_ready())
         );
 
-        let universe = tradeable_universe(decision, markets.clone());
-        let snapshots = engine.snapshots_at_with_universe(
+        let universe = selector_activation(decision, markets.clone());
+        let snapshots = engine.snapshots_at_with_activation(
             crate::event::CandleInterval::FifteenMinutes,
             decision,
             Some(&universe),
@@ -4464,14 +4576,14 @@ mod tests {
                 snapshot
                     .input_range()
                     .and_then(|range| range.universe_digest()),
-                Some(universe.digest())
+                universe.universe().map(|membership| membership.digest())
             );
             assert!(!snapshot.snapshot_hash().is_empty());
         }
     }
 
     #[test]
-    fn latest_completed_hour_universe_remains_current_at_the_fifteen_minute_boundary() {
+    fn selector_activation_is_effective_at_its_fifteen_minute_decision_boundary() {
         let mut engine = CommonFeatureEngine::new();
         let mut aggregator = CandleAggregator::new();
         let markets = [market("BTC"), market("ETH")];
@@ -4489,12 +4601,11 @@ mod tests {
                 dec!(1),
             );
         }
-        let hour = timestamp(128 * FIFTEEN_MINUTES_NS);
         let decision = timestamp(129 * FIFTEEN_MINUTES_NS);
         complete_with_canonical_funding_history(&mut engine, &mut aggregator, decision);
-        let universe = tradeable_universe(hour, markets);
+        let universe = selector_activation(decision, markets);
 
-        let snapshots = engine.snapshots_at_with_universe(
+        let snapshots = engine.snapshots_at_with_activation(
             crate::event::CandleInterval::FifteenMinutes,
             decision,
             Some(&universe),
@@ -4538,7 +4649,7 @@ mod tests {
             engine.observe(&bbo).expect("BBO must be observed");
             engine.observe(&book).expect("book must be observed");
         };
-        let universe = tradeable_universe(decision, [btc.clone(), market("ETH")]);
+        let universe = selector_activation(decision, [btc.clone(), market("ETH")]);
 
         reset_market(&mut engine);
         observe_pair(
@@ -4547,7 +4658,7 @@ mod tests {
             i128::from(decision.value() - MAX_BBO_BOOK_AGE_NS),
         );
         let inclusive = engine
-            .snapshots_at_with_universe(
+            .snapshots_at_with_activation(
                 crate::event::CandleInterval::FifteenMinutes,
                 decision,
                 Some(&universe),
@@ -4572,7 +4683,7 @@ mod tests {
             i128::from(decision.value() - MAX_BBO_BOOK_AGE_NS - 1),
         );
         let stale = engine
-            .snapshots_at_with_universe(
+            .snapshots_at_with_activation(
                 crate::event::CandleInterval::FifteenMinutes,
                 decision,
                 Some(&universe),
@@ -4593,7 +4704,7 @@ mod tests {
             i128::from(decision.value()) + 1,
         );
         let future_receipt = engine
-            .snapshots_at_with_universe(
+            .snapshots_at_with_activation(
                 crate::event::CandleInterval::FifteenMinutes,
                 decision,
                 Some(&universe),
@@ -5729,10 +5840,10 @@ mod tests {
         }
 
         let snapshot = engine
-            .snapshots_at_with_universe(
+            .snapshots_at_with_activation(
                 crate::event::CandleInterval::FifteenMinutes,
                 decision,
-                Some(&tradeable_universe(decision, [btc.clone(), eth])),
+                Some(&selector_activation(decision, [btc.clone(), eth])),
             )
             .into_iter()
             .find(|snapshot| snapshot.market() == &btc)
@@ -5902,9 +6013,9 @@ mod tests {
         }
         let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
         complete_with_canonical_funding_history(&mut engine, &mut aggregator, decision);
-        let universe = tradeable_universe(decision, [btc.clone(), eth]);
+        let universe = selector_activation(decision, [btc.clone(), eth]);
         let before = engine
-            .snapshots_at_with_universe(
+            .snapshots_at_with_activation(
                 crate::event::CandleInterval::FifteenMinutes,
                 decision,
                 Some(&universe),
@@ -5939,7 +6050,7 @@ mod tests {
         }
 
         let after = engine
-            .snapshots_at_with_universe(
+            .snapshots_at_with_activation(
                 crate::event::CandleInterval::FifteenMinutes,
                 decision,
                 Some(&universe),
@@ -5983,10 +6094,10 @@ mod tests {
         let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
         complete_with_canonical_funding_history(&mut engine, &mut aggregator, decision);
         let snapshot = engine
-            .snapshots_at_with_universe(
+            .snapshots_at_with_activation(
                 crate::event::CandleInterval::FifteenMinutes,
                 decision,
-                Some(&tradeable_universe(decision, [btc.clone(), market("ETH")])),
+                Some(&selector_activation(decision, [btc.clone(), market("ETH")])),
             )
             .into_iter()
             .find(|snapshot| snapshot.market() == &btc)
