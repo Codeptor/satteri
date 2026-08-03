@@ -1836,7 +1836,7 @@ impl CommonFeatureEngine {
         let trade_window_5m = self.trade_window(&market, sleeve, as_of_time, MICRO_5_MINUTES_NS);
         let trade_window_15m = self.trade_window(&market, sleeve, as_of_time, MICRO_15_MINUTES_NS);
         let microstructure_history_pruned =
-            microstructure_window_start(as_of_time, MICRO_15_MINUTES_NS).map_or(true, |start| {
+            microstructure_window_start(as_of_time, MICRO_15_MINUTES_NS).is_none_or(|start| {
                 self.pruned_trade_aggregate_through
                     .get(&(market.clone(), sleeve))
                     .is_some_and(|through| *through > start)
