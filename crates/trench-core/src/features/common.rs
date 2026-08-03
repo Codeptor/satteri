@@ -35,10 +35,8 @@ const MICRO_15_MINUTES_NS: i64 = 900_000_000_000;
 pub enum FeatureInputKind {
     /// One completed fifteen-minute candle represented by its contributing-trade span.
     FifteenMinuteCandle,
-    /// One completed hourly candle represented by its contributing-trade span.
-    HourlyCandle,
-    /// One peer-market candle used only by a cross-sectional return rank.
-    CrossSectionCandle,
+    /// One completed one-hour candle represented by its contributing-trade span.
+    OneHourCandle,
     /// One point-in-time asset-context observation.
     AssetContext,
     /// One funding observation.
@@ -55,8 +53,7 @@ impl FeatureInputKind {
     const fn identity_tag(self) -> u8 {
         match self {
             Self::FifteenMinuteCandle => 0,
-            Self::HourlyCandle => 1,
-            Self::CrossSectionCandle => 2,
+            Self::OneHourCandle => 1,
             Self::AssetContext => 3,
             Self::Funding => 4,
             Self::Bbo => 5,
@@ -124,16 +121,6 @@ impl InputEventSpan {
             last_event_id: candle.last_event_id().clone(),
             first_event_time: candle.first_event_time(),
             last_event_time: candle.last_event_time(),
-        }
-    }
-
-    fn with_kind(&self, kind: FeatureInputKind) -> Self {
-        Self {
-            kind,
-            first_event_id: self.first_event_id.clone(),
-            last_event_id: self.last_event_id.clone(),
-            first_event_time: self.first_event_time,
-            last_event_time: self.last_event_time,
         }
     }
 }
@@ -558,7 +545,7 @@ impl CommonFeatureEngine {
             .map(|base| base.market.clone())
             .collect::<Vec<_>>();
         if complete.len() >= 2 {
-            add_cross_sectional_ranks(&mut bases, &complete);
+            add_cross_sectional_ranks(&mut bases, &complete, sleeve);
         }
 
         bases
@@ -837,7 +824,11 @@ fn incomplete_source_reason(completeness: FeatureCompleteness) -> Option<Feature
     None
 }
 
-fn add_cross_sectional_ranks(bases: &mut [BaseSnapshot], complete: &[Market]) {
+fn add_cross_sectional_ranks(
+    bases: &mut [BaseSnapshot],
+    complete: &[Market],
+    sleeve: CandleInterval,
+) {
     for lookback in [4_usize, 16, 96] {
         let name = format!("return_{lookback}");
         let rank_name = format!("cross_return_{lookback}_rank");
@@ -864,6 +855,7 @@ fn add_cross_sectional_ranks(bases: &mut [BaseSnapshot], complete: &[Market]) {
         }
     }
 
+    let primary_candle_kind = candle_input_kind(sleeve);
     let peer_candle_spans = complete
         .iter()
         .filter_map(|market| {
@@ -877,8 +869,8 @@ fn add_cross_sectional_ranks(bases: &mut [BaseSnapshot], complete: &[Market]) {
                 range
                     .spans()
                     .iter()
-                    .filter(|span| span.kind() == FeatureInputKind::FifteenMinuteCandle)
-                    .map(|span| span.with_kind(FeatureInputKind::CrossSectionCandle))
+                    .filter(|span| span.kind() == primary_candle_kind)
+                    .cloned()
                     .collect::<Vec<_>>(),
             ))
         })
@@ -1015,12 +1007,10 @@ fn input_range(
 ) -> Option<InputEventRange> {
     let spans = feature_history
         .iter()
-        .map(|candle| InputEventSpan::candle(FeatureInputKind::FifteenMinuteCandle, candle))
-        .chain(
-            hourly_history
-                .iter()
-                .map(|candle| InputEventSpan::candle(FeatureInputKind::HourlyCandle, candle)),
-        )
+        .map(|candle| InputEventSpan::candle(candle_input_kind(candle.candle().interval()), candle))
+        .chain(hourly_history.iter().map(|candle| {
+            InputEventSpan::candle(candle_input_kind(candle.candle().interval()), candle)
+        }))
         .chain(
             context_events
                 .iter()
@@ -1046,6 +1036,13 @@ fn input_range(
         )
         .collect::<Vec<_>>();
     InputEventRange::from_spans(spans)
+}
+
+const fn candle_input_kind(interval: CandleInterval) -> FeatureInputKind {
+    match interval {
+        CandleInterval::FifteenMinutes => FeatureInputKind::FifteenMinuteCandle,
+        CandleInterval::OneHour => FeatureInputKind::OneHourCandle,
+    }
 }
 
 fn contiguous_tail<'a>(
@@ -1879,9 +1876,8 @@ mod tests {
                 .filter(|span| span.kind() == kind)
                 .count()
         };
-        assert_eq!(count(FeatureInputKind::FifteenMinuteCandle), 97);
-        assert_eq!(count(FeatureInputKind::HourlyCandle), 32);
-        assert_eq!(count(FeatureInputKind::CrossSectionCandle), 97);
+        assert_eq!(count(FeatureInputKind::FifteenMinuteCandle), 194);
+        assert_eq!(count(FeatureInputKind::OneHourCandle), 32);
         assert_eq!(count(FeatureInputKind::AssetContext), 30);
         assert_eq!(count(FeatureInputKind::Funding), 30);
         assert_eq!(count(FeatureInputKind::Bbo), 1);
@@ -1909,5 +1905,45 @@ mod tests {
             .find(|snapshot| snapshot.market() == &market("BTC"))
             .expect("BTC snapshot must still exist");
         assert_eq!(after.input_range(), before.input_range());
+    }
+
+    #[test]
+    fn one_hour_snapshot_provenance_labels_primary_and_peer_candles_as_one_hour() {
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        for (market, offset) in [(market("BTC"), dec!(100)), (market("ETH"), dec!(200))] {
+            populate(
+                &mut engine,
+                &mut aggregator,
+                market,
+                0,
+                388,
+                offset,
+                dec!(1),
+            );
+        }
+        let decision = timestamp(388 * FIFTEEN_MINUTES_NS);
+        complete(&mut engine, &mut aggregator, decision);
+
+        for snapshot in engine.snapshots_at(crate::event::CandleInterval::OneHour, decision) {
+            let candle_kinds = snapshot
+                .input_range()
+                .expect("ready snapshot must retain provenance")
+                .spans()
+                .iter()
+                .map(|span| span.kind())
+                .filter(|kind| {
+                    matches!(
+                        kind,
+                        FeatureInputKind::FifteenMinuteCandle | FeatureInputKind::OneHourCandle
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                candle_kinds,
+                vec![FeatureInputKind::OneHourCandle; 194],
+                "1h primary and peer return inputs must retain their source interval"
+            );
+        }
     }
 }
