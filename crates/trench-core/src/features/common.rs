@@ -1827,11 +1827,11 @@ impl CommonFeatureEngine {
         let regime = hourly_history.and_then(hourly_regime);
         let trade_window_5m = self.trade_window(&market, sleeve, as_of_time, MICRO_5_MINUTES_NS);
         let trade_window_15m = self.trade_window(&market, sleeve, as_of_time, MICRO_15_MINUTES_NS);
-        let microstructure_history_pruned = self
-            .pruned_trade_aggregate_through
-            .get(&(market.clone(), sleeve))
-            .is_some_and(|through| {
-                through.value() > as_of_time.value().saturating_sub(MICRO_15_MINUTES_NS)
+        let microstructure_history_pruned =
+            microstructure_window_start(as_of_time, MICRO_15_MINUTES_NS).map_or(true, |start| {
+                self.pruned_trade_aggregate_through
+                    .get(&(market.clone(), sleeve))
+                    .is_some_and(|through| *through > start)
             });
         let stale_bbo_or_book = bbo_event
             .is_some_and(|event| !is_fresh_book_input(event, as_of_time))
@@ -2176,12 +2176,12 @@ impl CommonFeatureEngine {
         as_of_time: TimestampNs,
         window_ns: i64,
     ) -> Option<AggressiveTradeWindow> {
-        let start = as_of_time.value().checked_sub(window_ns)?;
+        let start = microstructure_window_start(as_of_time, window_ns)?;
         let key = (market.clone(), sleeve);
         if self
             .pruned_trade_aggregate_through
             .get(&key)
-            .is_some_and(|through| through.value() > start)
+            .is_some_and(|through| *through > start)
         {
             return None;
         }
@@ -2193,10 +2193,7 @@ impl CommonFeatureEngine {
             spans: Vec::new(),
         };
         for ((bucket_close, available_at), aggregate) in aggregates {
-            if bucket_close.value() <= start
-                || *bucket_close > as_of_time
-                || *available_at > as_of_time
-            {
+            if *bucket_close <= start || *bucket_close > as_of_time || *available_at > as_of_time {
                 continue;
             }
             window.buy_notional = window.buy_notional.checked_add(aggregate.buy_notional)?;
@@ -2213,8 +2210,12 @@ impl CommonFeatureEngine {
 
 fn bucket_close(timestamp: TimestampNs, bucket_ns: i64) -> Option<TimestampNs> {
     let remainder = timestamp.value().checked_rem(bucket_ns)?;
-    let adjustment = (bucket_ns - remainder).checked_rem(bucket_ns)?;
+    let adjustment = bucket_ns.checked_sub(remainder)?;
     TimestampNs::new(i128::from(timestamp.value()).checked_add(i128::from(adjustment))?).ok()
+}
+
+fn microstructure_window_start(as_of_time: TimestampNs, window_ns: i64) -> Option<TimestampNs> {
+    TimestampNs::new(i128::from(as_of_time.value()).checked_sub(i128::from(window_ns))?).ok()
 }
 
 fn boundary_sample_limit(interval: CandleInterval) -> usize {
@@ -5098,6 +5099,61 @@ mod tests {
         assert_eq!(
             snapshot.values().get("trade_imbalance_15m"),
             Some(&Decimal::ONE)
+        );
+    }
+
+    #[test]
+    fn exact_decision_boundary_trade_belongs_to_the_next_microstructure_bucket() {
+        let btc = market("BTC");
+        let eth = market("ETH");
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        for (market, offset) in [(btc.clone(), dec!(100)), (eth, dec!(200))] {
+            populate(
+                &mut engine,
+                &mut aggregator,
+                market,
+                0,
+                128,
+                offset,
+                dec!(1),
+            );
+        }
+        let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
+        complete_with_canonical_funding_history(&mut engine, &mut aggregator, decision);
+        let boundary_trade = MarketEvent::trade(
+            decision,
+            decision,
+            btc.clone(),
+            Trade::new(10_000, Side::Sell, price(dec!(227)), quantity(dec!(1)))
+                .expect("boundary trade must be valid"),
+        )
+        .expect("boundary trade event must be valid");
+        engine
+            .observe(&boundary_trade)
+            .expect("boundary trade must be observed");
+
+        for window in [super::MICRO_5_MINUTES_NS, super::MICRO_15_MINUTES_NS] {
+            assert_eq!(
+                engine
+                    .trade_window(
+                        &btc,
+                        crate::event::CandleInterval::FifteenMinutes,
+                        decision,
+                        window,
+                    )
+                    .expect("completed microstructure window must exist")
+                    .imbalance(),
+                Decimal::ONE
+            );
+        }
+    }
+
+    #[test]
+    fn microstructure_window_start_fails_closed_before_the_supported_epoch() {
+        assert_eq!(
+            super::microstructure_window_start(absolute_timestamp(0), super::MICRO_15_MINUTES_NS,),
+            None
         );
     }
 
