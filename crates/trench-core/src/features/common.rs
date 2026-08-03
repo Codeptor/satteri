@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use blake3::Hasher;
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::candle::Candle;
@@ -16,6 +17,7 @@ use crate::event::{
 const FEATURE_SCHEMA: &str = concat!(
     "trench.common-features.v1\n",
     "warmup.bars=97;context_observations=30;funding_observations=30\n",
+    "rule_history=derivatives:30d;hourly_realized_volatility_20:90d\n",
     "returns=1,2,4,8,16,32,96\n",
     "ema=8,32;ema_slope=8:4\n",
     "rsi=14;atr=14;adx=14;realized_volatility=8,20,64\n",
@@ -25,13 +27,30 @@ const FEATURE_SCHEMA: &str = concat!(
     "cross_return_rank=4,16,96;hourly_regime\n"
 );
 const MAX_BAR_LOOKBACK: usize = 97;
-// Retain one newly completed bar beyond the declared 97-bar calculation window,
-// so an immediately preceding decision remains reproducible as the next bar closes.
-const MAX_CANDLE_HISTORY: usize = MAX_BAR_LOOKBACK + 1;
+const FIFTEEN_MINUTE_BARS_PER_DAY: usize = 24 * 4;
+const HOURLY_BARS_PER_DAY: usize = 24;
+const DERIVATIVE_HISTORY_DAYS: usize = 30;
+const HOURLY_REGIME_HISTORY_DAYS: usize = 90;
+const MAX_OPEN_INTEREST_LOOKBACK: usize = 16;
+const HOURLY_REALIZED_VOLATILITY_WINDOW: usize = 20;
+const DERIVATIVE_15_MINUTE_BARS: usize = DERIVATIVE_HISTORY_DAYS * FIFTEEN_MINUTE_BARS_PER_DAY;
+const DERIVATIVE_HOURLY_BARS: usize = DERIVATIVE_HISTORY_DAYS * HOURLY_BARS_PER_DAY;
+const HOURLY_REALIZED_VOLATILITY_HISTORY: usize = HOURLY_REGIME_HISTORY_DAYS * HOURLY_BARS_PER_DAY;
+// Retain enough completed 15-minute bars to sample every 30-day derivative
+// input at a bar boundary and still calculate OI change over its largest
+// declared lookback.
+const MAX_CANDLE_HISTORY: usize = DERIVATIVE_15_MINUTE_BARS + MAX_OPEN_INTEREST_LOOKBACK;
+// A current 20-bar hourly realized-volatility value and its preceding 90-day
+// distribution require 20 warmup bars, 2,160 historical observations, and
+// one current completed bar.
+const MAX_HOURLY_CANDLE_HISTORY: usize =
+    HOURLY_REALIZED_VOLATILITY_WINDOW + HOURLY_REALIZED_VOLATILITY_HISTORY + 1;
 const CONTEXT_WINDOW: usize = 30;
 const FUNDING_WINDOW: usize = 30;
 const MAX_MARKETS: usize = 128;
 const POINT_EVENT_HISTORY: usize = 64;
+const CONTEXT_EVENT_HISTORY: usize = DERIVATIVE_15_MINUTE_BARS + MAX_OPEN_INTEREST_LOOKBACK;
+const FUNDING_EVENT_HISTORY: usize = DERIVATIVE_15_MINUTE_BARS + 1;
 const TRADE_EVENT_HISTORY: usize = 128;
 /// Number of source identities retained after their active feature history is pruned.
 ///
@@ -387,6 +406,94 @@ impl RegimeInputs {
     }
 }
 
+/// One exact scalar input sampled at an explicit completed-bar boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimedFeatureValue {
+    as_of_time_ns: i64,
+    value: Decimal,
+}
+
+impl TimedFeatureValue {
+    /// Returns the completed-bar UTC boundary at which this value was known.
+    #[must_use]
+    pub const fn as_of_time_ns(&self) -> i64 {
+        self.as_of_time_ns
+    }
+
+    /// Returns the exact decimal input value.
+    #[must_use]
+    pub const fn value(&self) -> Decimal {
+        self.value
+    }
+}
+
+/// Bounded, serializable long-horizon inputs for the future rules sleeve.
+///
+/// Every value is constructed only from data available at `as_of_time_ns`.
+/// The API returns `None` when the retained state cannot reconstruct an exact
+/// complete horizon rather than filling a gap or substituting a newer input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LongHorizonFeatureHistory {
+    market: String,
+    sleeve: String,
+    as_of_time_ns: i64,
+    hourly_realized_volatility_20_history: Vec<TimedFeatureValue>,
+    current_hourly_realized_volatility_20: Decimal,
+    premium_history: Vec<TimedFeatureValue>,
+    open_interest_change_4_history: Vec<TimedFeatureValue>,
+    funding_history: Vec<TimedFeatureValue>,
+}
+
+impl LongHorizonFeatureHistory {
+    /// Returns the checked market identifier as canonical text.
+    #[must_use]
+    pub fn market(&self) -> &str {
+        &self.market
+    }
+
+    /// Returns the decision sleeve as `"15m"` or `"1h"`.
+    #[must_use]
+    pub fn sleeve(&self) -> &str {
+        &self.sleeve
+    }
+
+    /// Returns the explicit UTC snapshot boundary.
+    #[must_use]
+    pub const fn as_of_time_ns(&self) -> i64 {
+        self.as_of_time_ns
+    }
+
+    /// Returns the preceding 90-day hourly RV(20) distribution in chronological order.
+    #[must_use]
+    pub fn hourly_realized_volatility_20_history(&self) -> &[TimedFeatureValue] {
+        &self.hourly_realized_volatility_20_history
+    }
+
+    /// Returns the current completed-hour RV(20), excluded from the preceding distribution.
+    #[must_use]
+    pub const fn current_hourly_realized_volatility_20(&self) -> Decimal {
+        self.current_hourly_realized_volatility_20
+    }
+
+    /// Returns 30 days of completed-bar premium observations in chronological order.
+    #[must_use]
+    pub fn premium_history(&self) -> &[TimedFeatureValue] {
+        &self.premium_history
+    }
+
+    /// Returns 30 days of 4-bar OI-change observations in chronological order.
+    #[must_use]
+    pub fn open_interest_change_4_history(&self) -> &[TimedFeatureValue] {
+        &self.open_interest_change_4_history
+    }
+
+    /// Returns 30 days of completed-bar funding observations in chronological order.
+    #[must_use]
+    pub fn funding_history(&self) -> &[TimedFeatureValue] {
+        &self.funding_history
+    }
+}
+
 /// Immutable, point-in-time common-feature snapshot for one market and sleeve.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeatureSnapshot {
@@ -534,6 +641,18 @@ pub enum FeatureError {
         /// Number of finalized candle identities retained for idempotent replay.
         limit: usize,
     },
+    /// The bounded state cannot reconstruct every exact input required by the long-horizon rules.
+    #[error(
+        "long-horizon feature history for market {market:?}, sleeve {sleeve:?}, and boundary {as_of_time} is unavailable"
+    )]
+    LongHorizonHistoryUnavailable {
+        /// Market whose rules inputs are unavailable.
+        market: Market,
+        /// Requested decision sleeve.
+        sleeve: CandleInterval,
+        /// Explicit decision boundary.
+        as_of_time: TimestampNs,
+    },
     /// A completed candle contained invalid timestamp arithmetic.
     #[error(transparent)]
     Event(#[from] crate::event::EventError),
@@ -641,12 +760,33 @@ impl MarketEventHistory {
 const fn source_limit(kind: &MarketEventKind) -> usize {
     match kind {
         MarketEventKind::Trade(_) => TRADE_EVENT_HISTORY,
+        MarketEventKind::AssetContext(_) => CONTEXT_EVENT_HISTORY,
+        MarketEventKind::Funding(_) => FUNDING_EVENT_HISTORY,
         MarketEventKind::Metadata(_)
-        | MarketEventKind::AssetContext(_)
         | MarketEventKind::BookSnapshot(_)
         | MarketEventKind::Bbo(_)
-        | MarketEventKind::Funding(_)
         | MarketEventKind::CompletedCandle(_) => POINT_EVENT_HISTORY,
+    }
+}
+
+const fn candle_history_limit(interval: CandleInterval) -> usize {
+    match interval {
+        CandleInterval::FifteenMinutes => MAX_CANDLE_HISTORY,
+        CandleInterval::OneHour => MAX_HOURLY_CANDLE_HISTORY,
+    }
+}
+
+const fn derivative_history_bars(interval: CandleInterval) -> usize {
+    match interval {
+        CandleInterval::FifteenMinutes => DERIVATIVE_15_MINUTE_BARS,
+        CandleInterval::OneHour => DERIVATIVE_HOURLY_BARS,
+    }
+}
+
+const fn sleeve_name(interval: CandleInterval) -> &'static str {
+    match interval {
+        CandleInterval::FifteenMinutes => "15m",
+        CandleInterval::OneHour => "1h",
     }
 }
 
@@ -748,7 +888,8 @@ impl CommonFeatureEngine {
                     })
                 };
             }
-            if candles.len() == MAX_CANDLE_HISTORY
+            let limit = candle_history_limit(key.1);
+            if candles.len() == limit
                 && candles
                     .first_key_value()
                     .is_some_and(|(first, _)| open_time <= *first)
@@ -766,7 +907,7 @@ impl CommonFeatureEngine {
                 });
             }
             candles.insert(open_time, candle);
-            while candles.len() > MAX_CANDLE_HISTORY {
+            while candles.len() > limit {
                 if let Some((_, discarded)) = candles.pop_first() {
                     pruned.push(discarded);
                 }
@@ -834,6 +975,139 @@ impl CommonFeatureEngine {
                 }
             })
             .collect()
+    }
+
+    /// Returns exact, bounded long-horizon state for the future rules sleeve.
+    ///
+    /// The result contains a preceding 90-day distribution of completed-hour
+    /// RV(20), the current RV(20), and 30-day derivatives histories sampled at
+    /// the requested sleeve's completed-bar boundaries. It deliberately returns
+    /// `None` if any required history is absent, discontinuous, unavailable at
+    /// `as_of_time`, or outside the retained horizon.
+    #[must_use]
+    pub fn long_horizon_history_at(
+        &self,
+        market: &Market,
+        sleeve: CandleInterval,
+        as_of_time: TimestampNs,
+    ) -> Option<LongHorizonFeatureHistory> {
+        self.require_long_horizon_history_at(market, sleeve, as_of_time)
+            .ok()
+    }
+
+    /// Returns complete long-horizon state or a typed fail-closed readiness error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FeatureError::LongHorizonHistoryUnavailable`] rather than
+    /// substituting incomplete, future, or pruned source data.
+    pub fn require_long_horizon_history_at(
+        &self,
+        market: &Market,
+        sleeve: CandleInterval,
+        as_of_time: TimestampNs,
+    ) -> Result<LongHorizonFeatureHistory, FeatureError> {
+        self.build_long_horizon_history_at(market, sleeve, as_of_time)
+            .ok_or_else(|| FeatureError::LongHorizonHistoryUnavailable {
+                market: market.clone(),
+                sleeve,
+                as_of_time,
+            })
+    }
+
+    fn build_long_horizon_history_at(
+        &self,
+        market: &Market,
+        sleeve: CandleInterval,
+        as_of_time: TimestampNs,
+    ) -> Option<LongHorizonFeatureHistory> {
+        let derivative_bars = derivative_history_bars(sleeve);
+        let required_primary = derivative_bars.checked_add(4)?;
+        let primary_history = self.candle_history(market, sleeve, as_of_time);
+        let primary_history = contiguous_tail(&primary_history, required_primary, sleeve)?;
+        let sampled_contexts = primary_history
+            .iter()
+            .map(|candle| {
+                let boundary = candle.close_time().ok()?;
+                let context = self.latest_context(market, boundary)?;
+                Some((boundary, context))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let premium_history = sampled_contexts
+            .iter()
+            .skip(4)
+            .map(|(boundary, context)| {
+                Some(TimedFeatureValue {
+                    as_of_time_ns: boundary.value(),
+                    value: premium(context)?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let open_interest_change_4_history = sampled_contexts
+            .windows(5)
+            .map(|contexts| {
+                let (boundary, current) = contexts[4];
+                current
+                    .open_interest()
+                    .value()
+                    .checked_div(contexts[0].1.open_interest().value())
+                    .and_then(|ratio| ratio.checked_sub(Decimal::ONE))
+                    .map(|value| TimedFeatureValue {
+                        as_of_time_ns: boundary.value(),
+                        value,
+                    })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let funding_history = primary_history
+            .iter()
+            .skip(4)
+            .map(|candle| {
+                let boundary = candle.close_time().ok()?;
+                let funding = self.latest_funding(market, boundary)?;
+                Some(TimedFeatureValue {
+                    as_of_time_ns: boundary.value(),
+                    value: funding.rate().value(),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+
+        let hourly_history = self.candle_history(market, CandleInterval::OneHour, as_of_time);
+        let hourly_history = contiguous_tail(
+            &hourly_history,
+            MAX_HOURLY_CANDLE_HISTORY,
+            CandleInterval::OneHour,
+        )?;
+        let current_hourly_realized_volatility_20 =
+            realized_volatility(hourly_history, HOURLY_REALIZED_VOLATILITY_WINDOW)?;
+        let hourly_realized_volatility_20_history = (HOURLY_REALIZED_VOLATILITY_WINDOW
+            ..hourly_history.len().checked_sub(1)?)
+            .map(|end| {
+                let history = hourly_history.get(end - HOURLY_REALIZED_VOLATILITY_WINDOW..=end)?;
+                let boundary = history.last()?.close_time().ok()?;
+                Some(TimedFeatureValue {
+                    as_of_time_ns: boundary.value(),
+                    value: realized_volatility(history, HOURLY_REALIZED_VOLATILITY_WINDOW)?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        if hourly_realized_volatility_20_history.len() != HOURLY_REALIZED_VOLATILITY_HISTORY
+            || premium_history.len() != derivative_bars
+            || open_interest_change_4_history.len() != derivative_bars
+            || funding_history.len() != derivative_bars
+        {
+            return None;
+        }
+
+        Some(LongHorizonFeatureHistory {
+            market: market.as_str().to_owned(),
+            sleeve: sleeve_name(sleeve).to_owned(),
+            as_of_time_ns: as_of_time.value(),
+            hourly_realized_volatility_20_history,
+            current_hourly_realized_volatility_20,
+            premium_history,
+            open_interest_change_4_history,
+            funding_history,
+        })
     }
 
     fn markets_at(&self, sleeve: CandleInterval, as_of_time: TimestampNs) -> Vec<Market> {
@@ -1038,6 +1312,34 @@ impl CommonFeatureEngine {
                 .values()
                 .rev()
                 .find(|event| event_is_available(event, as_of_time))
+        })
+    }
+
+    fn latest_context(&self, market: &Market, as_of_time: TimestampNs) -> Option<&AssetContext> {
+        self.events.get(market).and_then(|history| {
+            history
+                .contexts
+                .values()
+                .rev()
+                .find(|event| event_is_available(event, as_of_time))
+                .and_then(|event| match event.kind() {
+                    MarketEventKind::AssetContext(context) => Some(context),
+                    _ => None,
+                })
+        })
+    }
+
+    fn latest_funding(&self, market: &Market, as_of_time: TimestampNs) -> Option<&Funding> {
+        self.events.get(market).and_then(|history| {
+            history
+                .fundings
+                .values()
+                .rev()
+                .find(|event| event_is_available(event, as_of_time))
+                .and_then(|event| match event.kind() {
+                    MarketEventKind::Funding(funding) => Some(funding),
+                    _ => None,
+                })
         })
     }
 
@@ -2057,6 +2359,39 @@ mod tests {
         }
     }
 
+    fn populate_long_history(
+        engine: &mut CommonFeatureEngine,
+        aggregator: &mut CandleAggregator,
+        market: Market,
+        receipt_delays: ReceiptDelays,
+    ) -> TimestampNs {
+        const BARS: u64 = 90 * 24 * 4 + 20 * 4 + 4;
+
+        for start in (0..BARS).step_by(512) {
+            let count = (BARS - start).min(512);
+            populate_with_receipt_delays(
+                engine,
+                aggregator,
+                market.clone(),
+                PopulateRange {
+                    start,
+                    count,
+                    offset: dec!(100),
+                    step: dec!(1),
+                    volume_spike: None,
+                },
+                None,
+                receipt_delays,
+            );
+            complete(
+                engine,
+                aggregator,
+                timestamp(i128::from(start + count) * FIFTEEN_MINUTES_NS),
+            );
+        }
+        timestamp(i128::from(BARS) * FIFTEEN_MINUTES_NS)
+    }
+
     #[test]
     fn same_exchange_time_uses_receipt_time_before_identity_for_latest_bbo_and_book() {
         let market = market("BTC");
@@ -2466,6 +2801,144 @@ mod tests {
     }
 
     #[test]
+    fn long_horizon_history_retains_exact_rule_inputs_and_round_trips_as_json() {
+        let market = market("BTC");
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        let decision = populate_long_history(
+            &mut engine,
+            &mut aggregator,
+            market.clone(),
+            ReceiptDelays::default(),
+        );
+
+        let history = engine
+            .long_horizon_history_at(
+                &market,
+                crate::event::CandleInterval::FifteenMinutes,
+                decision,
+            )
+            .expect("fully retained 30-day and 90-day inputs must be available");
+        assert_eq!(
+            history.hourly_realized_volatility_20_history().len(),
+            90 * 24
+        );
+        assert!(history.current_hourly_realized_volatility_20() >= Decimal::ZERO);
+        assert_eq!(history.premium_history().len(), 30 * 24 * 4);
+        assert_eq!(history.open_interest_change_4_history().len(), 30 * 24 * 4);
+        assert_eq!(history.funding_history().len(), 30 * 24 * 4);
+        let encoded = serde_json::to_string(&history).expect("history must serialize");
+        let decoded: super::LongHorizonFeatureHistory =
+            serde_json::from_str(&encoded).expect("history must deserialize");
+        assert_eq!(decoded, history);
+    }
+
+    #[test]
+    fn long_horizon_history_excludes_a_delayed_final_source_until_received() {
+        const BARS: u64 = 90 * 24 * 4 + 20 * 4 + 4;
+
+        let market = market("BTC");
+        let mut immediate_engine = CommonFeatureEngine::new();
+        let mut immediate_aggregator = CandleAggregator::new();
+        let decision = populate_long_history(
+            &mut immediate_engine,
+            &mut immediate_aggregator,
+            market.clone(),
+            ReceiptDelays::default(),
+        );
+        let immediate = immediate_engine
+            .long_horizon_history_at(
+                &market,
+                crate::event::CandleInterval::FifteenMinutes,
+                decision,
+            )
+            .expect("immediate source must be available");
+
+        let mut delayed_engine = CommonFeatureEngine::new();
+        let mut delayed_aggregator = CandleAggregator::new();
+        assert_eq!(
+            populate_long_history(
+                &mut delayed_engine,
+                &mut delayed_aggregator,
+                market.clone(),
+                ReceiptDelays {
+                    direct_at: Some(BARS - 1),
+                    trade_at: None,
+                },
+            ),
+            decision
+        );
+        let before_receipt = delayed_engine
+            .long_horizon_history_at(
+                &market,
+                crate::event::CandleInterval::FifteenMinutes,
+                decision,
+            )
+            .expect("older source state remains exact at the bar close");
+        let after_receipt = delayed_engine
+            .long_horizon_history_at(
+                &market,
+                crate::event::CandleInterval::FifteenMinutes,
+                timestamp(i128::from(decision.value() + 1)),
+            )
+            .expect("later query must retain the completed-bar source boundary");
+
+        assert_ne!(before_receipt, immediate);
+        assert_eq!(
+            after_receipt.current_hourly_realized_volatility_20(),
+            before_receipt.current_hourly_realized_volatility_20()
+        );
+        assert_eq!(
+            after_receipt.premium_history().last(),
+            before_receipt.premium_history().last()
+        );
+        assert_eq!(
+            after_receipt.open_interest_change_4_history().last(),
+            before_receipt.open_interest_change_4_history().last()
+        );
+        assert_eq!(
+            after_receipt.funding_history().last(),
+            before_receipt.funding_history().last()
+        );
+    }
+
+    #[test]
+    fn long_horizon_history_does_not_fill_missing_30_day_inputs() {
+        let market = market("BTC");
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        populate(
+            &mut engine,
+            &mut aggregator,
+            market.clone(),
+            0,
+            128,
+            dec!(100),
+            dec!(1),
+        );
+        let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
+        complete(&mut engine, &mut aggregator, decision);
+
+        assert!(
+            engine
+                .long_horizon_history_at(
+                    &market,
+                    crate::event::CandleInterval::FifteenMinutes,
+                    decision,
+                )
+                .is_none()
+        );
+        assert!(matches!(
+            engine.require_long_horizon_history_at(
+                &market,
+                crate::event::CandleInterval::FifteenMinutes,
+                decision,
+            ),
+            Err(FeatureError::LongHorizonHistoryUnavailable { .. })
+        ));
+    }
+
+    #[test]
     fn equal_cross_sectional_returns_receive_the_same_midrank() {
         let mut engine = CommonFeatureEngine::new();
         let mut aggregator = CandleAggregator::new();
@@ -2793,7 +3266,15 @@ mod tests {
                 .len()
                 <= super::MAX_CANDLE_HISTORY
         );
-        assert!(retained_engine.seen_events.len() <= 448);
+        let sources = retained_engine
+            .events
+            .get(&market)
+            .expect("market source state must exist");
+        assert!(sources.contexts.len() <= super::CONTEXT_EVENT_HISTORY);
+        assert!(sources.fundings.len() <= super::FUNDING_EVENT_HISTORY);
+        assert!(sources.bbo.len() <= super::POINT_EVENT_HISTORY);
+        assert!(sources.books.len() <= super::POINT_EVENT_HISTORY);
+        assert!(sources.trades.len() <= super::TRADE_EVENT_HISTORY);
     }
 
     #[test]

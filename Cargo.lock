@@ -2584,6 +2584,7 @@ dependencies = [
  "rust_decimal",
  "rust_decimal_macros",
  "serde",
+ "serde_json",
  "thiserror",
  "toml",
  "url",
