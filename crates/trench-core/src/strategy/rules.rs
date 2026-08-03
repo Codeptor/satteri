@@ -548,12 +548,15 @@ pub struct RulePosition {
 }
 
 impl RulePosition {
-    /// Captures an accepted candidate's market-owned exit plan without risk sizing.
+    /// Captures a rules-only candidate's market-owned exit plan without risk sizing.
+    ///
+    /// A rules position cannot be created from an ML candidate, preserving the
+    /// independent-strategy boundary even for shared downstream exit plumbing.
     #[must_use]
-    pub fn from_candidate(candidate: &SignalCandidate) -> Self {
-        Self {
+    pub fn from_candidate(candidate: &SignalCandidate) -> Option<Self> {
+        (candidate.strategy() == StrategyKind::RulesOnly).then(|| Self {
             candidate: candidate.clone(),
-        }
+        })
     }
 }
 
@@ -938,7 +941,7 @@ mod tests {
         let strategy = RulesStrategy::new(RuleConfig::default());
         let decision = strategy.evaluate_parts(source(), &golden_inputs(), &golden_history());
         let candidate = decision.candidate().expect("candidate");
-        let position = RulePosition::from_candidate(candidate);
+        let position = RulePosition::from_candidate(candidate).expect("rules position");
 
         assert_eq!(
             strategy.exit_for_composite(&position, dec!(80), dec!(-1), timestamp(1)),
@@ -961,6 +964,11 @@ mod tests {
             ),
             Some(ExitReason::TimeLimit)
         );
+    }
+
+    #[test]
+    fn rules_exit_state_refuses_ml_candidates() {
+        assert!(RulePosition::from_candidate(&candidate_for(StrategyKind::MlChampion)).is_none());
     }
 
     #[test]
@@ -1039,8 +1047,12 @@ mod tests {
     }
 
     fn exact_candidate() -> SignalCandidate {
+        candidate_for(StrategyKind::RulesOnly)
+    }
+
+    fn candidate_for(strategy: StrategyKind) -> SignalCandidate {
         SignalCandidate::new(CandidateSpecification {
-            strategy: StrategyKind::RulesOnly,
+            strategy,
             market: Market::new("BTC").expect("market"),
             side: Side::Buy,
             sleeve: Sleeve::FifteenMinute,
