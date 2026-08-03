@@ -10,6 +10,8 @@ use crate::event::{
     CandleInterval, CompletedCandle, EventError, MarketEvent, MarketEventKind, TimestampNs,
 };
 
+const MAX_PENDING_TRADES: usize = 4_096;
+
 /// One immutable completed candle with its exact normalized-trade input range.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candle {
@@ -103,6 +105,25 @@ pub enum CandleError {
     ConflictingDuplicate {
         /// Reused canonical trade identity.
         event_id: EventId,
+    },
+    /// A duplicate trade identity changed its receipt time, which would change
+    /// point-in-time availability and feature provenance.
+    #[error(
+        "duplicate trade identity {event_id:?} changed receipt time from {existing_received_at} to {received_at}"
+    )]
+    ConflictingDuplicateReceiptTime {
+        /// Reused canonical trade identity.
+        event_id: EventId,
+        /// Receipt time already bound to the identity.
+        existing_received_at: TimestampNs,
+        /// Receipt time supplied by the conflicting replay.
+        received_at: TimestampNs,
+    },
+    /// The bounded pending-trade buffer is full before a watermark advances.
+    #[error("pending trade capacity {limit} reached before finalization")]
+    PendingTradeCapacity {
+        /// Maximum unique pending trades across all buckets.
+        limit: usize,
     },
     /// A trade arrived after the caller finalized its enclosing interval.
     #[error("trade at {event_time} is older than finalized watermark {watermark}")]
@@ -211,11 +232,23 @@ impl CandleAggregator {
         if let Some(existing) = self.seen.get(&point.event_id) {
             return if existing == &point {
                 Ok(())
+            } else if existing.received_at != point.received_at {
+                Err(CandleError::ConflictingDuplicateReceiptTime {
+                    event_id: point.event_id,
+                    existing_received_at: existing.received_at,
+                    received_at: point.received_at,
+                })
             } else {
                 Err(CandleError::ConflictingDuplicate {
                     event_id: point.event_id,
                 })
             };
+        }
+
+        if self.seen.len() == MAX_PENDING_TRADES {
+            return Err(CandleError::PendingTradeCapacity {
+                limit: MAX_PENDING_TRADES,
+            });
         }
 
         let mut keys = Vec::with_capacity(2);
@@ -295,6 +328,13 @@ impl CandleAggregator {
             })?;
         }
         self.watermark = Some(watermark);
+        self.seen.retain(|_, trade| {
+            bucket_open(trade.event_time, CandleInterval::OneHour).is_ok_and(|open_time| {
+                open_time
+                    .checked_add(CandleInterval::OneHour.duration())
+                    .is_ok_and(|close| close > watermark)
+            })
+        });
         Ok(candles)
     }
 }
@@ -550,6 +590,56 @@ mod tests {
             .find(|candle| candle.candle().interval() == CandleInterval::FifteenMinutes)
             .expect("fifteen-minute candle must exist");
         assert_eq!(candle.source_available_at(), timestamp(500));
+    }
+
+    #[test]
+    fn rejects_a_duplicate_identity_with_a_different_receipt_time() {
+        let mut aggregator = CandleAggregator::new();
+        let first = trade_with_receipt(1, 1, 1, dec!(100));
+        aggregator
+            .ingest(&first)
+            .expect("initial trade must be accepted");
+
+        assert!(matches!(
+            aggregator.ingest(&trade_with_receipt(1, 2, 1, dec!(100))),
+            Err(CandleError::ConflictingDuplicateReceiptTime {
+                event_id,
+                existing_received_at,
+                received_at,
+            }) if event_id == *first.event_id()
+                && existing_received_at == timestamp(1)
+                && received_at == timestamp(2)
+        ));
+    }
+
+    #[test]
+    fn finalization_prunes_deduplication_for_fully_closed_trade_intervals() {
+        let mut aggregator = CandleAggregator::new();
+        aggregator
+            .ingest(&trade(1, 1, dec!(100)))
+            .expect("trade must be accepted");
+        aggregator
+            .complete_through(timestamp(3_600_000_000_000))
+            .expect("watermark must finalize both candle intervals");
+
+        assert!(aggregator.seen.is_empty());
+    }
+
+    #[test]
+    fn refuses_new_trades_when_the_unfinalized_buffer_reaches_its_capacity() {
+        let mut aggregator = CandleAggregator::new();
+        for trade_id in 0..super::MAX_PENDING_TRADES {
+            aggregator
+                .ingest(&trade(1, trade_id as u64 + 1, dec!(100)))
+                .expect("trade within the pending capacity must be accepted");
+        }
+
+        assert_eq!(
+            aggregator.ingest(&trade(1, super::MAX_PENDING_TRADES as u64 + 1, dec!(100))),
+            Err(CandleError::PendingTradeCapacity {
+                limit: super::MAX_PENDING_TRADES,
+            })
+        );
     }
 
     proptest! {
