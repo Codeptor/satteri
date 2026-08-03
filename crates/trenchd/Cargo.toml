@@ -1,9 +1,11 @@
 [package]
 name = "trenchd"
 version = "0.1.0"
+description = "Paper-only asynchronous orchestration daemon for Satteri"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 publish = false
 
 [dependencies]

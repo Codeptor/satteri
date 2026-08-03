@@ -14,7 +14,7 @@
 
 This is phase 1 of the approved [paper-bot design](../specs/2026-08-03-trench-paper-trading-bot-design.md). It produces a complete `rules_only` paper bot and deterministic replay tool. It deliberately does not create Python, ML, Telegram, wallet, signing, Trench order-submission, or Hyperliquid `/exchange` code. Run this plan before the ML and VPS plans.
 
-Use `@test-driven-development`, `@rust-best-practices`, `@rust-async-patterns`, `@api-security-best-practices`, and `@SQLite Database Expert` while executing. Never modify the user-supplied `GETTING-STARTED.md` or `trench-perps-sdk-0.1.0.tgz`.
+Use `@test-driven-development`, `@rust-best-practices`, `@rust-async-patterns`, `@api-security-best-practices`, and `@SQLite Database Expert` while executing. Never modify or commit operator-supplied package and reference inputs kept outside version control.
 
 ## Target file map
 
@@ -125,7 +125,7 @@ Use edition 2024 and resolver 3. The root workspace must list exactly the four c
 
 - [ ] **Step 3: Record project conventions**
 
-`AGENTS.md` must state the four-crate boundary, paper-only security invariant, single-writer rule, deterministic-time rule, commands (`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`), current known issue (VPS `systemd-networkd-wait-online` failure), and links to the design and three phase plans.
+`AGENTS.md` must state the four-crate boundary, paper-only security invariant, single-writer rule, deterministic-time rule, commands (`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`), the unresolved `systemd-networkd-wait-online` deployment fixture, and links to the design and three phase plans.
 
 The example TOML must contain only public endpoints, local paths, feed thresholds, and the frozen risk numbers. It must have no wallet, account address, API key, or generic secret field.
 

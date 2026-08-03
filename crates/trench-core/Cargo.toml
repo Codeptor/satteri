@@ -1,9 +1,11 @@
 [package]
 name = "trench-core"
 version = "0.1.0"
+description = "Deterministic strategy, risk, broker, and ledger logic for Satteri"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 publish = false
 
 [dependencies]

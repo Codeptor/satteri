@@ -1,9 +1,11 @@
 [package]
 name = "trench-hyperliquid"
 version = "0.1.0"
+description = "Read-only public Hyperliquid market-data adapters for Satteri"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 publish = false
 
 [dependencies]

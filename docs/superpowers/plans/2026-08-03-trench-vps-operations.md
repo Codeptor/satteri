@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Package, harden, deploy, and operate the completed paper bot continuously on the measured shared VPS without exposing ports, secrets, or live-trading capability.
+**Goal:** Package, harden, deploy, and operate the completed paper bot continuously on the preflight-qualified `trench-vps` target without exposing ports, secrets, or live-trading capability.
 
-**Architecture:** CI produces a content-addressed static Rust binary plus a locked Python source bundle; a root-run installer prepares an immutable release before atomically activating it. Dedicated systemd units run as the unprivileged `trenchbot` account inside a bounded slice, while loopback health/metrics, journal alerts, online SQLite backups, and deterministic doctor/smoke commands provide operations evidence. Existing VPS containers and services are outside the deployment boundary.
+**Architecture:** CI produces a content-addressed static Rust binary plus a locked Python source bundle; a root-run installer prepares an immutable release before atomically activating it. Dedicated systemd units run as the unprivileged `trenchbot` account inside a bounded slice, while loopback health/metrics, journal alerts, online SQLite backups, and deterministic doctor/smoke commands provide operations evidence. All out-of-scope host workloads are outside the deployment boundary.
 
 **Tech Stack:** GitHub Actions, x86_64-unknown-linux-musl Rust release, uv/Python 3.12, systemd services/slice/timers, SQLite online backup, Prometheus text metrics over loopback, Bash with ShellCheck/Bats.
 
@@ -12,11 +12,11 @@
 
 ## Scope and prerequisites
 
-Execute this after both the [rules platform](2026-08-03-trench-rules-platform.md) and [ML champion plan](2026-08-03-trench-ml-champion.md) pass; the ML unit may remain disabled until a valid champion is installed. The target is SSH alias `gifgoblin`, measured as Ubuntu 24.04, 6 shared EPYC vCPUs, about 12 GB RAM, and 174 GB free disk. Re-measure rather than trusting those numbers at deployment time.
+Execute this after both the [rules platform](2026-08-03-trench-rules-platform.md) and [ML champion plan](2026-08-03-trench-ml-champion.md) pass; the ML unit may remain disabled until a valid champion is installed. All command examples use the generic SSH alias `trench-vps`. At deployment time, capture a redacted measured-host fixture and require it to satisfy the Task 5 OS, CPU, memory, storage, time, route, DNS, TLS, port, and service-collision gates. Checked-in documentation and fixtures must not encode a real hostname or previously observed hardware inventory.
 
-Current read-only evidence narrows the network blocker: `eth0` is routable and netplan reports it online, IPv4 and IPv6 HTTPS work, but networkd keeps its administrative state at `configuring`; the generated default-route states remain `requesting/configuring`, both generated wait-online commands time out, and the unit stays failed. Root access is required to inspect the protected cloud-init netplan and networkd journal. The deployment must correct that pending route configuration until `eth0` becomes `configured`; it must not suppress the unit or replace it with an optimistic wait override.
+The checked-in preflight suite includes a generic failure fixture in which the primary link has route, DNS, and TLS reachability while networkd remains administratively `configuring`, generated default routes remain pending, and `systemd-networkd-wait-online` fails. The fixture defines diagnostics and acceptance criteria; it does not assert the deployment target's current state. Deployment-time read-only evidence must identify the actual affected link and cause. When pending route configuration is present, correct it until the link becomes `configured`; do not suppress the unit or replace it with an optimistic wait override.
 
-Use `@devops-engineer`, `@deploy-checklist`, `@runbook`, `@api-security-best-practices`, and `@risk-management` during execution. Do not touch GIF Goblin, Discord, SearXNG, Caddy, Docker configuration, firewall rules unrelated to this service, or any Telegram material. The other administrator has root-equivalent access, so this host is suitable only because the paper deployment contains no confidential trading key or personal session.
+Use `@devops-engineer`, `@deploy-checklist`, `@runbook`, `@api-security-best-practices`, and `@risk-management` during execution. Do not modify out-of-scope workloads, container-runtime or reverse-proxy configuration, unrelated firewall rules, or personal messaging material. The target is suitable only because the paper deployment contains no confidential trading key or personal session.
 
 ## Target file map
 
@@ -54,7 +54,7 @@ deploy/tests/smoke-test.bats                    scoped activation/failure fixtur
 deploy/tests/systemd.bats                      unit hardening/static tests
 deploy/tests/verify-host.bats                   prerequisite failure tests
 docs/runbooks/trench-paper-operations.md        operator commands and incident actions
-docs/ops/network-preflight.md                   evidence and resolution of current wait-online failure
+docs/ops/network-preflight.md                   deployment-time wait-online evidence and resolution
 ```
 
 ## Deployment invariants
@@ -64,7 +64,7 @@ docs/ops/network-preflight.md                   evidence and resolution of curre
 - `/var/lib/trenchbot`, `/var/backups/trenchbot`, and `/run/trenchbot` are the only writable service paths and use `0700` directories/`0600` data files.
 - Metrics and health bind to exactly `127.0.0.1:9464`; a port conflict is a hard preflight failure, never an automatic neighboring-port selection.
 - Database migrations are forward-only. Never activate an older binary against a newer schema; retain the verified pre-migration online backup for explicit recovery.
-- Systemd and journal visibility do not hide data from the co-administrator with root access. Live keys require a different host/spec.
+- Host administrators can inspect systemd state and journals. The paper deployment therefore contains no live key; live keys require a different host/specification.
 
 ### Task 1: Add loopback health, bounded metrics, and systemd watchdog
 
@@ -223,7 +223,7 @@ Run `systemd-analyze verify` against the initial absent files and assert failure
 
 - [ ] **Step 2: Create account/directories and slice policy**
 
-`sysusers.d` creates a system `trenchbot` user/group with `/var/lib/trenchbot` and `/usr/sbin/nologin`. `tmpfiles.d` creates `/etc/trenchbot` as root:`trenchbot` `0750`, plus `/var/lib/trenchbot/{sqlite,parquet,models}`, `/var/backups/trenchbot`, and `/run/trenchbot` at `0700`. The slice uses `CPUQuota=300%`, `MemoryHigh=3G`, `MemoryMax=4G`, `TasksMax=512`, and accounting enabled, leaving the majority of the measured host memory plus three vCPUs available to other workloads.
+`sysusers.d` creates a system `trenchbot` user/group with `/var/lib/trenchbot` and `/usr/sbin/nologin`. `tmpfiles.d` creates `/etc/trenchbot` as root:`trenchbot` `0750`, plus `/var/lib/trenchbot/{sqlite,parquet,models}`, `/var/backups/trenchbot`, and `/run/trenchbot` at `0700`. The slice uses `CPUQuota=300%`, `MemoryHigh=3G`, `MemoryMax=4G`, `TasksMax=512`, and accounting enabled, reserving at least one vCPU and 4 GB RAM for out-of-scope workloads on the minimum compliant target.
 
 `deploy/config/paper.toml` contains the exact production public REST/WS endpoints, `/var/lib` data paths, `/run/trenchbot/admin.sock`, `/run/trenchbot/ml.sock`, `127.0.0.1:9464`, frozen universe/risk/fee settings, `rules.mode=active`, sibling filenames `rules-artifact.json` and `rules-validation.json`, their release-supplied digests, and no independently tunable rule values or secret field. Both files are packaged beside `paper.toml`; `trenchd` resolves them relative to the canonical physical config target, so staged validation reads the staged pair and `/etc/trenchbot/paper.toml` reads the pair in the atomically selected release. `deploy/config/ml.toml` contains the Unix socket, content-addressed model root, worker limits/deadline, feature/config digests supplied at release time, and no database/exchange/credential field.
 
@@ -255,36 +255,36 @@ git commit -m "ops: define hardened paper-bot services"
 
 - [ ] **Step 1: Write failing preflight fixtures**
 
-Test rejection of wrong architecture/OS, less than 4 vCPUs, less than 8 GB RAM, less than 80 GB free ext4 disk, unsynchronized NTP, missing default route/DNS/TLS reachability, port 9464 already bound, failed system units, unsupported Python, and release/data paths on a network or `/mnt/c` filesystem. Test success with the measured-host fixture.
+Test rejection of wrong architecture/OS, less than 4 vCPUs, less than 8 GB RAM, less than 80 GB free ext4 disk, unsynchronized NTP, missing default route/DNS/TLS reachability, port 9464 already bound, failed system units, unsupported Python, and release/data paths on a network or `/mnt/c` filesystem. Test success with a redacted deployment-time measured fixture.
 
 - [ ] **Step 2: Implement a read-only host verifier**
 
-The script must use explicit commands/paths, output a compact JSON result plus human summary, and never install, stop, restart, or edit anything. It checks `uname`, `/etc/os-release`, `nproc`, `/proc/meminfo`, `findmnt`, `df`, `timedatectl`, `ip route`, `resolvectl`, TLS reachability to official Hyperliquid endpoints, `ss`, `systemctl --failed`, existing containers/resource usage, Python 3.12, `libgomp`, and current service/path collisions.
+The script must use explicit commands/paths, output a compact JSON result plus human summary, and never install, stop, restart, or edit anything. It checks `uname`, `/etc/os-release`, `nproc`, `/proc/meminfo`, `findmnt`, `df`, `timedatectl`, `ip route`, `resolvectl`, TLS reachability to official Hyperliquid endpoints, `ss`, `systemctl --failed`, running-workload resource usage, Python 3.12, `libgomp`, and service/path collisions.
 
-- [ ] **Step 3: Capture the live network failure evidence**
+- [ ] **Step 3: Capture deployment-time network evidence**
 
 Run read-only:
 
 ```bash
-ssh gifgoblin 'systemctl --failed --no-pager'
-ssh gifgoblin 'systemctl status systemd-networkd-wait-online.service --no-pager'
-ssh gifgoblin 'systemctl cat systemd-networkd-wait-online.service'
-ssh gifgoblin 'networkctl list --no-pager'
-ssh gifgoblin 'ip route'
-ssh gifgoblin 'resolvectl status'
+ssh trench-vps 'systemctl --failed --no-pager'
+ssh trench-vps 'systemctl status systemd-networkd-wait-online.service --no-pager'
+ssh trench-vps 'systemctl cat systemd-networkd-wait-online.service'
+ssh trench-vps 'networkctl list --no-pager'
+ssh trench-vps 'ip route'
+ssh trench-vps 'resolvectl status'
 ```
 
-Record exact failed link/unit, boot impact, current route/DNS/NTP evidence, protected netplan inputs, networkd journal cause, and ownership in `docs/ops/network-preflight.md`; do not record credentials or unrelated service configuration. Confirm the already observed state: `eth0` is operationally routable/online while administratively `configuring`, and its generated default routes retain pending configuration flags.
+Record the exact failed link/unit, boot impact, deployment-time route/DNS/NTP evidence, protected netplan inputs, networkd journal cause, and remediation owner in `docs/ops/network-preflight.md`; do not record credentials, host identifiers, or unrelated service configuration. In the generic failure fixture, assert that a routable primary link remains administratively `configuring` while generated default routes retain pending flags. Do not assume that fixture matches the target; establish the target's state before remediation.
 
 - [ ] **Step 4: Resolve only the evidenced cause**
 
-Using root plus provider-console access, back up the exact protected netplan file, inspect the pending IPv4/IPv6 default-route entries and networkd journal, and correct the erroneous cloud-init/netplan route declaration so `networkctl` reports `eth0` as `configured`. Validate with `netplan generate`, use `netplan try` with automatic rollback before `netplan apply`, and preserve both IPv4 and verified IPv6 reachability. Then rerun both generated wait-online commands, restart only the wait-online unit, and confirm `systemctl --failed` remains clean through an agreed reboot window. Do not mark `eth0` optional, disable wait-online, clear the failure without fixing it, or mask it with `--any`.
+Using root plus provider-console access, back up the exact protected netplan inputs for the affected link, inspect pending IPv4/IPv6 default-route entries and the networkd journal, and correct only the evidenced cloud-init/netplan route declaration so `networkctl` reports the link as `configured`. If the deployment evidence identifies a different cause, document and resolve that cause instead of applying the fixture's route edit. Validate with `netplan generate`, use `netplan try` with automatic rollback before `netplan apply`, and preserve both IPv4 and verified IPv6 reachability. Then rerun the generated wait-online commands, restart only the wait-online unit, and confirm `systemctl --failed` remains clean through an agreed reboot window. Do not mark the link optional, disable wait-online, clear the failure without fixing it, or mask it with `--any`.
 
 - [ ] **Step 5: Run local and remote preflight**
 
-Run: `bats deploy/tests/verify-host.bats && ssh gifgoblin 'bash -s -- --json' < deploy/scripts/verify-host.sh`
+Run: `bats deploy/tests/verify-host.bats && ssh trench-vps 'bash -s -- --json' < deploy/scripts/verify-host.sh`
 
-Expected: fixture tests PASS and the live result is all green, including wait-online and port availability.
+Expected: fixture tests PASS and the deployment-time result is all green, including wait-online and port availability.
 
 - [ ] **Step 6: Commit**
 
@@ -357,30 +357,30 @@ git add deploy/scripts/install-model.sh deploy/tests/install-model.bats
 git commit -m "ops: install verified ML champions"
 ```
 
-### Task 7: Activate services without disturbing neighboring workloads
+### Task 7: Activate services without disturbing out-of-scope workloads
 
 **Files:**
 - Create: `deploy/scripts/smoke-test.sh`
 - Create: `deploy/tests/smoke-test.bats`
-- Test: live host smoke evidence
+- Test: deployment-host smoke evidence
 
 - [ ] **Step 1: Write smoke-test failure fixtures**
 
-Test nonzero exit for inactive/failed units, watchdog miss, non-loopback listener, readiness blocker, schema/config/run digest mismatch, a missing required run rotation, ledger not exactly 100 USDC on a fresh run, unexpected writable path, disk above threshold, and modification/restart of protected neighboring services.
+Test nonzero exit for inactive/failed units, watchdog miss, non-loopback listener, readiness blocker, schema/config/run digest mismatch, a missing required run rotation, ledger not exactly 100 USDC on a fresh run, unexpected writable path, disk above threshold, and modification/restart of protected out-of-scope workloads.
 
-- [ ] **Step 2: Snapshot neighboring state before activation**
+- [ ] **Step 2: Snapshot out-of-scope state before activation**
 
-Over SSH, record hashes/status/start timestamps for existing containers and GIF Goblin/Discord/SearXNG/Caddy services, current listeners, load, memory, disk, and failed units. Store only comparison digests/status in the deployment report, not unrelated logs/configuration.
+At deployment time, identify the protected out-of-scope units and containers without adding their names to public fixtures. Over SSH, record their hashes/status/start timestamps plus listeners, load, memory, disk, and failed units. Store only comparison digests/status in the deployment report, not unrelated logs/configuration.
 
 - [ ] **Step 3: Install system definitions, release, and optional champion**
 
-Run sysusers/tmpfiles, copy verified unit files, daemon-reload, and use `install-release.sh prepare` to publish an inert release. For an upgrade, call `trenchd release prepare` against that release manifest and wait for its durable ID; stop only `trench-ml.service`, then call `install-release.sh activate` with the ID. For a proven first install use its explicit `--initial` path. Start/restart only `trenchd.service` and start the backup/retention timers in decisions-paused/ML-degraded mode. If an approved replacement ML artifact is in scope, transfer only its artifact directory plus promotion report, run `install-model.sh`, inspect the inert candidate digest, and invoke `trenchd champion activate --socket /run/trenchbot/admin.sock --candidate-pointer ABSOLUTE_PATH --run-manifest ABSOLUTE_PATH`. Require the command to report a durable `pending_worker_restart` transition and a fresh run ID before starting only `trench-ml.service`; wait until status reports the exact champion digest and that run in `burn_in` before any ML inference boundary. If the existing champion remains compatible, start only `trench-ml.service`, require its exact current-release handshake, then invoke `trenchd run rotate --socket /run/trenchbot/admin.sock --run-manifest ABSOLUTE_PATH --reason initial|release_change|rules_change` with the pending prepare ID when applicable. With no champion installed, invoke the same rotation in explicit ML-degraded mode. Require the new `burn_in` run before decisions resume; otherwise leave decisions paused. Use exact unit names and never restart all services or Docker.
+Run sysusers/tmpfiles, copy verified unit files, daemon-reload, and use `install-release.sh prepare` to publish an inert release. For an upgrade, call `trenchd release prepare` against that release manifest and wait for its durable ID; stop only `trench-ml.service`, then call `install-release.sh activate` with the ID. For a proven first install use its explicit `--initial` path. Start/restart only `trenchd.service` and start the backup/retention timers in decisions-paused/ML-degraded mode. If an approved replacement ML artifact is in scope, transfer only its artifact directory plus promotion report, run `install-model.sh`, inspect the inert candidate digest, and invoke `trenchd champion activate --socket /run/trenchbot/admin.sock --candidate-pointer ABSOLUTE_PATH --run-manifest ABSOLUTE_PATH`. Require the command to report a durable `pending_worker_restart` transition and a fresh run ID before starting only `trench-ml.service`; wait until status reports the exact champion digest and that run in `burn_in` before any ML inference boundary. If the existing champion remains compatible, start only `trench-ml.service`, require its exact current-release handshake, then invoke `trenchd run rotate --socket /run/trenchbot/admin.sock --run-manifest ABSOLUTE_PATH --reason initial|release_change|rules_change` with the pending prepare ID when applicable. With no champion installed, invoke the same rotation in explicit ML-degraded mode. Require the new `burn_in` run before decisions resume; otherwise leave decisions paused. Use exact Trench unit names and never restart all services or the container runtime.
 
 - [ ] **Step 4: Run post-activation smoke**
 
-The script checks loopback endpoints, systemd status/watchdog, journal error codes, current-release digest, config/schema fingerprint, exact active-or-burn-in run/digest binding, SQLite integrity/reconciliation, event freshness, universe explanation, two ledger identities/equity, timers, resource slice, writable paths, listeners, and protected-neighbor before/after state.
+The script checks loopback endpoints, systemd status/watchdog, journal error codes, current-release digest, config/schema fingerprint, exact active-or-burn-in run/digest binding, SQLite integrity/reconciliation, event freshness, universe explanation, two ledger identities/equity, timers, resource slice, writable paths, listeners, and protected out-of-scope workload state before and after activation.
 
-Run: `ssh gifgoblin 'sudo /opt/trenchbot/current/deploy/scripts/smoke-test.sh --config /etc/trenchbot/paper.toml'`
+Run: `ssh trench-vps 'sudo /opt/trenchbot/current/deploy/scripts/smoke-test.sh --config /etc/trenchbot/paper.toml'`
 
 Expected: PASS; only Trench units have new start timestamps and no public listener appears.
 
@@ -391,7 +391,7 @@ git add deploy/scripts/smoke-test.sh deploy/tests/smoke-test.bats
 git commit -m "ops: add isolated activation smoke test"
 ```
 
-### Task 8: Exercise recovery and alert contracts on the live paper service
+### Task 8: Exercise recovery and alert contracts on the deployed paper service
 
 **Files:**
 - Modify: `deploy/scripts/smoke-test.sh`
@@ -403,21 +403,21 @@ Use fixture/replay mode or service-specific controls to inject WS disconnect/gap
 
 - [ ] **Step 2: Verify each readiness and alert transition**
 
-For every scenario, assert the expected global/market/ledger scope, new-entry block, mandatory-exit availability, structured priority journal record, active bounded metric, persistence transition, recovery criteria, and no neighbor restart. A process kill at each ledger transition must reopen to the same reconciled digest.
+For every scenario, assert the expected global/market/ledger scope, new-entry block, mandatory-exit availability, structured priority journal record, active bounded metric, persistence transition, recovery criteria, and no out-of-scope workload restart. A process kill at each ledger transition must reopen to the same reconciled digest.
 
 - [ ] **Step 3: Verify backup recovery in an isolated directory**
 
-Restore the latest online backup to a fresh explicit temporary data root, replay from its checkpoint, and compare ledger/event/config digests with live state at the same event boundary. Never overwrite the live database during this test.
+Restore the latest online backup to a fresh explicit temporary data root, replay from its checkpoint, and compare ledger/event/config digests with active state at the same event boundary. Never overwrite the active database during this test.
 
-- [ ] **Step 4: Write the operator runbook from observed commands**
+- [ ] **Step 4: Write the operator runbook from validated commands**
 
 Document status/readiness, journal filters, start/stop/restart of exact Trench units, release verification, backup/restore to a new root, disk retention, ML-degraded operation, unresolved exposure, breaker review, forward-evidence report, schema migration rule, and escalation. Explicitly state that journal/metric alerts are local signals and must be actively monitored over SSH until a separately approved external notification channel exists.
 
 - [ ] **Step 5: Run final recovery smoke**
 
-Run: `ssh gifgoblin 'sudo /opt/trenchbot/current/deploy/scripts/smoke-test.sh --fault-suite safe'`
+Run: `ssh trench-vps 'sudo /opt/trenchbot/current/deploy/scripts/smoke-test.sh --fault-suite safe'`
 
-Expected: every scoped fault is detected/recovered, backup replay matches, and protected services remain unchanged.
+Expected: every scoped fault is detected/recovered, backup replay matches, and protected out-of-scope workloads remain unchanged.
 
 - [ ] **Step 6: Commit**
 
@@ -438,7 +438,7 @@ Record release/config/schema/rules/model/data-cutoff/license digests, universe f
 
 - [ ] **Step 2: Prove 24-hour operational stability before counting promotion time**
 
-Require continuous normalized data, expected hourly universe snapshots, completed 15m/1h boundaries, zero unexplained gaps/state mismatches/restart loops, verified daily backup, bounded retention, and no neighbor impact. Any code/config/model change creates a new run ID and restarts untouched evidence.
+Require continuous normalized data, expected hourly universe snapshots, completed 15m/1h boundaries, zero unexplained gaps/state mismatches/restart loops, verified daily backup, bounded retention, and no impact to out-of-scope workloads. Any code/config/model change creates a new run ID and restarts untouched evidence.
 
 - [ ] **Step 3: Begin the immutable evidence window**
 
@@ -452,11 +452,11 @@ The writer verifies the run is already the `burn_in` run created by the champion
 
 - [ ] **Step 4: Validate daily/weekly operator checks**
 
-Daily: readiness, gaps, reconciliation, backup, disk, NTP, breaker/exposure, missed boundaries, and neighbor resources. Weekly: cost decomposition, asset/month concentration, calibration/drift, ledger independence, shadow count, unresolved states, and manifest immutability. Record evidence digests rather than editing prior reports.
+Daily: readiness, gaps, reconciliation, backup, disk, NTP, breaker/exposure, missed boundaries, and out-of-scope workload resources. Weekly: cost decomposition, asset/month concentration, calibration/drift, ledger independence, shadow count, unresolved states, and manifest immutability. Record evidence digests rather than editing prior reports.
 
 - [ ] **Step 5: Run the complete repository and host gate**
 
-Run local Rust/Python/shell/systemd checks from the prior plans, verify a clean Git worktree except the two preserved user reference files, then rerun remote preflight and smoke. Expected: all pass; the service is collecting untouched evidence but makes no claim of alpha or promotion before 90 days/100 closed trades.
+Run local Rust/Python/shell/systemd checks from the prior plans, verify a clean tracked Git worktree, confirm operator-supplied reference inputs remain outside version control, then rerun remote preflight and smoke. Expected: all pass; the service is collecting untouched evidence but makes no claim of alpha or promotion before 90 days/100 closed trades.
 
 - [ ] **Step 6: Commit**
 
@@ -467,4 +467,4 @@ git commit -m "docs: define untouched forward paper run"
 
 ## Phase-3 completion gate
 
-Phase 3 is complete when the measured host passes preflight, the wait-online failure is genuinely resolved, verified immutable services run inside their slice, only loopback endpoints exist, backup/recovery and scoped fault tests pass, neighboring workloads are unchanged, and a frozen forward run is collecting evidence. This does not authorize live trading or claim that either strategy has alpha; those conclusions require the untouched promotion gates.
+Phase 3 is complete when the deployment-time measured target passes preflight, any wait-online failure is genuinely resolved, verified immutable services run inside their slice, only loopback endpoints exist, backup/recovery and scoped fault tests pass, out-of-scope workloads are unchanged, and a frozen forward run is collecting evidence. This does not authorize live trading or claim that either strategy has alpha; those conclusions require the untouched promotion gates.

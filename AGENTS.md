@@ -29,6 +29,9 @@ cargo test --workspace
 - [ML champion plan](docs/superpowers/plans/2026-08-03-trench-ml-champion.md)
 - [VPS operations plan](docs/superpowers/plans/2026-08-03-trench-vps-operations.md)
 
-## Known issue
+## Deployment fixture
 
-The VPS has an unresolved `systemd-networkd-wait-online` failure. Correct the pending route configuration; do not suppress or replace the wait-online unit.
+The VPS preflight fixture includes an unresolved
+`systemd-networkd-wait-online` failure caused by pending route configuration.
+Correct the route configuration; do not suppress or replace the wait-online
+unit.

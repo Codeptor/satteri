@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-03
 **Status:** Approved
-**Project root:** `/home/esoteric/satteri`
+**Project root:** repository root (`./`)
 
 ## 1. Decision summary
 
@@ -26,7 +26,7 @@ Telegram is completely outside this project. There is no Telegram credential sch
 - Protect a 100 USDC account with hard, strategy-independent risk constraints.
 - Support 15-minute and 1-hour decision sleeves without allowing simultaneous positions within one ledger.
 - Make every signal, risk decision, fill, state transition, and model/configuration version auditable.
-- Run continuously on the existing `gifgoblin` VPS without disrupting its current services.
+- Run continuously on the generic `trench-vps` deployment target without disrupting out-of-scope workloads.
 - Keep the architecture ready for a separately approved live-execution project without putting live-only code or secrets in the paper deployment.
 
 ## 3. Non-goals
@@ -42,11 +42,11 @@ Telegram is completely outside this project. There is no Telegram credential sch
 - Storing unbounded raw order-book data.
 - PostgreSQL, Redis, Kafka, Kubernetes, or distributed writers.
 
-The shared VPS is acceptable for paper trading because it holds no financial or Telegram secret. It is not an acceptable future home for a live trading key: the second administrator has `sudo`/Docker-equivalent root access. Live activation requires a separate security design and an exclusive signer trust boundary.
+The shared VPS deployment is acceptable only for paper trading because it holds no financial or personal-session secret. It is not an acceptable future home for a live trading key. Live activation requires a separate security design and an exclusive signer trust boundary.
 
 ## 4. Source constraints and SDK boundary
 
-The supplied package is `@trench/perps-sdk` v0.1.0. Its public declarations expose REST reads and order construction/submission but no WebSocket client. The local [getting-started guide](../../../GETTING-STARTED.md) also fixes the Trench builder fee at 30 tenths of a basis point, or 3 bps per filled order.
+The supplied `@trench/perps-sdk` v0.1.0 package materials expose REST reads and order construction/submission but no WebSocket client. For reproducibility, this design freezes their 3 bps-per-filled-order builder-fee value as a paper-simulation assumption. It is not a claim about a publicly verifiable or current venue fee.
 
 Therefore:
 
@@ -312,7 +312,7 @@ All simulated positions use isolated margin. Cross margin and portfolio margin a
 Primary results assume taker execution at the lowest Hyperliquid fee tier:
 
 - Hyperliquid perp taker fee: 4.5 bps per side.
-- Trench builder fee: 3.0 bps per filled order.
+- Trench builder fee: 3.0 bps per filled order, frozen from the supplied `@trench/perps-sdk` v0.1.0 package materials as a paper-simulation assumption rather than a public venue-fee claim.
 - Fixed fee subtotal: 7.5 bps per side, approximately 15 bps round trip before spread, depth slippage, latency, and funding.
 
 The fee schedule and any asset-specific fee modifier are snapshotted with each run. Unknown fee state uses the more expensive plausible value or makes the asset ineligible. Discounts, staking, referrals, and maker rebates are not assumed.
@@ -440,19 +440,19 @@ There is no attempt to recreate a missed favorable paper order after downtime. M
 
 ## 12. Deployment and operations
 
-The existing VPS was measured on 2026-08-03 as 6 shared AMD EPYC vCPUs, approximately 12 GB RAM, a 200 GB non-rotational virtual disk with 174 GB free, synchronized NTP, and low current load. This is sufficient for the paper hot path provided heavy foundation-model work stays ephemeral and raw-book retention is bounded.
+Measure the `trench-vps` target at deployment time and persist a redacted preflight fixture. It must provide Ubuntu 24.04 on x86_64, at least 4 vCPUs, 8 GB RAM, 80 GB free ext4 storage, synchronized NTP, working default-route/DNS/TLS checks, and enough unused capacity for the resource slice below. The paper hot path remains bounded by ephemeral foundation-model work and finite raw-book retention.
 
 Deployment principles:
 
 - dedicated unprivileged `trenchbot` service account;
-- native systemd services and a `trenchbot.slice`, leaving capacity for existing containers;
+- native systemd services and a `trenchbot.slice`, leaving capacity for out-of-scope workloads;
 - no public application port; metrics/admin bind to loopback;
 - explicit CPU/memory/file-descriptor limits and restart policy;
 - structured `tracing` logs with no environment dump;
 - pinned, reproducible dependencies and immutable release directory;
 - global readiness requires database, NTP, market stream, data freshness, storage, and risk reconciliation; model handshake is an `ml_champion`-only readiness condition;
-- deployment is blocked until the observed `systemd-networkd-wait-online` failure is understood or corrected;
-- the existing GIF Goblin, Discord bot, SearXNG, Caddy, and Docker configuration are not modified by this project.
+- deployment is blocked whenever `systemd-networkd-wait-online` fails; the evidenced route/configuration cause must be corrected rather than suppressed;
+- out-of-scope workloads and host configuration are not modified by this project.
 
 Required alerts include process restart loops, WS disconnect/gap, stale market, decision latency, rejected/partial fills, breaker changes, equity mismatch, model deadline/drift, SQLite checkpoint failure, disk above 70%, memory pressure, NTP loss, and missed bar boundaries.
 
@@ -501,14 +501,14 @@ Required alerts include process restart loops, WS disconnect/gap, stale market, 
 - **All-Python runtime:** rejected because Python remains ideal for research while Rust gives stronger operational and state invariants.
 - **Foundation model as initial champion:** rejected because current 2026 evidence is strongest on IID tables, temporal evidence favors conventional models, licensing is uneven, and GPU cost is unnecessary.
 - **PostgreSQL:** rejected because one VPS and one writer gain simplicity and deterministic local recovery from SQLite WAL; Parquet handles analytical volume.
-- **Dedicated/VDS CPU:** rejected for paper mode after measuring sufficient shared-VPS headroom.
-- **Telegram on the shared VPS:** rejected and removed from scope because co-administrators have root-equivalent access and a personal MTProto session is not channel-scoped.
+- **Dedicated/VDS CPU:** not required by the baseline paper design; deployment proceeds only when the measured target passes preflight and slice-capacity checks.
+- **Telegram integration:** rejected because personal messaging sessions are outside the paper-only boundary.
 
 ## 16. Primary references
 
 ### Trench and Hyperliquid
 
-- Local [Trench Perps SDK getting-started guide](../../../GETTING-STARTED.md)
+- Supplied `@trench/perps-sdk` v0.1.0 package materials (frozen paper-simulation input; not a public fee source)
 - [Hyperliquid WebSocket API](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket)
 - [Hyperliquid WebSocket subscriptions](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions)
 - [Hyperliquid perpetual metadata](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals)

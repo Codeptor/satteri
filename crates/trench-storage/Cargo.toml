@@ -1,9 +1,11 @@
 [package]
 name = "trench-storage"
 version = "0.1.0"
+description = "Durable storage and deterministic replay for Satteri"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 publish = false
 
 [dependencies]
