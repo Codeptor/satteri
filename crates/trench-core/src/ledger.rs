@@ -527,10 +527,16 @@ impl LedgerState {
         self.last_executable_mark
     }
 
-    /// Returns whether no fresh executable valuation is currently available.
+    /// Returns whether an executable book remains source-fresh at `at`.
     #[must_use]
-    pub const fn executable_mark_stale(&self) -> bool {
-        !self.book_freshness.is_fresh()
+    pub fn is_executable_mark_fresh_at(&self, at: TimestampNs) -> bool {
+        self.book_freshness.is_fresh_at(at)
+    }
+
+    /// Returns whether no executable book remains source-fresh at `at`.
+    #[must_use]
+    pub fn is_executable_mark_stale_at(&self, at: TimestampNs) -> bool {
+        !self.is_executable_mark_fresh_at(at)
     }
 
     /// Returns source-time evidence for the current executable-mark status.
@@ -625,7 +631,7 @@ impl LedgerState {
         if self.position.is_some() {
             return Err(LedgerError::PositionAlreadyOpen);
         }
-        if !self.book_freshness.is_fresh_at(at)
+        if !self.is_executable_mark_fresh_at(at)
             || self.fresh_book_market.as_ref() != Some(&entry.market)
         {
             return Err(LedgerError::StaleExecutableMark);

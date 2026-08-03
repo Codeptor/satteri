@@ -207,7 +207,7 @@ fn long_marks_walk_bid_depth_and_apply_the_mandatory_exit_boundary() {
     assert_eq!(marked.unrealized_pnl(), dec!(-2.292));
     assert_eq!(marked.equity(), usdc(dec!(97.633)));
     assert!(marked.liquidity_incomplete());
-    assert!(!marked.executable_mark_stale());
+    assert!(marked.is_executable_mark_fresh_at(at));
     assert!(marked.breakers().daily_loss_tripped());
 }
 
@@ -276,7 +276,7 @@ fn stale_books_preserve_the_last_executable_value_and_block_new_entries() {
         .into_state();
 
     assert_eq!(stale.equity(), valuation);
-    assert!(stale.executable_mark_stale());
+    assert!(stale.is_executable_mark_stale_at(at));
 
     let flat_stale = LedgerState::new(LedgerId::RulesOnly, at)
         .expect("ledger must initialize")
@@ -383,8 +383,8 @@ fn source_timestamps_make_both_long_and_short_marks_fresh_at_the_inclusive_bound
         short.book_freshness(),
         BookFreshnessStatus::Fresh { .. }
     ));
-    assert!(!long.executable_mark_stale());
-    assert!(!short.executable_mark_stale());
+    assert!(long.is_executable_mark_fresh_at(at));
+    assert!(short.is_executable_mark_fresh_at(at));
 }
 
 #[test]
@@ -416,7 +416,7 @@ fn stale_long_source_book_preserves_valuation_and_blocks_a_later_entry() {
         .expect("stale source book must record a stale transition")
         .into_state();
     assert_eq!(stale.equity(), valuation);
-    assert!(stale.executable_mark_stale());
+    assert!(stale.is_executable_mark_stale_at(stale_at));
     assert!(matches!(
         stale.book_freshness(),
         BookFreshnessStatus::Stale {
@@ -469,7 +469,7 @@ fn future_short_source_book_marks_stale_without_using_its_ask() {
         .into_state();
 
     assert_eq!(stale.equity(), valuation);
-    assert!(stale.executable_mark_stale());
+    assert!(stale.is_executable_mark_stale_at(at));
     assert!(matches!(
         stale.book_freshness(),
         BookFreshnessStatus::Stale {
@@ -495,7 +495,7 @@ fn replay_cannot_look_ahead_to_a_book_received_after_the_transition() {
         .expect("look-ahead source book must record a stale transition")
         .into_state();
 
-    assert!(stale.executable_mark_stale());
+    assert!(stale.is_executable_mark_stale_at(at));
     assert!(matches!(
         stale.book_freshness(),
         BookFreshnessStatus::Stale {
@@ -525,6 +525,8 @@ fn entry_cannot_reuse_a_source_book_after_its_explicit_age_bound_expires() {
         .expect("source book must initially be fresh")
         .into_state();
 
+    assert!(marked.is_executable_mark_fresh_at(source_at));
+    assert!(marked.is_executable_mark_stale_at(entry_at));
     assert!(matches!(
         marked.open_position(entry_at, long_entry(), usdc(dec!(0.50))),
         Err(LedgerError::StaleExecutableMark)
