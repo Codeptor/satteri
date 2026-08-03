@@ -69,6 +69,11 @@ pub const FINALIZED_EVENT_ID_HORIZON: usize = 4_096;
 pub const FINALIZED_CANDLE_ID_HORIZON: usize = 4_096;
 const MICRO_5_MINUTES_NS: i64 = 300_000_000_000;
 const MICRO_15_MINUTES_NS: i64 = 900_000_000_000;
+/// Maximum authoritative age of a BBO or L2 snapshot at a decision boundary.
+///
+/// This frozen one-second policy matches paper execution's executable-book
+/// contract and is evaluated solely against explicit event and decision times.
+pub const MAX_BBO_BOOK_AGE_NS: i64 = 1_000_000_000;
 
 /// A dependency family included in an immutable feature-input range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -379,6 +384,8 @@ pub enum FeatureUnreadyReason {
     FundingHistory,
     /// BBO, order-book, or aggressive-trade inputs are incomplete.
     Microstructure,
+    /// A BBO or L2 book was available but older than the frozen executable-data bound.
+    StaleBboOrBook,
     /// The preceding completed hourly regime inputs are incomplete.
     HourlyRegime,
     /// A declared feature calculation could not be represented from complete inputs.
@@ -1344,8 +1351,12 @@ impl CommonFeatureEngine {
         let microstructure_history_pruned = self.events.get(&market).is_some_and(|history| {
             history.has_pruned_trade_after(as_of_time.value().saturating_sub(MICRO_15_MINUTES_NS))
         });
+        let stale_bbo_or_book = bbo_event
+            .is_some_and(|event| !is_fresh_book_input(event, as_of_time))
+            || book_event.is_some_and(|event| !is_fresh_book_input(event, as_of_time));
         let microstructure = bbo.is_some()
             && book.is_some()
+            && !stale_bbo_or_book
             && !microstructure_history_pruned
             && trade_imbalance(&trades, as_of_time, MICRO_5_MINUTES_NS).is_some()
             && trade_imbalance(&trades, as_of_time, MICRO_15_MINUTES_NS).is_some();
@@ -1363,6 +1374,7 @@ impl CommonFeatureEngine {
         let mut unready_reason =
             (primary_history_pruned || hourly_history_pruned || microstructure_history_pruned)
                 .then_some(FeatureUnreadyReason::HistoryPruned)
+                .or_else(|| stale_bbo_or_book.then_some(FeatureUnreadyReason::StaleBboOrBook))
                 .or_else(|| incomplete_source_reason(completeness));
         if unready_reason.is_none() {
             if let (
@@ -1709,6 +1721,14 @@ fn available_events(events: &EventHistory, as_of_time: TimestampNs) -> Vec<&Mark
 
 fn event_is_available(event: &MarketEvent, as_of_time: TimestampNs) -> bool {
     event.event_time() <= as_of_time && event.received_at() <= as_of_time
+}
+
+fn is_fresh_book_input(event: &MarketEvent, as_of_time: TimestampNs) -> bool {
+    event_is_available(event, as_of_time)
+        && as_of_time
+            .value()
+            .checked_sub(event.event_time().value())
+            .is_some_and(|age| age <= MAX_BBO_BOOK_AGE_NS)
 }
 
 #[derive(Debug)]
@@ -2526,10 +2546,11 @@ const fn unready_reason_tag(reason: Option<FeatureUnreadyReason>) -> u8 {
         Some(FeatureUnreadyReason::ContextHistory) => 3,
         Some(FeatureUnreadyReason::FundingHistory) => 4,
         Some(FeatureUnreadyReason::Microstructure) => 5,
-        Some(FeatureUnreadyReason::HourlyRegime) => 6,
-        Some(FeatureUnreadyReason::CalculationFailed) => 7,
-        Some(FeatureUnreadyReason::CrossSection) => 8,
-        Some(FeatureUnreadyReason::InputProvenance) => 9,
+        Some(FeatureUnreadyReason::StaleBboOrBook) => 6,
+        Some(FeatureUnreadyReason::HourlyRegime) => 7,
+        Some(FeatureUnreadyReason::CalculationFailed) => 8,
+        Some(FeatureUnreadyReason::CrossSection) => 9,
+        Some(FeatureUnreadyReason::InputProvenance) => 10,
     }
 }
 
@@ -2540,6 +2561,7 @@ mod tests {
 
     use super::{
         CommonFeatureEngine, FeatureError, FeatureInputKind, FeatureSnapshot, FeatureUnreadyReason,
+        MAX_BBO_BOOK_AGE_NS,
     };
     use crate::candle::CandleAggregator;
     use crate::domain::{Market, Price, Quantity, Side, Usdc};
@@ -2593,8 +2615,18 @@ mod tests {
     }
 
     fn book_at(market: Market, received_at: i128, sequence: u64, bid: Decimal) -> MarketEvent {
+        book_at_time(market, 10, received_at, sequence, bid)
+    }
+
+    fn book_at_time(
+        market: Market,
+        event_time: i128,
+        received_at: i128,
+        sequence: u64,
+        bid: Decimal,
+    ) -> MarketEvent {
         MarketEvent::book_snapshot(
-            timestamp(10),
+            timestamp(event_time),
             timestamp(received_at),
             market,
             BookSnapshot::new(
@@ -3307,6 +3339,102 @@ mod tests {
                 .iter()
                 .all(|snapshot| snapshot.completeness().cross_section())
         );
+    }
+
+    #[test]
+    fn bbo_and_book_freshness_is_receipt_aware_and_bounded_at_decision_time() {
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        for (market, offset) in [(market("BTC"), dec!(100)), (market("ETH"), dec!(200))] {
+            populate(
+                &mut engine,
+                &mut aggregator,
+                market,
+                0,
+                128,
+                offset,
+                dec!(1),
+            );
+        }
+        let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
+        complete(&mut engine, &mut aggregator, decision);
+        let btc = market("BTC");
+        let reset_market = |engine: &mut CommonFeatureEngine| {
+            let sources = engine.events.get_mut(&btc).expect("BTC sources must exist");
+            sources.bbo.clear();
+            sources.books.clear();
+        };
+        let observe_pair =
+            |engine: &mut CommonFeatureEngine, event_time: i128, received_at: i128| {
+                let bbo = bbo_at_time(btc.clone(), event_time, received_at, 10_000, dec!(227));
+                let book = book_at_time(btc.clone(), event_time, received_at, 10_000, dec!(227));
+                engine.observe(&bbo).expect("BBO must be observed");
+                engine.observe(&book).expect("book must be observed");
+            };
+        let universe = tradeable_universe(decision, [btc.clone(), market("ETH")]);
+
+        reset_market(&mut engine);
+        observe_pair(
+            &mut engine,
+            i128::from(decision.value() - MAX_BBO_BOOK_AGE_NS),
+            i128::from(decision.value() - MAX_BBO_BOOK_AGE_NS),
+        );
+        let inclusive = engine
+            .snapshots_at_with_universe(
+                crate::event::CandleInterval::FifteenMinutes,
+                decision,
+                Some(&universe),
+            )
+            .into_iter()
+            .find(|snapshot| snapshot.market() == &btc)
+            .expect("BTC snapshot must exist");
+        assert!(inclusive.completeness().microstructure());
+        assert!(
+            inclusive
+                .input_range()
+                .expect("fresh snapshot retains provenance")
+                .spans()
+                .iter()
+                .any(|span| span.kind() == FeatureInputKind::Bbo)
+        );
+
+        reset_market(&mut engine);
+        observe_pair(
+            &mut engine,
+            i128::from(decision.value() - MAX_BBO_BOOK_AGE_NS - 1),
+            i128::from(decision.value() - MAX_BBO_BOOK_AGE_NS - 1),
+        );
+        let stale = engine
+            .snapshots_at_with_universe(
+                crate::event::CandleInterval::FifteenMinutes,
+                decision,
+                Some(&universe),
+            )
+            .into_iter()
+            .find(|snapshot| snapshot.market() == &btc)
+            .expect("BTC snapshot must exist");
+        assert!(!stale.completeness().microstructure());
+        assert_eq!(
+            stale.unready_reason(),
+            Some(FeatureUnreadyReason::StaleBboOrBook)
+        );
+
+        reset_market(&mut engine);
+        observe_pair(
+            &mut engine,
+            i128::from(decision.value()),
+            i128::from(decision.value()) + 1,
+        );
+        let future_receipt = engine
+            .snapshots_at_with_universe(
+                crate::event::CandleInterval::FifteenMinutes,
+                decision,
+                Some(&universe),
+            )
+            .into_iter()
+            .find(|snapshot| snapshot.market() == &btc)
+            .expect("BTC snapshot must exist");
+        assert!(!future_receipt.completeness().microstructure());
     }
 
     #[test]
