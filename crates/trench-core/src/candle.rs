@@ -10,7 +10,13 @@ use crate::event::{
     CandleInterval, CompletedCandle, EventError, MarketEvent, MarketEventKind, TimestampNs,
 };
 
-const MAX_PENDING_TRADES: usize = 4_096;
+/// Number of fully finalized trade identities retained for idempotent replay.
+///
+/// Once this fixed-capacity horizon has filled, an unseen trade for an already
+/// finalized interval is rejected as [`CandleError::FinalizedReplayOutsideHorizon`].
+pub const FINALIZED_TRADE_ID_HORIZON: usize = 4_096;
+
+const MAX_PENDING_TRADES: usize = FINALIZED_TRADE_ID_HORIZON;
 
 /// One immutable completed candle with its exact normalized-trade input range.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +131,14 @@ pub enum CandleError {
         /// Maximum unique pending trades across all buckets.
         limit: usize,
     },
+    /// A replay targeted a finalized interval after its bounded identity horizon expired.
+    #[error("finalized trade identity {event_id:?} is outside retained replay horizon {limit}")]
+    FinalizedReplayOutsideHorizon {
+        /// Replayed canonical trade identity.
+        event_id: EventId,
+        /// Number of finalized identities retained for idempotent replay.
+        limit: usize,
+    },
     /// A trade arrived after the caller finalized its enclosing interval.
     #[error("trade at {event_time} is older than finalized watermark {watermark}")]
     LateTrade {
@@ -173,6 +187,7 @@ impl Ord for TradePoint {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.event_time
             .cmp(&other.event_time)
+            .then_with(|| self.received_at.cmp(&other.received_at))
             .then_with(|| self.event_id.cmp(&other.event_id))
     }
 }
@@ -191,9 +206,16 @@ struct BucketKey {
 }
 
 /// Stateful deterministic trade-to-candle aggregation for the two supported sleeves.
+///
+/// Pending identities remain idempotent until both candle sleeves close. Fully
+/// finalized identities remain idempotent for
+/// [`FINALIZED_TRADE_ID_HORIZON`] canonical ordering positions; a replay after
+/// that finite horizon fails closed instead of being accepted as a new late trade.
 #[derive(Debug, Default)]
 pub struct CandleAggregator {
     seen: BTreeMap<EventId, TradePoint>,
+    finalized: BTreeMap<EventId, TradePoint>,
+    finalized_order: BTreeMap<(TimestampNs, TimestampNs, EventId), EventId>,
     pending: BTreeMap<BucketKey, Vec<TradePoint>>,
     watermark: Option<TimestampNs>,
 }
@@ -207,7 +229,8 @@ impl CandleAggregator {
 
     /// Buffers one canonical trade for both 15-minute and one-hour intervals.
     ///
-    /// Duplicate events are an idempotent no-op. A conflicting reuse of a
+    /// Duplicate events are an idempotent no-op while their identity is pending
+    /// or within [`FINALIZED_TRADE_ID_HORIZON`]. A conflicting reuse of a
     /// canonical identity or a trade after its interval was finalized fails
     /// closed instead of mutating an immutable candle.
     ///
@@ -230,19 +253,10 @@ impl CandleAggregator {
         };
 
         if let Some(existing) = self.seen.get(&point.event_id) {
-            return if existing == &point {
-                Ok(())
-            } else if existing.received_at != point.received_at {
-                Err(CandleError::ConflictingDuplicateReceiptTime {
-                    event_id: point.event_id,
-                    existing_received_at: existing.received_at,
-                    received_at: point.received_at,
-                })
-            } else {
-                Err(CandleError::ConflictingDuplicate {
-                    event_id: point.event_id,
-                })
-            };
+            return duplicate_result(existing, &point);
+        }
+        if let Some(existing) = self.finalized.get(&point.event_id) {
+            return duplicate_result(existing, &point);
         }
 
         if self.seen.len() == MAX_PENDING_TRADES {
@@ -266,6 +280,12 @@ impl CandleAggregator {
                     .checked_add(key.interval.duration())
                     .map_err(CandleError::from)?;
                 if close <= watermark {
+                    if self.finalized.len() == FINALIZED_TRADE_ID_HORIZON {
+                        return Err(CandleError::FinalizedReplayOutsideHorizon {
+                            event_id: point.event_id,
+                            limit: FINALIZED_TRADE_ID_HORIZON,
+                        });
+                    }
                     return Err(CandleError::LateTrade {
                         event_time: point.event_time,
                         watermark,
@@ -328,15 +348,52 @@ impl CandleAggregator {
             })?;
         }
         self.watermark = Some(watermark);
-        self.seen.retain(|_, trade| {
-            bucket_open(trade.event_time, CandleInterval::OneHour).is_ok_and(|open_time| {
-                open_time
-                    .checked_add(CandleInterval::OneHour.duration())
-                    .is_ok_and(|close| close > watermark)
+        let finalized = self
+            .seen
+            .values()
+            .filter(|trade| {
+                bucket_open(trade.event_time, CandleInterval::OneHour).is_ok_and(|open_time| {
+                    open_time
+                        .checked_add(CandleInterval::OneHour.duration())
+                        .is_ok_and(|close| close <= watermark)
+                })
             })
-        });
+            .cloned()
+            .collect::<Vec<_>>();
+        for trade in finalized {
+            self.seen.remove(&trade.event_id);
+            self.record_finalized(trade);
+        }
         Ok(candles)
     }
+
+    fn record_finalized(&mut self, trade: TradePoint) {
+        let order_key = (trade.event_time, trade.received_at, trade.event_id.clone());
+        self.finalized_order
+            .insert(order_key, trade.event_id.clone());
+        self.finalized.insert(trade.event_id.clone(), trade);
+        while self.finalized.len() > FINALIZED_TRADE_ID_HORIZON {
+            if let Some((_, event_id)) = self.finalized_order.pop_first() {
+                self.finalized.remove(&event_id);
+            }
+        }
+    }
+}
+
+fn duplicate_result(existing: &TradePoint, incoming: &TradePoint) -> Result<(), CandleError> {
+    if existing == incoming {
+        return Ok(());
+    }
+    if existing.received_at != incoming.received_at {
+        return Err(CandleError::ConflictingDuplicateReceiptTime {
+            event_id: incoming.event_id.clone(),
+            existing_received_at: existing.received_at,
+            received_at: incoming.received_at,
+        });
+    }
+    Err(CandleError::ConflictingDuplicate {
+        event_id: incoming.event_id.clone(),
+    })
 }
 
 fn bucket_open(time: TimestampNs, interval: CandleInterval) -> Result<TimestampNs, CandleError> {
@@ -593,6 +650,36 @@ mod tests {
     }
 
     #[test]
+    fn same_exchange_time_uses_receipt_time_before_trade_identity_for_ohlc_order() {
+        let (earlier_receipt, later_receipt) = (1_u64..64)
+            .flat_map(|early_id| ((early_id + 1)..64).map(move |late_id| (early_id, late_id)))
+            .find_map(|(early_id, late_id)| {
+                let early = trade_with_receipt(1, 10, early_id, dec!(100));
+                let late = trade_with_receipt(1, 20, late_id, dec!(200));
+                (early.event_id() > late.event_id()).then_some((early, late))
+            })
+            .expect("test identities must include an order opposite to receipt time");
+        assert!(earlier_receipt.event_id() > later_receipt.event_id());
+
+        let mut aggregator = CandleAggregator::new();
+        aggregator
+            .ingest(&later_receipt)
+            .expect("later trade must be accepted");
+        aggregator
+            .ingest(&earlier_receipt)
+            .expect("earlier trade must be accepted");
+
+        let candle = aggregator
+            .complete_through(timestamp(900_000_000_000))
+            .expect("watermark must finalize the candle")
+            .into_iter()
+            .find(|candle| candle.candle().interval() == CandleInterval::FifteenMinutes)
+            .expect("fifteen-minute candle must exist");
+        assert_eq!(candle.candle().open().value(), dec!(100));
+        assert_eq!(candle.candle().close().value(), dec!(200));
+    }
+
+    #[test]
     fn rejects_a_duplicate_identity_with_a_different_receipt_time() {
         let mut aggregator = CandleAggregator::new();
         let first = trade_with_receipt(1, 1, 1, dec!(100));
@@ -613,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn finalization_prunes_deduplication_for_fully_closed_trade_intervals() {
+    fn finalization_moves_deduplication_to_the_bounded_finalized_horizon() {
         let mut aggregator = CandleAggregator::new();
         aggregator
             .ingest(&trade(1, 1, dec!(100)))
@@ -623,6 +710,83 @@ mod tests {
             .expect("watermark must finalize both candle intervals");
 
         assert!(aggregator.seen.is_empty());
+        assert_eq!(aggregator.finalized.len(), 1);
+    }
+
+    #[test]
+    fn finalized_trade_identity_is_idempotent_within_the_declared_horizon() {
+        let mut aggregator = CandleAggregator::new();
+        let event = trade(1, 1, dec!(100));
+        aggregator.ingest(&event).expect("trade must be accepted");
+        aggregator
+            .complete_through(timestamp(3_600_000_000_000))
+            .expect("watermark must finalize the trade");
+
+        assert_eq!(aggregator.ingest(&event), Ok(()));
+    }
+
+    #[test]
+    fn finalized_trade_identity_rejects_a_changed_receipt_time_within_the_horizon() {
+        let mut aggregator = CandleAggregator::new();
+        let event = trade_with_receipt(1, 1, 1, dec!(100));
+        aggregator.ingest(&event).expect("trade must be accepted");
+        aggregator
+            .complete_through(timestamp(3_600_000_000_000))
+            .expect("watermark must finalize the trade");
+
+        assert!(matches!(
+            aggregator.ingest(&trade_with_receipt(1, 2, 1, dec!(100))),
+            Err(CandleError::ConflictingDuplicateReceiptTime { .. })
+        ));
+    }
+
+    #[test]
+    fn replay_beyond_the_finalized_identity_horizon_is_not_reported_as_late() {
+        let mut aggregator = CandleAggregator::new();
+        let first_batch = (1..=super::FINALIZED_TRADE_ID_HORIZON)
+            .map(|trade_id| trade(1, trade_id as u64, dec!(100)))
+            .collect::<Vec<_>>();
+        let expired = first_batch
+            .iter()
+            .min_by_key(|event| event.event_id())
+            .expect("first batch must not be empty")
+            .clone();
+        for event in &first_batch {
+            aggregator.ingest(event).expect("trade must be accepted");
+        }
+        aggregator
+            .complete_through(timestamp(3_600_000_000_000))
+            .expect("watermark must finalize the first batch");
+        let next = trade(
+            3_600_000_000_001,
+            super::FINALIZED_TRADE_ID_HORIZON as u64 + 1,
+            dec!(100),
+        );
+        aggregator
+            .ingest(&next)
+            .expect("next trade must be accepted");
+        aggregator
+            .complete_through(timestamp(7_200_000_000_000))
+            .expect("watermark must finalize the next trade");
+        assert_eq!(
+            aggregator.finalized.len(),
+            super::FINALIZED_TRADE_ID_HORIZON
+        );
+        assert_eq!(
+            aggregator.finalized_order.len(),
+            super::FINALIZED_TRADE_ID_HORIZON
+        );
+
+        let error = aggregator
+            .ingest(&expired)
+            .expect_err("expired finalized identity must not be accepted");
+        assert!(matches!(
+            error,
+            CandleError::FinalizedReplayOutsideHorizon {
+                limit: super::FINALIZED_TRADE_ID_HORIZON,
+                ..
+            }
+        ));
     }
 
     #[test]
