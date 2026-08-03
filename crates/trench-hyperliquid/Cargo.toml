@@ -9,3 +9,15 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+reqwest.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+trench-core = { path = "../trench-core" }
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+wiremock.workspace = true
