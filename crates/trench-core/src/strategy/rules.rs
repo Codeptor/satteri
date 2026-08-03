@@ -832,6 +832,25 @@ mod tests {
     }
 
     #[test]
+    fn no_adverse_swing_uses_fixed_one_point_five_atr_even_with_one_point_two_five_floor() {
+        let strategy = RulesStrategy::new(RuleConfig::new(
+            EntryThreshold::P60,
+            AtrFloor::OnePointTwoFive,
+            TakeProfitMultiple::TwoR,
+        ));
+        let mut inputs = golden_inputs();
+        inputs.low_10 = inputs.close;
+
+        let decision = strategy.evaluate_parts(source(), &inputs, &golden_history());
+        let candidate = decision
+            .candidate()
+            .expect("golden score should cross the selected threshold");
+
+        assert_eq!(candidate.stop().value(), dec!(85));
+        assert_eq!(candidate.target().value(), dec!(130));
+    }
+
+    #[test]
     fn frozen_configuration_allows_only_approved_training_grid_values() {
         assert_eq!(RuleConfig::default().threshold(), EntryThreshold::P60);
         assert_eq!(RuleConfig::default().atr_floor(), AtrFloor::OnePointFive);

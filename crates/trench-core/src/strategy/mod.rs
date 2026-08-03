@@ -45,9 +45,28 @@ pub struct SignalCandidate {
 impl SignalCandidate {
     /// Builds a checked un-sized candidate inside the deterministic strategy boundary.
     pub(crate) fn new(specification: CandidateSpecification) -> Result<Self, CandidateError> {
-        if specification.gross_edge < Decimal::ZERO {
-            return Err(CandidateError::NegativeGrossEdge {
+        if specification.gross_edge <= Decimal::ZERO {
+            return Err(CandidateError::NonPositiveGrossEdge {
                 gross_edge: specification.gross_edge,
+            });
+        }
+        let entry = specification.reference_entry;
+        let exits_are_ordered = match specification.side {
+            Side::Buy => specification.stop < entry && specification.target > entry,
+            Side::Sell => specification.stop > entry && specification.target < entry,
+        };
+        if !exits_are_ordered {
+            return Err(CandidateError::InvalidExitOrdering {
+                side: specification.side,
+                reference_entry: entry,
+                stop: specification.stop,
+                target: specification.target,
+            });
+        }
+        if specification.time_exit <= specification.decision_time {
+            return Err(CandidateError::TimeExitNotAfterDecision {
+                decision_time: specification.decision_time,
+                time_exit: specification.time_exit,
             });
         }
         if specification.snapshot_digest.is_empty()
@@ -190,11 +209,33 @@ pub(crate) struct CandidateSpecification {
 /// Candidate construction rejected an invalid strategy output before it reached risk.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CandidateError {
-    /// Gross edge is a magnitude and cannot be negative.
-    #[error("candidate gross edge must be nonnegative, got {gross_edge}")]
-    NegativeGrossEdge {
+    /// Gross edge must cover a positive expected move before cost acceptance.
+    #[error("candidate gross edge must be positive, got {gross_edge}")]
+    NonPositiveGrossEdge {
         /// Rejected fraction.
         gross_edge: Decimal,
+    },
+    /// Side-aware invalidation and profit prices did not straddle the entry.
+    #[error(
+        "candidate {side:?} exits must straddle entry {reference_entry:?}, got stop {stop:?} and target {target:?}"
+    )]
+    InvalidExitOrdering {
+        /// Candidate direction governing the required ordering.
+        side: Side,
+        /// Immutable completed-bar entry reference.
+        reference_entry: Price,
+        /// Proposed stop price.
+        stop: Price,
+        /// Proposed target price.
+        target: Price,
+    },
+    /// A time exit must give the candidate at least one instant after its decision boundary.
+    #[error("candidate time exit {time_exit} must be later than decision time {decision_time}")]
+    TimeExitNotAfterDecision {
+        /// Immutable strategy decision boundary.
+        decision_time: TimestampNs,
+        /// Rejected non-future exit boundary.
+        time_exit: TimestampNs,
     },
     /// A candidate cannot be reconstructed without all three input digests.
     #[error("candidate requires snapshot, universe, and long-horizon provenance digests")]
@@ -242,16 +283,45 @@ fn candidate_digest(candidate: &SignalCandidate) -> String {
 }
 
 /// Opaque identifier assigned to a sealed risk-sized cost quote.
+///
+/// External code can inspect a quote ID but cannot manufacture one, its source
+/// digests, or a feasible quote. The risk authority owns that construction
+/// boundary.
+///
+/// ```compile_fail
+/// use rust_decimal::Decimal;
+/// use trench_core::domain::Market;
+/// use trench_core::event::TimestampNs;
+/// use trench_core::strategy::{
+///     CostQuote, CostQuoteFreshness, CostSourceDigests, QuoteId,
+/// };
+///
+/// let at = TimestampNs::new(0).unwrap();
+/// let _ = CostQuote::new(
+///     QuoteId::new("untrusted").unwrap(),
+///     Market::new("BTC").unwrap(),
+///     "candidate",
+///     CostQuoteFreshness::new(at, at).unwrap(),
+///     CostSourceDigests::new("book", "risk"),
+///     Decimal::ZERO,
+///     Vec::new(),
+///     Vec::new(),
+/// );
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct QuoteId(String);
 
 impl QuoteId {
-    /// Creates a checked opaque quote identifier.
+    /// Creates a checked opaque quote identifier for the crate-private risk boundary.
     ///
     /// # Errors
     ///
     /// Rejects empty, padded, or control-character-containing IDs.
-    pub fn new(value: impl Into<String>) -> Result<Self, CostQuoteError> {
+    #[allow(
+        dead_code,
+        reason = "Task 11's risk engine is the sole production constructor; strategy tests exercise the boundary first."
+    )]
+    pub(crate) fn new(value: impl Into<String>) -> Result<Self, CostQuoteError> {
         let value = value.into();
         if value.is_empty() || value.trim() != value || value.chars().any(char::is_control) {
             return Err(CostQuoteError::InvalidQuoteId);
@@ -312,9 +382,13 @@ pub struct CostSourceDigests {
 }
 
 impl CostSourceDigests {
-    /// Captures immutable public book and risk-quote source digests.
+    /// Captures immutable public book and risk-quote source digests inside risk.
     #[must_use]
-    pub fn new(book: impl Into<String>, risk: impl Into<String>) -> Self {
+    #[allow(
+        dead_code,
+        reason = "Task 11's risk engine is the sole production constructor; strategy tests exercise the boundary first."
+    )]
+    pub(crate) fn new(book: impl Into<String>, risk: impl Into<String>) -> Self {
         Self {
             book: book.into(),
             risk: risk.into(),
@@ -399,12 +473,16 @@ pub struct CostQuote {
 }
 
 impl CostQuote {
-    /// Creates a checked public cost quote without revealing any sealed sizing detail.
+    /// Creates a checked public cost quote inside risk without revealing sealed sizing detail.
     #[expect(
         clippy::too_many_arguments,
         reason = "fixed cost-quote boundary schema"
     )]
-    pub fn new(
+    #[allow(
+        dead_code,
+        reason = "Task 11's risk engine is the sole production constructor; strategy tests exercise the boundary first."
+    )]
+    pub(crate) fn new(
         quote_id: QuoteId,
         market: Market,
         candidate_digest: impl Into<String>,
@@ -631,12 +709,86 @@ pub trait Strategy {
 mod tests {
     use rust_decimal_macros::dec;
 
-    use crate::domain::Market;
+    use crate::domain::{Market, Price, Side, Sleeve};
     use crate::event::TimestampNs;
 
     use super::{
-        CostAttribution, CostQuote, CostQuoteError, CostQuoteFreshness, CostSourceDigests, QuoteId,
+        CandidateError, CandidateSpecification, CostAttribution, CostQuote, CostQuoteError,
+        CostQuoteFreshness, CostSourceDigests, QuoteId, SignalCandidate, StrategyKind,
     };
+
+    #[test]
+    fn candidate_rejects_nonpositive_gross_edge() {
+        let mut specification = candidate_specification(Side::Buy);
+        specification.gross_edge = dec!(0);
+
+        assert!(matches!(
+            SignalCandidate::new(specification),
+            Err(CandidateError::NonPositiveGrossEdge { gross_edge }) if gross_edge == dec!(0)
+        ));
+    }
+
+    #[test]
+    fn candidate_rejects_side_aware_inverted_exit_ordering() {
+        let mut long = candidate_specification(Side::Buy);
+        long.stop = Price::new(dec!(100)).expect("price");
+        assert!(matches!(
+            SignalCandidate::new(long),
+            Err(CandidateError::InvalidExitOrdering {
+                side: Side::Buy,
+                ..
+            })
+        ));
+
+        let mut long = candidate_specification(Side::Buy);
+        long.target = Price::new(dec!(100)).expect("price");
+        assert!(matches!(
+            SignalCandidate::new(long),
+            Err(CandidateError::InvalidExitOrdering {
+                side: Side::Buy,
+                ..
+            })
+        ));
+
+        let mut short = candidate_specification(Side::Sell);
+        short.stop = Price::new(dec!(100)).expect("price");
+        assert!(matches!(
+            SignalCandidate::new(short),
+            Err(CandidateError::InvalidExitOrdering {
+                side: Side::Sell,
+                ..
+            })
+        ));
+
+        let mut short = candidate_specification(Side::Sell);
+        short.target = Price::new(dec!(100)).expect("price");
+        assert!(matches!(
+            SignalCandidate::new(short),
+            Err(CandidateError::InvalidExitOrdering {
+                side: Side::Sell,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn candidate_rejects_time_exit_at_or_before_decision_time() {
+        let mut specification = candidate_specification(Side::Buy);
+        specification.time_exit = specification.decision_time;
+
+        assert!(matches!(
+            SignalCandidate::new(specification),
+            Err(CandidateError::TimeExitNotAfterDecision { .. })
+        ));
+
+        let mut specification = candidate_specification(Side::Buy);
+        specification.time_exit = timestamp(9);
+
+        assert!(matches!(
+            SignalCandidate::new(specification),
+            Err(CandidateError::TimeExitNotAfterDecision { .. })
+        ));
+    }
 
     #[test]
     fn public_cost_quote_exposes_only_complete_fractional_cost_audit() {
@@ -679,5 +831,28 @@ mod tests {
 
     fn timestamp(value: i128) -> TimestampNs {
         TimestampNs::new(value).expect("timestamp")
+    }
+
+    fn candidate_specification(side: Side) -> CandidateSpecification {
+        let (stop, target) = match side {
+            Side::Buy => (dec!(90), dec!(120)),
+            Side::Sell => (dec!(110), dec!(80)),
+        };
+        CandidateSpecification {
+            strategy: StrategyKind::MlChampion,
+            market: Market::new("BTC").expect("market"),
+            side,
+            sleeve: Sleeve::FifteenMinute,
+            decision_time: timestamp(10),
+            gross_edge: dec!(0.12),
+            reference_entry: Price::new(dec!(100)).expect("price"),
+            stop: Price::new(stop).expect("price"),
+            target: Price::new(target).expect("price"),
+            time_exit: timestamp(11),
+            snapshot_digest: "snapshot".to_owned(),
+            universe_digest: "universe".to_owned(),
+            history_digest: "history".to_owned(),
+            explanation_json: "{}".to_owned(),
+        }
     }
 }

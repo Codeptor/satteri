@@ -3274,7 +3274,7 @@ fn donchian_position(history: &[&Candle], window: usize) -> Option<Decimal> {
         .min()?;
     let span = high.checked_sub(low)?;
     if span.is_zero() {
-        Some(Decimal::ZERO)
+        Some(Decimal::new(5, 1))
     } else {
         candles
             .last()?
@@ -5554,6 +5554,7 @@ mod tests {
             assert!(snapshot.is_ready());
             assert_eq!(snapshot.values()["adx_14"], Decimal::ZERO);
             assert_eq!(snapshot.values()["realized_volatility_64"], Decimal::ZERO);
+            assert_eq!(snapshot.values()["donchian_20_position"], dec!(0.5));
         }
     }
 

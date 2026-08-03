@@ -536,13 +536,17 @@ pub fn unit(value: Decimal) -> Result<Decimal, RuleScoreError> {
 ///
 /// The input values are copied and sorted because all rule inputs are immutable.
 /// In particular, `p = 0` must not underflow into an invalid index and `p > 1`
-/// must not be silently clamped.
+/// must not be silently clamped. An empty input is rejected before rank-index
+/// arithmetic.
 pub fn nearest_rank_percentile(
     values: &[Decimal],
     percentile: Decimal,
 ) -> Result<Decimal, RuleScoreError> {
     if percentile <= Decimal::ZERO || percentile > Decimal::ONE {
         return Err(RuleScoreError::InvalidPercentile { percentile });
+    }
+    if values.is_empty() {
+        return Err(RuleScoreError::EmptyPercentile);
     }
     let mut sorted = values.to_vec();
     sorted.sort();
@@ -948,6 +952,14 @@ mod tests {
     }
 
     #[test]
+    fn percentile_rejects_empty_values_before_rank_indexing() {
+        assert!(matches!(
+            nearest_rank_percentile(&[], dec!(0.50)),
+            Err(RuleScoreError::EmptyPercentile)
+        ));
+    }
+
+    #[test]
     fn percentile_uses_frozen_nearest_rank_indexing() {
         let values = [dec!(1), dec!(2), dec!(3), dec!(4), dec!(5)];
 
@@ -987,6 +999,16 @@ mod tests {
 
         assert_eq!(scores.momentum(), dec!(-0.55));
         assert_eq!(scores.derivatives(), dec!(-1));
+    }
+
+    #[test]
+    fn flat_donchian_window_is_neutral_with_a_usable_atr_scale() {
+        let mut inputs = golden_inputs();
+        inputs.donchian_20_position = dec!(0.5);
+
+        let scores = score(&inputs, &golden_history()).expect("nonzero ATR remains usable");
+
+        assert_eq!(scores.momentum(), dec!(0.75));
     }
 
     #[test]
