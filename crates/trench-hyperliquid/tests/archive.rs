@@ -1,5 +1,6 @@
 mod archive {
     pub mod tests {
+        use std::fmt::Write as _;
         use std::fs;
         use std::io::Write;
         use std::path::{Path, PathBuf};
@@ -25,6 +26,16 @@ mod archive {
         fn l2_span() -> ArchiveSpan {
             ArchiveSpan::new(
                 market("SOL"),
+                ArchiveDataKind::L2Book,
+                HOUR_START_MS,
+                HOUR_END_MS,
+            )
+            .expect("fixture span must be valid")
+        }
+
+        fn l2_span_for_market(value: &str) -> ArchiveSpan {
+            ArchiveSpan::new(
+                market(value),
                 ArchiveDataKind::L2Book,
                 HOUR_START_MS,
                 HOUR_END_MS,
@@ -95,6 +106,25 @@ mod archive {
                 ArchiveDigest::of_bytes(&bytes),
             );
             (destination, source)
+        }
+
+        fn fixture_source_for_market(root: &TempDir, value: &str) -> ArchiveSource {
+            let relative_path = PathBuf::from(format!("market_data/20230916/9/l2Book/{value}.lz4"));
+            let destination = root.path().join(&relative_path);
+            fs::create_dir_all(
+                destination
+                    .parent()
+                    .expect("fixture archive path has a parent"),
+            )
+            .expect("create fixture archive directories");
+            fs::copy(fixture_path(), &destination).expect("copy immutable LZ4 fixture");
+            let bytes = fs::read(&destination).expect("read copied fixture");
+            ArchiveSource::new(
+                l2_span_for_market(value),
+                relative_path,
+                u64::try_from(bytes.len()).expect("fixture length fits u64"),
+                ArchiveDigest::of_bytes(&bytes),
+            )
         }
 
         fn write_lz4(destination: &Path, records: &[u8]) {
@@ -297,6 +327,142 @@ mod archive {
             assert!(matches!(
                 error,
                 trench_hyperliquid::ArchiveError::UnsafePath { .. }
+            ));
+        }
+
+        #[test]
+        fn manifest_rejects_unbounded_requirement_sets() {
+            let requirements = (0..32_769)
+                .map(|index| {
+                    ArchiveRequirement::optional(l2_span_for_market(&format!("ITEM{index}")))
+                })
+                .collect::<Vec<_>>();
+            let error = ArchiveManifest::new(AS_OF_MS, requirements, [])
+                .expect_err("the immutable manifest must bound its requirement vector");
+
+            assert!(matches!(
+                error,
+                trench_hyperliquid::ArchiveError::TooManyRequirements { .. }
+            ));
+        }
+
+        #[test]
+        fn manifest_rejects_unbounded_source_sets() {
+            let requirements = (0..16_385)
+                .map(|index| {
+                    ArchiveRequirement::optional(l2_span_for_market(&format!("ITEM{index}")))
+                })
+                .collect::<Vec<_>>();
+            let sources = (0..16_385)
+                .map(|index| {
+                    let value = format!("ITEM{index}");
+                    ArchiveSource::new(
+                        l2_span_for_market(&value),
+                        PathBuf::from(format!("not-opened/{value}.lz4")),
+                        0,
+                        ArchiveDigest::of_bytes(b""),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let error = ArchiveManifest::new(AS_OF_MS, requirements, sources)
+                .expect_err("the immutable manifest must bound its source vector");
+
+            assert!(matches!(
+                error,
+                trench_hyperliquid::ArchiveError::TooManySources { .. }
+            ));
+        }
+
+        #[test]
+        fn manifest_rejects_excess_total_declared_compressed_bytes() {
+            let first = l2_span_for_market("COMPRESSED_A");
+            let second = l2_span_for_market("COMPRESSED_B");
+            let sources = [
+                ArchiveSource::new(
+                    first.clone(),
+                    PathBuf::from("not-opened/a.lz4"),
+                    8 * 1_024 * 1_024 * 1_024,
+                    ArchiveDigest::of_bytes(b""),
+                ),
+                ArchiveSource::new(
+                    second.clone(),
+                    PathBuf::from("not-opened/b.lz4"),
+                    1,
+                    ArchiveDigest::of_bytes(b""),
+                ),
+            ];
+
+            let error = ArchiveManifest::new(
+                AS_OF_MS,
+                [
+                    ArchiveRequirement::required(first),
+                    ArchiveRequirement::required(second),
+                ],
+                sources,
+            )
+            .expect_err(
+                "the manifest must reject an aggregate compressed-byte overflow before I/O",
+            );
+
+            assert!(matches!(
+                error,
+                trench_hyperliquid::ArchiveError::TotalCompressedBytesTooLarge { .. }
+            ));
+        }
+
+        #[test]
+        fn reader_rejects_more_sources_than_its_retained_descriptor_cap() {
+            let root = TempDir::new().expect("create archive root");
+            let sources = (0..257)
+                .map(|index| fixture_source_for_market(&root, &format!("FD{index}")))
+                .collect::<Vec<_>>();
+            let requirements = sources
+                .iter()
+                .map(|source| ArchiveRequirement::required(source.span().clone()))
+                .collect::<Vec<_>>();
+            let manifest = ArchiveManifest::new(AS_OF_MS, requirements, sources)
+                .expect("descriptor-cap fixture manifest must be structurally valid");
+
+            let error = ArchiveReader::open(root.path(), manifest).expect_err(
+                "the reader must reject an archive set before retaining unbounded descriptors",
+            );
+
+            assert!(matches!(
+                error,
+                trench_hyperliquid::ArchiveError::TooManyOpenSources { .. }
+            ));
+        }
+
+        #[test]
+        fn reader_rejects_total_decoded_events_before_retaining_an_unbounded_batch() {
+            let root = TempDir::new().expect("create archive root");
+            let mut records = String::new();
+            for offset in 0..100_001 {
+                writeln!(
+                    records,
+                    r#"{{"coin":"SOL","time":{},"levels":[[{{"px":"19.12345","sz":"1.2500","n":2}}],[{{"px":"19.22345","sz":"2.5000","n":3}}]]}}"#,
+                    HOUR_START_MS + i64::from(offset),
+                )
+                .expect("append bounded archive record");
+            }
+            let (_, source) = install_lz4(&root, records.as_bytes());
+            let manifest = ArchiveManifest::new(
+                AS_OF_MS,
+                [ArchiveRequirement::required(l2_span())],
+                [source],
+            )
+            .expect("aggregate-event fixture manifest must be valid");
+
+            let error = ArchiveReader::open(root.path(), manifest)
+                .expect("aggregate-event source must open")
+                .read_all()
+                .expect_err(
+                    "the reader must stop before retaining more than its aggregate event cap",
+                );
+
+            assert!(matches!(
+                error,
+                trench_hyperliquid::ArchiveError::TotalDecodedEventsTooLarge { .. }
             ));
         }
 

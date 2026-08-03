@@ -18,10 +18,16 @@ use trench_core::event::{BookLevel, MarketEvent, MarketEventKind, TimestampNs};
 use crate::ws::normalize_l2_book_wire_for_market;
 
 const HOUR_MILLIS: i64 = 3_600_000;
+const MAX_MANIFEST_REQUIREMENTS: usize = 32_768;
+const MAX_MANIFEST_SOURCES: usize = 16_384;
+const MAX_OPEN_SOURCES: usize = 256;
 const MAX_COMPRESSED_SOURCE_BYTES: u64 = 1_073_741_824;
-const MAX_DECOMPRESSED_SOURCE_BYTES: usize = 4 * 1_024 * 1_024 * 1_024;
+const MAX_TOTAL_COMPRESSED_BYTES: u64 = 8 * 1_024 * 1_024 * 1_024;
+const MAX_DECOMPRESSED_SOURCE_BYTES: u64 = 4 * 1_024 * 1_024 * 1_024;
+const MAX_TOTAL_DECOMPRESSED_BYTES: u64 = 8 * 1_024 * 1_024 * 1_024;
 const MAX_RECORD_BYTES: usize = 1_024 * 1_024;
 const MAX_EVENTS_PER_SOURCE: usize = 5_000_000;
+const MAX_TOTAL_EVENTS: usize = 100_000;
 const DIGEST_BUFFER_BYTES: usize = 64 * 1_024;
 const CONTENT_DIGEST_DOMAIN: &str = "trench.archive.content.v1";
 const LZ4_FRAME_MAGIC: [u8; 4] = [0x04, 0x22, 0x4d, 0x18];
@@ -262,10 +268,39 @@ impl ArchiveManifest {
     ) -> Result<Self, ArchiveError> {
         let received_at =
             timestamp_from_millis(as_of_ms).ok_or(ArchiveError::InvalidAsOf { as_of_ms })?;
-        let requirements = requirements.into_iter().collect::<Vec<_>>();
-        let sources = sources.into_iter().collect::<Vec<_>>();
+        let mut requirement_entries = Vec::new();
+        for requirement in requirements {
+            if requirement_entries.len() == MAX_MANIFEST_REQUIREMENTS {
+                return Err(ArchiveError::TooManyRequirements {
+                    count: requirement_entries.len().saturating_add(1),
+                    max_requirements: MAX_MANIFEST_REQUIREMENTS,
+                });
+            }
+            requirement_entries.push(requirement);
+        }
+        let mut source_entries = Vec::new();
+        let mut total_compressed_bytes = 0_u64;
+        for source in sources {
+            if source_entries.len() == MAX_MANIFEST_SOURCES {
+                return Err(ArchiveError::TooManySources {
+                    count: source_entries.len().saturating_add(1),
+                    max_sources: MAX_MANIFEST_SOURCES,
+                });
+            }
+            total_compressed_bytes = total_compressed_bytes
+                .checked_add(source.compressed_bytes)
+                .ok_or(ArchiveError::TotalCompressedBytesTooLarge {
+                    max_bytes: MAX_TOTAL_COMPRESSED_BYTES,
+                })?;
+            if total_compressed_bytes > MAX_TOTAL_COMPRESSED_BYTES {
+                return Err(ArchiveError::TotalCompressedBytesTooLarge {
+                    max_bytes: MAX_TOTAL_COMPRESSED_BYTES,
+                });
+            }
+            source_entries.push(source);
+        }
         let mut requested = BTreeSet::new();
-        for requirement in &requirements {
+        for requirement in &requirement_entries {
             if !requested.insert(requirement.span.clone()) {
                 return Err(ArchiveError::DuplicateRequirement {
                     span: requirement.span.clone(),
@@ -273,7 +308,7 @@ impl ArchiveManifest {
             }
         }
         let mut supplied = BTreeSet::new();
-        for source in &sources {
+        for source in &source_entries {
             if source.span.data_kind != ArchiveDataKind::L2Book {
                 return Err(ArchiveError::UnsupportedArchiveDataKind {
                     span: source.span.clone(),
@@ -293,8 +328,8 @@ impl ArchiveManifest {
         Ok(Self {
             as_of_ms,
             received_at,
-            requirements,
-            sources,
+            requirements: requirement_entries,
+            sources: source_entries,
         })
     }
 }
@@ -304,14 +339,16 @@ impl ArchiveManifest {
 pub struct ArchiveReader {
     manifest: ArchiveManifest,
     sources: Vec<ResolvedSource>,
+    limits: ArchiveLimits,
 }
 
 impl ArchiveReader {
     /// Opens only sources named by `manifest` beneath the resolved `source_root`.
     ///
-    /// Every component is checked with `symlink_metadata`; absolute paths,
-    /// traversal, symlinks, manifest-layout mismatches, byte mismatches, and
-    /// digest mismatches are rejected before any decompression begins.
+    /// The resolved root is opened once, then each declared path component is
+    /// opened relative to that descriptor with no-follow flags. Absolute paths,
+    /// traversal, symlinks, non-regular files, manifest-layout mismatches, byte
+    /// mismatches, and digest mismatches are rejected before decompression.
     ///
     /// # Errors
     ///
@@ -321,6 +358,20 @@ impl ArchiveReader {
         source_root: impl AsRef<Path>,
         manifest: ArchiveManifest,
     ) -> Result<Self, ArchiveError> {
+        Self::open_with_limits(source_root, manifest, ArchiveLimits::default())
+    }
+
+    fn open_with_limits(
+        source_root: impl AsRef<Path>,
+        manifest: ArchiveManifest,
+        limits: ArchiveLimits,
+    ) -> Result<Self, ArchiveError> {
+        if manifest.sources.len() > MAX_OPEN_SOURCES {
+            return Err(ArchiveError::TooManyOpenSources {
+                count: manifest.sources.len(),
+                max_sources: MAX_OPEN_SOURCES,
+            });
+        }
         let root = fs::canonicalize(source_root.as_ref()).map_err(|source| ArchiveError::Root {
             path: source_root.as_ref().to_path_buf(),
             source,
@@ -365,7 +416,11 @@ impl ArchiveReader {
             .iter()
             .map(|source| resolve_source(&root, &root_fd, source))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { manifest, sources })
+        Ok(Self {
+            manifest,
+            sources,
+            limits,
+        })
     }
 
     /// Streams all verified sources, returning deterministic event order and
@@ -377,7 +432,11 @@ impl ArchiveReader {
     /// record versions, foreign timestamps, invalid live-wire records, and
     /// conflicting event identities.
     pub fn read_all(self) -> Result<ArchiveBatch, ArchiveError> {
-        let Self { manifest, sources } = self;
+        let Self {
+            manifest,
+            sources,
+            limits,
+        } = self;
         let present_spans = sources
             .iter()
             .map(|source| source.span.clone())
@@ -385,9 +444,16 @@ impl ArchiveReader {
             .into_iter()
             .collect::<Vec<_>>();
         let mut events = BTreeMap::<EventId, (MarketEvent, ArchiveSpan)>::new();
+        let mut usage = ArchiveResourceUsage::default();
         for source in sources {
             let span = source.span.clone();
-            let decoded = read_source(source, manifest.as_of_ms, manifest.received_at)?;
+            let decoded = read_source(
+                source,
+                manifest.as_of_ms,
+                manifest.received_at,
+                limits,
+                &mut usage,
+            )?;
             for event in decoded {
                 let event_id = event.event_id().clone();
                 if let Some((previous, previous_span)) = events.get(&event_id) {
@@ -469,6 +535,71 @@ impl ArchiveBatch {
     }
 }
 
+/// Fixed resource ceilings applied while decoding one immutable archive batch.
+#[derive(Debug, Clone, Copy)]
+struct ArchiveLimits {
+    max_total_decoded_bytes: u64,
+    max_total_events: usize,
+}
+
+impl Default for ArchiveLimits {
+    fn default() -> Self {
+        Self {
+            max_total_decoded_bytes: MAX_TOTAL_DECOMPRESSED_BYTES,
+            max_total_events: MAX_TOTAL_EVENTS,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ArchiveResourceUsage {
+    decoded_bytes: u64,
+    decoded_events: usize,
+}
+
+impl ArchiveResourceUsage {
+    fn record_decoded_bytes(
+        &mut self,
+        path: &Path,
+        bytes: usize,
+        limits: ArchiveLimits,
+    ) -> Result<(), ArchiveError> {
+        let bytes = u64::try_from(bytes).map_err(|_| ArchiveError::TotalDecodedBytesTooLarge {
+            path: path.to_path_buf(),
+            max_bytes: limits.max_total_decoded_bytes,
+        })?;
+        self.decoded_bytes = self.decoded_bytes.checked_add(bytes).ok_or_else(|| {
+            ArchiveError::TotalDecodedBytesTooLarge {
+                path: path.to_path_buf(),
+                max_bytes: limits.max_total_decoded_bytes,
+            }
+        })?;
+        if self.decoded_bytes > limits.max_total_decoded_bytes {
+            return Err(ArchiveError::TotalDecodedBytesTooLarge {
+                path: path.to_path_buf(),
+                max_bytes: limits.max_total_decoded_bytes,
+            });
+        }
+        Ok(())
+    }
+
+    fn record_event(&mut self, path: &Path, limits: ArchiveLimits) -> Result<(), ArchiveError> {
+        self.decoded_events = self.decoded_events.checked_add(1).ok_or_else(|| {
+            ArchiveError::TotalDecodedEventsTooLarge {
+                path: path.to_path_buf(),
+                max_events: limits.max_total_events,
+            }
+        })?;
+        if self.decoded_events > limits.max_total_events {
+            return Err(ArchiveError::TotalDecodedEventsTooLarge {
+                path: path.to_path_buf(),
+                max_events: limits.max_total_events,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// A local source, archive structure, decompression, or record failure.
 #[derive(Debug, Error)]
 pub enum ArchiveError {
@@ -487,6 +618,21 @@ pub enum ArchiveError {
     /// As-of time could not be converted to a core timestamp.
     #[error("archive as-of time `{as_of_ms}` is outside the supported timestamp range")]
     InvalidAsOf { as_of_ms: i64 },
+    /// The manifest exceeded the bounded number of source requirements.
+    #[error("archive manifest has {count} requirements, exceeding {max_requirements}")]
+    TooManyRequirements {
+        count: usize,
+        max_requirements: usize,
+    },
+    /// The manifest exceeded the bounded number of declared source objects.
+    #[error("archive manifest has {count} sources, exceeding {max_sources}")]
+    TooManySources { count: usize, max_sources: usize },
+    /// Declared compressed sources exceeded the total immutable reader budget.
+    #[error("archive manifest compressed bytes exceed {max_bytes}")]
+    TotalCompressedBytesTooLarge { max_bytes: u64 },
+    /// Opening the declared sources would retain too many file descriptors.
+    #[error("archive reader would retain {count} source descriptors, exceeding {max_sources}")]
+    TooManyOpenSources { count: usize, max_sources: usize },
     /// A requirement named the same span more than once.
     #[error("duplicate archive requirement for `{span}")]
     DuplicateRequirement { span: ArchiveSpan },
@@ -520,9 +666,6 @@ pub enum ArchiveError {
         path: PathBuf,
         source: std::io::Error,
     },
-    /// The resolved source escaped the canonical root.
-    #[error("archive source `{path}` escaped root `{root}`")]
-    SourceOutsideRoot { path: PathBuf, root: PathBuf },
     /// The declared source was not a regular file.
     #[error("archive source `{path}` is not a regular file")]
     SourceNotFile { path: PathBuf },
@@ -555,7 +698,13 @@ pub enum ArchiveError {
     },
     /// Decoded source bytes exceeded the fixed streaming bound.
     #[error("archive source `{path}` decoded beyond {max_bytes} bytes")]
-    DecompressedSourceTooLarge { path: PathBuf, max_bytes: usize },
+    DecompressedSourceTooLarge { path: PathBuf, max_bytes: u64 },
+    /// All decoded sources together exceeded the bounded replay byte budget.
+    #[error("archive sources decoded beyond {max_bytes} bytes while reading `{path}`")]
+    TotalDecodedBytesTooLarge { path: PathBuf, max_bytes: u64 },
+    /// All decoded sources together exceeded the bounded event budget.
+    #[error("archive sources decoded beyond {max_events} events while reading `{path}`")]
+    TotalDecodedEventsTooLarge { path: PathBuf, max_events: usize },
     /// One JSON line exceeded the fixed record bound.
     #[error("archive source `{path}` line {line} exceeds {max_bytes} bytes")]
     RecordTooLarge {
@@ -753,6 +902,8 @@ fn read_source(
     source: ResolvedSource,
     as_of_ms: i64,
     received_at: TimestampNs,
+    limits: ArchiveLimits,
+    usage: &mut ArchiveResourceUsage,
 ) -> Result<Vec<MarketEvent>, ArchiveError> {
     let ResolvedSource {
         compressed_bytes,
@@ -763,7 +914,7 @@ fn read_source(
     } = source;
     let decoder = FrameDecoder::new(DigestingReader::new(file));
     let mut reader = BufReader::with_capacity(DIGEST_BUFFER_BYTES, decoder);
-    let mut decoded_bytes = 0_usize;
+    let mut decoded_bytes = 0_u64;
     let mut line_number = 0_usize;
     let mut events = Vec::new();
     while let Some(record) = read_bounded_line(
@@ -771,6 +922,8 @@ fn read_source(
         &path,
         line_number.saturating_add(1),
         &mut decoded_bytes,
+        limits,
+        usage,
     )? {
         line_number = line_number.saturating_add(1);
         if record.iter().all(u8::is_ascii_whitespace) {
@@ -783,6 +936,7 @@ fn read_source(
                 max_bytes: MAX_DECOMPRESSED_SOURCE_BYTES,
             });
         }
+        usage.record_event(&path, limits)?;
         events.push(event);
     }
     let mut decoder = reader.into_inner();
@@ -938,7 +1092,9 @@ fn read_bounded_line<R: BufRead>(
     reader: &mut R,
     path: &Path,
     line: usize,
-    decoded_bytes: &mut usize,
+    decoded_bytes: &mut u64,
+    limits: ArchiveLimits,
+    usage: &mut ArchiveResourceUsage,
 ) -> Result<Option<Vec<u8>>, ArchiveError> {
     let mut record = Vec::new();
     loop {
@@ -959,13 +1115,24 @@ fn read_bounded_line<R: BufRead>(
             .iter()
             .position(|byte| *byte == b'\n')
             .map_or(available.len(), |position| position.saturating_add(1));
-        *decoded_bytes = decoded_bytes.saturating_add(take);
+        *decoded_bytes = decoded_bytes
+            .checked_add(u64::try_from(take).map_err(|_| {
+                ArchiveError::DecompressedSourceTooLarge {
+                    path: path.to_path_buf(),
+                    max_bytes: MAX_DECOMPRESSED_SOURCE_BYTES,
+                }
+            })?)
+            .ok_or_else(|| ArchiveError::DecompressedSourceTooLarge {
+                path: path.to_path_buf(),
+                max_bytes: MAX_DECOMPRESSED_SOURCE_BYTES,
+            })?;
         if *decoded_bytes > MAX_DECOMPRESSED_SOURCE_BYTES {
             return Err(ArchiveError::DecompressedSourceTooLarge {
                 path: path.to_path_buf(),
                 max_bytes: MAX_DECOMPRESSED_SOURCE_BYTES,
             });
         }
+        usage.record_decoded_bytes(path, take, limits)?;
         if record.len().saturating_add(take) > MAX_RECORD_BYTES {
             return Err(ArchiveError::RecordTooLarge {
                 path: path.to_path_buf(),
@@ -1125,15 +1292,17 @@ fn update_digest_field(hasher: &mut Hasher, field: &[u8]) {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::io::BufReader;
+    use std::path::{Path, PathBuf};
 
     use tempfile::TempDir;
     use trench_core::domain::Market;
     use trench_core::event::MarketEventKind;
 
     use super::{
-        ArchiveDataKind, ArchiveDigest, ArchiveError, ArchiveManifest, ArchiveReader,
-        ArchiveRequirement, ArchiveSource, ArchiveSpan,
+        ArchiveDataKind, ArchiveDigest, ArchiveError, ArchiveLimits, ArchiveManifest,
+        ArchiveReader, ArchiveRequirement, ArchiveResourceUsage, ArchiveSource, ArchiveSpan,
+        read_bounded_line,
     };
 
     const HOUR_START_MS: i64 = 1_694_854_800_000;
@@ -1208,6 +1377,32 @@ mod tests {
         assert!(matches!(
             error,
             ArchiveError::UnsupportedArchiveDataKind { .. }
+        ));
+    }
+
+    #[test]
+    fn decoded_bytes_are_capped_across_the_opened_batch() {
+        let mut reader = BufReader::new(b"bounded\n".as_slice());
+        let mut decoded_bytes = 0;
+        let mut usage = ArchiveResourceUsage::default();
+        let limits = ArchiveLimits {
+            max_total_decoded_bytes: 7,
+            max_total_events: 1,
+        };
+
+        let error = read_bounded_line(
+            &mut reader,
+            Path::new("archive.lz4"),
+            1,
+            &mut decoded_bytes,
+            limits,
+            &mut usage,
+        )
+        .expect_err("decoded byte caps must apply before a record is retained");
+
+        assert!(matches!(
+            error,
+            ArchiveError::TotalDecodedBytesTooLarge { max_bytes: 7, .. }
         ));
     }
 }
