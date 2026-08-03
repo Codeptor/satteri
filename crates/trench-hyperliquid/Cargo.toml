@@ -15,7 +15,6 @@ lz4_flex = "0.11.5"
 rand.workspace = true
 reqwest.workspace = true
 rust_decimal.workspace = true
-rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -26,6 +25,9 @@ trench-core = { path = "../trench-core" }
 tracing.workspace = true
 time.workspace = true
 url.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

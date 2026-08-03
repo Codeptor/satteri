@@ -1,16 +1,26 @@
 //! Bounded local readers for explicitly downloaded official market archives.
+//!
+//! Each source must be exactly one current LZ4 frame. Legacy, skippable, and
+//! dictionary frames, concatenated frames, and bytes after the frame terminal
+//! are deliberately unsupported.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::{self, File};
+#[cfg(unix)]
+use std::fs;
+use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 
 use blake3::Hasher;
 use lz4_flex::frame::FrameDecoder;
+#[cfg(unix)]
 use rustix::fs::{FileType, Mode, OFlags, fstat, open, openat};
 use serde_json::Value;
 use thiserror::Error;
+#[cfg(unix)]
 use time::OffsetDateTime;
 use trench_core::domain::{EventId, Market};
 use trench_core::event::{BookLevel, MarketEvent, MarketEventKind, TimestampNs};
@@ -20,7 +30,9 @@ use crate::ws::normalize_l2_book_wire_for_market;
 const HOUR_MILLIS: i64 = 3_600_000;
 const MAX_MANIFEST_REQUIREMENTS: usize = 32_768;
 const MAX_MANIFEST_SOURCES: usize = 16_384;
+#[cfg(unix)]
 const MAX_OPEN_SOURCES: usize = 256;
+#[cfg(unix)]
 const MAX_COMPRESSED_SOURCE_BYTES: u64 = 1_073_741_824;
 const MAX_TOTAL_COMPRESSED_BYTES: u64 = 8 * 1_024 * 1_024 * 1_024;
 const MAX_DECOMPRESSED_SOURCE_BYTES: u64 = 4 * 1_024 * 1_024 * 1_024;
@@ -31,7 +43,14 @@ const MAX_TOTAL_EVENTS: usize = 100_000;
 const DIGEST_BUFFER_BYTES: usize = 64 * 1_024;
 const CONTENT_DIGEST_DOMAIN: &str = "trench.archive.content.v1";
 const LZ4_FRAME_MAGIC: [u8; 4] = [0x04, 0x22, 0x4d, 0x18];
-const LZ4_CONTENT_CHECKSUM_FLAG: u8 = 0b0000_0100;
+const LZ4_FRAME_VERSION_MASK: u8 = 0b1100_0000;
+const LZ4_FRAME_CURRENT_VERSION: u8 = 0b0100_0000;
+const LZ4_FRAME_RESERVED_FLAG: u8 = 0b0000_0010;
+const LZ4_FRAME_BLOCK_CHECKSUM_FLAG: u8 = 0b0001_0000;
+const LZ4_FRAME_CONTENT_SIZE_FLAG: u8 = 0b0000_1000;
+const LZ4_FRAME_CONTENT_CHECKSUM_FLAG: u8 = 0b0000_0100;
+const LZ4_FRAME_DICTIONARY_FLAG: u8 = 0b0000_0001;
+const LZ4_BLOCK_SIZE_MASK: u8 = 0b0111_0000;
 
 /// The market-data channel contained by a local archive object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -120,6 +139,7 @@ impl ArchiveSpan {
         self.end_ms
     }
 
+    #[cfg(unix)]
     fn official_relative_path(&self) -> Result<PathBuf, ArchiveError> {
         if self.data_kind != ArchiveDataKind::L2Book {
             return Err(ArchiveError::UnsupportedArchiveDataKind { span: self.clone() });
@@ -194,6 +214,9 @@ pub struct ArchiveSource {
 
 impl ArchiveSource {
     /// Describes one local object without opening it or performing I/O.
+    ///
+    /// Readers accept only one current, non-dictionary LZ4 frame per source;
+    /// a manifest cannot opt into legacy, concatenated, or trailing LZ4 data.
     #[must_use]
     pub fn new(
         span: ArchiveSpan,
@@ -350,6 +373,10 @@ impl ArchiveReader {
     /// traversal, symlinks, non-regular files, manifest-layout mismatches, byte
     /// mismatches, and digest mismatches are rejected before decompression.
     ///
+    /// This descriptor-safe operation is available only on Unix. Other
+    /// platforms fail closed with [`ArchiveError::UnsupportedPlatform`] before
+    /// inspecting the supplied path.
+    ///
     /// # Errors
     ///
     /// Returns an error when a required source is absent or any source fails
@@ -358,9 +385,18 @@ impl ArchiveReader {
         source_root: impl AsRef<Path>,
         manifest: ArchiveManifest,
     ) -> Result<Self, ArchiveError> {
-        Self::open_with_limits(source_root, manifest, ArchiveLimits::default())
+        #[cfg(unix)]
+        {
+            Self::open_with_limits(source_root, manifest, ArchiveLimits::default())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (source_root, manifest);
+            Err(ArchiveError::UnsupportedPlatform)
+        }
     }
 
+    #[cfg(unix)]
     fn open_with_limits(
         source_root: impl AsRef<Path>,
         manifest: ArchiveManifest,
@@ -603,6 +639,9 @@ impl ArchiveResourceUsage {
 /// A local source, archive structure, decompression, or record failure.
 #[derive(Debug, Error)]
 pub enum ArchiveError {
+    /// The host cannot safely perform descriptor-relative no-follow opens.
+    #[error("archive source opening is unsupported on this platform")]
+    UnsupportedPlatform,
     /// The supplied root could not be resolved.
     #[error("cannot resolve archive root `{path}`: {source}")]
     Root {
@@ -690,6 +729,18 @@ pub enum ArchiveError {
         expected: ArchiveDigest,
         actual: ArchiveDigest,
     },
+    /// The source uses an LZ4 frame format deliberately excluded by the importer contract.
+    #[error("archive source `{path}` is not a supported current single LZ4 frame")]
+    UnsupportedLz4Frame { path: PathBuf },
+    /// The current LZ4 frame is structurally invalid.
+    #[error("archive source `{path}` has an invalid current LZ4 frame")]
+    InvalidLz4Frame { path: PathBuf },
+    /// The current LZ4 frame ended before its terminal structure was complete.
+    #[error("archive source `{path}` ends before its LZ4 frame terminal marker")]
+    TruncatedLz4Frame { path: PathBuf },
+    /// Extra bytes follow an otherwise complete single LZ4 frame.
+    #[error("archive source `{path}` contains data after its single LZ4 frame")]
+    TrailingLz4Data { path: PathBuf },
     /// The LZ4 frame was unreadable or truncated.
     #[error("cannot decompress archive source `{path}`: {source}")]
     Decompression {
@@ -759,6 +810,7 @@ struct ResolvedSource {
     span: ArchiveSpan,
 }
 
+#[cfg(unix)]
 fn resolve_source(
     root: &Path,
     root_fd: &File,
@@ -832,14 +884,14 @@ fn resolve_source(
         });
     }
     let mut file = file;
-    let actual = digest_file(&mut file, &path)?;
-    if actual != source.compressed_digest {
-        return Err(ArchiveError::CompressedDigestMismatch {
-            path,
-            expected: source.compressed_digest,
-            actual,
-        });
-    }
+    let (actual_bytes, actual_digest) = digest_file(&mut file, &path)?;
+    verify_source_metadata(
+        &path,
+        source.compressed_bytes,
+        source.compressed_digest,
+        actual_bytes,
+        actual_digest,
+    )?;
     file.seek(SeekFrom::Start(0))
         .map_err(|source| ArchiveError::SourceIo {
             path: path.clone(),
@@ -854,6 +906,7 @@ fn resolve_source(
     })
 }
 
+#[cfg(unix)]
 fn secure_open_error(path: &Path, source: rustix::io::Errno) -> ArchiveError {
     if source == rustix::io::Errno::LOOP {
         return ArchiveError::Symlink {
@@ -867,6 +920,7 @@ fn secure_open_error(path: &Path, source: rustix::io::Errno) -> ArchiveError {
     }
 }
 
+#[cfg(unix)]
 fn validate_relative_path(path: &Path) -> Result<(), ArchiveError> {
     if path.as_os_str().is_empty()
         || path.is_absolute()
@@ -881,8 +935,10 @@ fn validate_relative_path(path: &Path) -> Result<(), ArchiveError> {
     Ok(())
 }
 
-fn digest_file(file: &mut File, path: &Path) -> Result<ArchiveDigest, ArchiveError> {
+#[cfg(unix)]
+fn digest_file(file: &mut File, path: &Path) -> Result<(u64, ArchiveDigest), ArchiveError> {
     let mut hasher = Hasher::new();
+    let mut bytes_read = 0_u64;
     let mut buffer = [0_u8; DIGEST_BUFFER_BYTES];
     loop {
         let read = file
@@ -892,10 +948,133 @@ fn digest_file(file: &mut File, path: &Path) -> Result<ArchiveDigest, ArchiveErr
                 source,
             })?;
         if read == 0 {
-            return Ok(ArchiveDigest::from_hasher(hasher));
+            return Ok((bytes_read, ArchiveDigest::from_hasher(hasher)));
         }
+        bytes_read = bytes_read
+            .checked_add(u64::try_from(read).map_err(|_| ArchiveError::SourceIo {
+                path: path.to_path_buf(),
+                source: std::io::Error::other("archive byte count overflow"),
+            })?)
+            .ok_or_else(|| ArchiveError::SourceIo {
+                path: path.to_path_buf(),
+                source: std::io::Error::other("archive byte count overflow"),
+            })?;
         hasher.update(&buffer[..read]);
     }
+}
+
+fn validate_single_current_lz4_frame<R: Read>(
+    reader: &mut R,
+    path: &Path,
+) -> Result<(), ArchiveError> {
+    let mut magic = [0_u8; LZ4_FRAME_MAGIC.len()];
+    read_lz4_exact(reader, &mut magic, path)?;
+    if magic != LZ4_FRAME_MAGIC {
+        return Err(ArchiveError::UnsupportedLz4Frame {
+            path: path.to_path_buf(),
+        });
+    }
+
+    let mut descriptor = [0_u8; 2];
+    read_lz4_exact(reader, &mut descriptor, path)?;
+    let [flags, block_descriptor] = descriptor;
+    if flags & LZ4_FRAME_VERSION_MASK != LZ4_FRAME_CURRENT_VERSION
+        || flags & (LZ4_FRAME_RESERVED_FLAG | LZ4_FRAME_DICTIONARY_FLAG) != 0
+    {
+        return Err(ArchiveError::UnsupportedLz4Frame {
+            path: path.to_path_buf(),
+        });
+    }
+    let block_size =
+        lz4_block_size(block_descriptor).ok_or_else(|| ArchiveError::InvalidLz4Frame {
+            path: path.to_path_buf(),
+        })?;
+
+    if flags & LZ4_FRAME_CONTENT_SIZE_FLAG != 0 {
+        skip_lz4_bytes(reader, 8, path)?;
+    }
+    read_lz4_exact(reader, &mut [0_u8; 1], path)?;
+
+    loop {
+        let mut block_header = [0_u8; 4];
+        read_lz4_exact(reader, &mut block_header, path)?;
+        let block_header = u32::from_le_bytes(block_header);
+        if block_header == 0 {
+            break;
+        }
+        let block_bytes = usize::try_from(block_header & 0x7fff_ffff).map_err(|_| {
+            ArchiveError::InvalidLz4Frame {
+                path: path.to_path_buf(),
+            }
+        })?;
+        if block_bytes == 0 || block_bytes > block_size {
+            return Err(ArchiveError::InvalidLz4Frame {
+                path: path.to_path_buf(),
+            });
+        }
+        skip_lz4_bytes(reader, block_bytes, path)?;
+        if flags & LZ4_FRAME_BLOCK_CHECKSUM_FLAG != 0 {
+            skip_lz4_bytes(reader, 4, path)?;
+        }
+    }
+    if flags & LZ4_FRAME_CONTENT_CHECKSUM_FLAG != 0 {
+        skip_lz4_bytes(reader, 4, path)?;
+    }
+
+    let mut trailing = [0_u8; 1];
+    match reader.read(&mut trailing) {
+        Ok(0) => Ok(()),
+        Ok(_) => Err(ArchiveError::TrailingLz4Data {
+            path: path.to_path_buf(),
+        }),
+        Err(source) => Err(ArchiveError::SourceIo {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn lz4_block_size(block_descriptor: u8) -> Option<usize> {
+    if block_descriptor & !LZ4_BLOCK_SIZE_MASK != 0 {
+        return None;
+    }
+    match (block_descriptor & LZ4_BLOCK_SIZE_MASK) >> 4 {
+        4 => Some(64 * 1_024),
+        5 => Some(256 * 1_024),
+        6 => Some(1_024 * 1_024),
+        7 => Some(4 * 1_024 * 1_024),
+        _ => None,
+    }
+}
+
+fn skip_lz4_bytes<R: Read>(reader: &mut R, bytes: usize, path: &Path) -> Result<(), ArchiveError> {
+    let mut buffer = [0_u8; DIGEST_BUFFER_BYTES];
+    let mut remaining = bytes;
+    while remaining != 0 {
+        let take = remaining.min(buffer.len());
+        read_lz4_exact(reader, &mut buffer[..take], path)?;
+        remaining -= take;
+    }
+    Ok(())
+}
+
+fn read_lz4_exact<R: Read>(
+    reader: &mut R,
+    buffer: &mut [u8],
+    path: &Path,
+) -> Result<(), ArchiveError> {
+    reader.read_exact(buffer).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::UnexpectedEof {
+            ArchiveError::TruncatedLz4Frame {
+                path: path.to_path_buf(),
+            }
+        } else {
+            ArchiveError::SourceIo {
+                path: path.to_path_buf(),
+                source,
+            }
+        }
+    })
 }
 
 fn read_source(
@@ -908,10 +1087,32 @@ fn read_source(
     let ResolvedSource {
         compressed_bytes,
         compressed_digest,
-        file,
+        mut file,
         path,
         span,
     } = source;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| ArchiveError::SourceIo {
+            path: path.clone(),
+            source,
+        })?;
+    let mut validated = DigestingReader::new(file);
+    let frame_validation = validate_single_current_lz4_frame(&mut validated, &path);
+    validated.drain_to_end(&path)?;
+    let (mut file, actual_bytes, actual_digest) = validated.finish();
+    verify_source_metadata(
+        &path,
+        compressed_bytes,
+        compressed_digest,
+        actual_bytes,
+        actual_digest,
+    )?;
+    frame_validation?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| ArchiveError::SourceIo {
+            path: path.clone(),
+            source,
+        })?;
     let decoder = FrameDecoder::new(DigestingReader::new(file));
     let mut reader = BufReader::with_capacity(DIGEST_BUFFER_BYTES, decoder);
     let mut decoded_bytes = 0_u64;
@@ -939,45 +1140,25 @@ fn read_source(
         usage.record_event(&path, limits)?;
         events.push(event);
     }
-    let mut decoder = reader.into_inner();
-    let trailing = decoder
-        .fill_buf()
-        .map_err(|source| ArchiveError::Decompression {
-            path: path.clone(),
-            source,
-        })?;
-    if !trailing.is_empty() {
-        return Err(incomplete_lz4_frame(&path));
-    }
+    let decoder = reader.into_inner();
     let mut compressed = decoder.into_inner();
     compressed.drain_to_end(&path)?;
-    if !compressed.has_complete_lz4_terminal() {
-        return Err(incomplete_lz4_frame(&path));
-    }
     verify_streamed_source(&path, compressed_bytes, compressed_digest, compressed)?;
     Ok(events)
 }
 
 struct DigestingReader<R> {
     bytes_read: u64,
-    first_bytes: [u8; 5],
-    first_bytes_len: usize,
     hasher: Hasher,
     inner: R,
-    trailing_bytes: [u8; 8],
-    trailing_bytes_len: usize,
 }
 
 impl<R> DigestingReader<R> {
     fn new(inner: R) -> Self {
         Self {
             bytes_read: 0,
-            first_bytes: [0; 5],
-            first_bytes_len: 0,
             hasher: Hasher::new(),
             inner,
-            trailing_bytes: [0; 8],
-            trailing_bytes_len: 0,
         }
     }
 
@@ -997,50 +1178,12 @@ impl<R> DigestingReader<R> {
         Ok(())
     }
 
-    fn has_complete_lz4_terminal(&self) -> bool {
-        if self.first_bytes_len < self.first_bytes.len() || self.first_bytes[..4] != LZ4_FRAME_MAGIC
-        {
-            return false;
-        }
-        let terminal_length = if self.first_bytes[4] & LZ4_CONTENT_CHECKSUM_FLAG != 0 {
-            8
-        } else {
-            4
-        };
-        if self.trailing_bytes_len < terminal_length {
-            return false;
-        }
-        let terminal_start = self.trailing_bytes_len - terminal_length;
-        self.trailing_bytes[terminal_start..terminal_start + 4]
-            .iter()
-            .all(|byte| *byte == 0)
-    }
-
-    fn finish(self) -> (u64, ArchiveDigest) {
-        (self.bytes_read, ArchiveDigest::from_hasher(self.hasher))
-    }
-
-    fn observe(&mut self, bytes: &[u8]) {
-        let prefix_remaining = self.first_bytes.len() - self.first_bytes_len;
-        let prefix_len = prefix_remaining.min(bytes.len());
-        self.first_bytes[self.first_bytes_len..self.first_bytes_len + prefix_len]
-            .copy_from_slice(&bytes[..prefix_len]);
-        self.first_bytes_len += prefix_len;
-
-        let trailing_capacity = self.trailing_bytes.len();
-        if bytes.len() >= trailing_capacity {
-            self.trailing_bytes
-                .copy_from_slice(&bytes[bytes.len() - trailing_capacity..]);
-            self.trailing_bytes_len = trailing_capacity;
-            return;
-        }
-        let retained = self.trailing_bytes_len.min(trailing_capacity - bytes.len());
-        self.trailing_bytes.copy_within(
-            self.trailing_bytes_len - retained..self.trailing_bytes_len,
-            0,
-        );
-        self.trailing_bytes[retained..retained + bytes.len()].copy_from_slice(bytes);
-        self.trailing_bytes_len = retained + bytes.len();
+    fn finish(self) -> (R, u64, ArchiveDigest) {
+        (
+            self.inner,
+            self.bytes_read,
+            ArchiveDigest::from_hasher(self.hasher),
+        )
     }
 }
 
@@ -1049,18 +1192,7 @@ impl<R: Read> Read for DigestingReader<R> {
         let read = self.inner.read(buffer)?;
         self.bytes_read = self.bytes_read.saturating_add(read as u64);
         self.hasher.update(&buffer[..read]);
-        self.observe(&buffer[..read]);
         Ok(read)
-    }
-}
-
-fn incomplete_lz4_frame(path: &Path) -> ArchiveError {
-    ArchiveError::Decompression {
-        path: path.to_path_buf(),
-        source: std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "archive LZ4 frame did not end with a complete terminal marker",
-        ),
     }
 }
 
@@ -1070,7 +1202,23 @@ fn verify_streamed_source(
     expected_digest: ArchiveDigest,
     compressed: DigestingReader<File>,
 ) -> Result<(), ArchiveError> {
-    let (actual_bytes, actual_digest) = compressed.finish();
+    let (_, actual_bytes, actual_digest) = compressed.finish();
+    verify_source_metadata(
+        path,
+        expected_bytes,
+        expected_digest,
+        actual_bytes,
+        actual_digest,
+    )
+}
+
+fn verify_source_metadata(
+    path: &Path,
+    expected_bytes: u64,
+    expected_digest: ArchiveDigest,
+    actual_bytes: u64,
+    actual_digest: ArchiveDigest,
+) -> Result<(), ArchiveError> {
     if actual_bytes != expected_bytes {
         return Err(ArchiveError::CompressedLengthMismatch {
             path: path.to_path_buf(),

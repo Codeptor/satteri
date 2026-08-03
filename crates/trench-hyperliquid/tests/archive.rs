@@ -5,6 +5,7 @@ mod archive {
         use std::io::Write;
         use std::path::{Path, PathBuf};
 
+        use lz4_flex::block::compress;
         use lz4_flex::frame::FrameEncoder;
         use rust_decimal::Decimal;
         use tempfile::TempDir;
@@ -62,6 +63,11 @@ mod archive {
             let bytes = fs::read(fixture_path()).expect("read immutable LZ4 fixture");
 
             assert_eq!(bytes.len(), 173);
+            assert_ne!(
+                bytes[4] & 0b0000_0100,
+                0,
+                "the immutable current-frame fixture includes a content checksum"
+            );
             assert_eq!(
                 ArchiveDigest::of_bytes(&bytes).to_string(),
                 "b3:b7fbf0b0473d3dfb5e32b824360e840978d47f8321b748c493585240b52fed6a"
@@ -134,6 +140,48 @@ mod archive {
                 .write_all(records)
                 .expect("compress archive fixture records");
             encoder.finish().expect("finish compressed fixture");
+        }
+
+        fn empty_lz4_frame() -> Vec<u8> {
+            FrameEncoder::new(Vec::new())
+                .finish()
+                .expect("finish empty LZ4 frame")
+        }
+
+        fn write_legacy_lz4(destination: &Path, records: &[u8]) {
+            let compressed = compress(records);
+            let mut bytes = vec![0x02, 0x21, 0x4c, 0x18];
+            bytes.extend(
+                u32::try_from(compressed.len())
+                    .expect("legacy compressed block length fits u32")
+                    .to_le_bytes(),
+            );
+            bytes.extend(compressed);
+            fs::write(destination, bytes).expect("write legacy compressed fixture");
+        }
+
+        #[cfg(not(unix))]
+        #[test]
+        fn reader_fails_closed_before_inspecting_paths_without_descriptor_safety() {
+            struct PanickingPath;
+
+            impl AsRef<Path> for PanickingPath {
+                fn as_ref(&self) -> &Path {
+                    panic!("the fail-closed reader must not inspect the supplied path")
+                }
+            }
+
+            let manifest = ArchiveManifest::new(AS_OF_MS, [], [])
+                .expect("empty manifest must remain valid on every platform");
+
+            let error = ArchiveReader::open(PanickingPath, manifest).expect_err(
+                "platforms without descriptor-relative no-follow opens must fail closed",
+            );
+
+            assert!(matches!(
+                error,
+                trench_hyperliquid::ArchiveError::UnsupportedPlatform
+            ));
         }
 
         #[test]
@@ -211,7 +259,7 @@ mod archive {
 
             assert!(matches!(
                 error,
-                trench_hyperliquid::ArchiveError::Decompression { .. }
+                trench_hyperliquid::ArchiveError::TruncatedLz4Frame { .. }
             ));
         }
 
@@ -242,8 +290,144 @@ mod archive {
 
             assert!(matches!(
                 error,
+                trench_hyperliquid::ArchiveError::TruncatedLz4Frame { .. }
+            ));
+        }
+
+        #[test]
+        fn reader_rejects_an_invalid_current_lz4_content_checksum() {
+            let root = TempDir::new().expect("create archive root");
+            let (destination, _) = install_fixture(&root);
+            let mut bytes = fs::read(&destination).expect("read copied immutable fixture");
+            let last = bytes
+                .last_mut()
+                .expect("checksum-bearing fixture has a trailing checksum byte");
+            *last ^= 0xff;
+            fs::write(&destination, &bytes).expect("corrupt LZ4 content checksum");
+            let source = ArchiveSource::new(
+                l2_span(),
+                PathBuf::from("market_data/20230916/9/l2Book/SOL.lz4"),
+                u64::try_from(bytes.len()).expect("fixture length fits u64"),
+                ArchiveDigest::of_bytes(&bytes),
+            );
+            let manifest = ArchiveManifest::new(
+                AS_OF_MS,
+                [ArchiveRequirement::required(l2_span())],
+                [source],
+            )
+            .expect("corrupt-checksum source metadata remains explicit");
+
+            let error = ArchiveReader::open(root.path(), manifest)
+                .expect("metadata-verifiable source opens before streaming")
+                .read_all()
+                .expect_err("invalid LZ4 content checksum must be rejected");
+
+            assert!(matches!(
+                error,
                 trench_hyperliquid::ArchiveError::Decompression { .. }
             ));
+        }
+
+        #[test]
+        fn reader_rejects_a_concatenated_lz4_frame_after_metadata_verification() {
+            let root = TempDir::new().expect("create archive root");
+            let (destination, _) = install_fixture(&root);
+            let mut bytes = fs::read(&destination).expect("read copied immutable fixture");
+            bytes.extend(empty_lz4_frame());
+            fs::write(&destination, &bytes).expect("append a second complete LZ4 frame");
+            let source = ArchiveSource::new(
+                l2_span(),
+                PathBuf::from("market_data/20230916/9/l2Book/SOL.lz4"),
+                u64::try_from(bytes.len()).expect("fixture length fits u64"),
+                ArchiveDigest::of_bytes(&bytes),
+            );
+            let manifest = ArchiveManifest::new(
+                AS_OF_MS,
+                [ArchiveRequirement::required(l2_span())],
+                [source],
+            )
+            .expect("concatenated source metadata remains explicit");
+
+            let error = ArchiveReader::open(root.path(), manifest)
+                .expect("verified concatenated object opens before streaming")
+                .read_all()
+                .expect_err("a second complete LZ4 frame must be rejected");
+
+            assert!(matches!(
+                error,
+                trench_hyperliquid::ArchiveError::TrailingLz4Data { .. }
+            ));
+        }
+
+        #[test]
+        fn reader_rejects_trailing_nul_bytes_after_metadata_verification() {
+            let root = TempDir::new().expect("create archive root");
+            let (destination, _) = install_fixture(&root);
+            let mut bytes = fs::read(&destination).expect("read copied immutable fixture");
+            bytes.extend([0, 0, 0]);
+            fs::write(&destination, &bytes).expect("append trailing NUL bytes");
+            let source = ArchiveSource::new(
+                l2_span(),
+                PathBuf::from("market_data/20230916/9/l2Book/SOL.lz4"),
+                u64::try_from(bytes.len()).expect("fixture length fits u64"),
+                ArchiveDigest::of_bytes(&bytes),
+            );
+            let manifest = ArchiveManifest::new(
+                AS_OF_MS,
+                [ArchiveRequirement::required(l2_span())],
+                [source],
+            )
+            .expect("source metadata with NUL suffix remains explicit");
+
+            let error = ArchiveReader::open(root.path(), manifest)
+                .expect("verified suffixed object opens before streaming")
+                .read_all()
+                .expect_err("trailing NUL bytes must be rejected");
+
+            assert!(matches!(
+                error,
+                trench_hyperliquid::ArchiveError::TrailingLz4Data { .. }
+            ));
+        }
+
+        #[test]
+        fn reader_rejects_a_legacy_lz4_frame_before_output() {
+            let root = TempDir::new().expect("create archive root");
+            let relative_path = PathBuf::from("market_data/20230916/9/l2Book/SOL.lz4");
+            let destination = root.path().join(&relative_path);
+            fs::create_dir_all(
+                destination
+                    .parent()
+                    .expect("legacy archive path has a parent"),
+            )
+            .expect("create legacy archive directories");
+            write_legacy_lz4(&destination, b"{}");
+            let bytes = fs::read(&destination).expect("read legacy compressed fixture");
+            let source = ArchiveSource::new(
+                l2_span(),
+                relative_path,
+                u64::try_from(bytes.len()).expect("fixture length fits u64"),
+                ArchiveDigest::of_bytes(&bytes),
+            );
+            let manifest = ArchiveManifest::new(
+                AS_OF_MS,
+                [ArchiveRequirement::required(l2_span())],
+                [source],
+            )
+            .expect("legacy source metadata remains explicit");
+
+            let error = ArchiveReader::open(root.path(), manifest)
+                .expect("verified legacy object opens before streaming")
+                .read_all()
+                .expect_err("legacy LZ4 is outside the importer contract");
+
+            assert!(
+                matches!(
+                    error,
+                    trench_hyperliquid::ArchiveError::UnsupportedLz4Frame { .. }
+                ),
+                "legacy LZ4 must be rejected with its typed error: {error:?}"
+            );
         }
 
         #[test]
@@ -271,12 +455,16 @@ mod archive {
                 .read_all()
                 .expect_err("the complete opened descriptor must be rehashed before success");
 
-            assert!(matches!(
-                error,
-                trench_hyperliquid::ArchiveError::CompressedLengthMismatch { .. }
-                    | trench_hyperliquid::ArchiveError::CompressedDigestMismatch { .. }
-                    | trench_hyperliquid::ArchiveError::Decompression { .. }
-            ));
+            assert!(
+                matches!(
+                    error,
+                    trench_hyperliquid::ArchiveError::CompressedLengthMismatch { .. }
+                        | trench_hyperliquid::ArchiveError::CompressedDigestMismatch { .. }
+                        | trench_hyperliquid::ArchiveError::Decompression { .. }
+                        | trench_hyperliquid::ArchiveError::TrailingLz4Data { .. }
+                ),
+                "post-open mutation must fail before success: {error:?}"
+            );
         }
 
         #[test]
