@@ -2209,9 +2209,14 @@ mod tests {
             panic!("replayed trade must remain a trade event");
         };
         assert_eq!(trade.trade_id(), 41);
-        stream.shutdown().await;
+        timeout(Duration::from_secs(1), stream.shutdown())
+            .await
+            .expect("client must shut down before test cleanup");
         let _ = release_server.send(());
-        server.await.expect("server task must complete");
+        timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server task must complete before test cleanup timeout")
+            .expect("server task must complete");
     }
 
     #[test]
