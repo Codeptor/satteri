@@ -28,9 +28,11 @@ Cargo.lock                                     pinned expanded Rust graph
 crates/trenchd/src/health.rs                   loopback liveness/readiness/metrics server
 crates/trenchd/src/systemd.rs                  watchdog/status notification
 crates/trenchd/src/retention.rs                disk thresholds and bounded-book retention
+crates/trenchd/src/admin.rs                    backup/retention admin protocol extensions
 crates/trenchd/src/commands.rs                 status, backup, compact, smoke commands
 crates/trench-storage/src/backup.rs            SQLite online backup and verification
 deploy/config/paper.toml                       production paper config without secrets
+deploy/config/ml.toml                          production ML worker config without secrets
 deploy/systemd/trenchbot.slice                 shared-host CPU/memory/task budget
 deploy/systemd/trenchd.service                 Rust authority service
 deploy/systemd/trench-ml.service               optional frozen inference service
@@ -111,6 +113,7 @@ git commit -m "feat(ops): expose private health and metrics"
 - Create: `crates/trench-storage/src/backup.rs`
 - Modify: `crates/trench-storage/src/lib.rs`
 - Create: `crates/trenchd/src/retention.rs`
+- Modify: `crates/trenchd/src/admin.rs`
 - Modify: `crates/trenchd/src/commands.rs`
 - Modify: `crates/trenchd/src/app.rs`
 - Test: storage/daemon unit tests
@@ -121,7 +124,7 @@ Create a WAL database with active reads, request an online backup through the si
 
 - [ ] **Step 2: Write failing disk-threshold tests**
 
-At below 65% usage, retain seven raw-book days. At 65-69.99%, delete only fully manifested raw L2/BBO partitions oldest-first while retaining compact trades/candles/features/ledgers. At 70% or more, block new entries and emit an active alert; never delete transactional data or an open-position dependency. Use an injected filesystem-usage provider.
+At below 65% usage, retain seven raw-book days. At 65-69.99%, delete only fully manifested raw L2/BBO partitions oldest-first while retaining compact trades/candles/features/ledgers and every finalized `LabelObservation` required by a data/run manifest. At 70% or more, block new entries and emit an active alert; never delete transactional data, durable labels, archive/data manifests, or an open-position dependency. Use an injected filesystem-usage provider and race it against an active Parquet writer in tests.
 
 - [ ] **Step 3: Verify failure**
 
@@ -131,7 +134,7 @@ Expected: FAIL because backup/retention modules are absent.
 
 - [ ] **Step 4: Implement explicit maintenance commands**
 
-Add:
+Extend the phase-1 authenticated Unix admin protocol and add client commands:
 
 ```text
 trenchd status --config PATH --json
@@ -140,7 +143,7 @@ trenchd compact --config PATH
 trenchd smoke --config PATH
 ```
 
-Backup coordinates with the writer, writes a temporary sibling, fsyncs, verifies, and renames. Retention resolves and validates each partition beneath the configured data root before removal and journals every removed manifest. It never expands an unresolved variable/glob or recursively targets a broad directory.
+`status`, `backup`, `compact`, and `smoke` are thin clients to the running daemon's versioned admin socket; they never open SQLite or mutate Parquet directly. The daemon handles each request inside its authority loop: backup coordinates with the sole writer, writes a temporary sibling, fsyncs, verifies, and renames; retention first fences/flushes the Parquet writer, resolves and validates each partition beneath the configured data root, journals removals through the SQLite writer, then un-fences. It never expands an unresolved variable/glob or recursively targets a broad directory. A down/unready daemon makes the timer command fail and alert rather than creating a second writer.
 
 - [ ] **Step 5: Run maintenance tests**
 
@@ -200,6 +203,7 @@ git commit -m "ci: build verified paper-bot releases"
 
 **Files:**
 - Create: `deploy/config/paper.toml`
+- Create: `deploy/config/ml.toml`
 - Create: `deploy/systemd/trenchbot.slice`
 - Create: `deploy/systemd/trenchd.service`
 - Create: `deploy/systemd/trench-ml.service`
@@ -213,17 +217,19 @@ git commit -m "ci: build verified paper-bot releases"
 
 - [ ] **Step 1: Write failing unit validation checks**
 
-Run `systemd-analyze verify` against the initial absent files and assert failure. Add a Bats static test requiring user/group `trenchbot`, nologin home, exact writable paths, loopback endpoint, no `EnvironmentFile` containing secrets, no Docker, and no dependency on unrelated services.
+Run `systemd-analyze verify` against the initial absent files and assert failure. Add a Bats static test requiring user/group `trenchbot`, nologin home, exact writable paths, exact `/etc/trenchbot/paper.toml` and `/etc/trenchbot/ml.toml` arguments, loopback endpoint, no `EnvironmentFile` containing secrets, no Docker, and no dependency on unrelated services. Parse both TOML files with production config types and reject unknown/default-placeholder paths.
 
 - [ ] **Step 2: Create account/directories and slice policy**
 
-`sysusers.d` creates a system `trenchbot` user/group with `/var/lib/trenchbot` and `/usr/sbin/nologin`. `tmpfiles.d` creates `/var/lib/trenchbot/{sqlite,parquet,models}`, `/var/backups/trenchbot`, and `/run/trenchbot` at `0700`. The slice uses `CPUQuota=300%`, `MemoryHigh=3G`, `MemoryMax=4G`, `TasksMax=512`, and accounting enabled, leaving the majority of the measured host memory plus three vCPUs available to other workloads.
+`sysusers.d` creates a system `trenchbot` user/group with `/var/lib/trenchbot` and `/usr/sbin/nologin`. `tmpfiles.d` creates `/etc/trenchbot` as root:`trenchbot` `0750`, plus `/var/lib/trenchbot/{sqlite,parquet,models}`, `/var/backups/trenchbot`, and `/run/trenchbot` at `0700`. The slice uses `CPUQuota=300%`, `MemoryHigh=3G`, `MemoryMax=4G`, `TasksMax=512`, and accounting enabled, leaving the majority of the measured host memory plus three vCPUs available to other workloads.
+
+`deploy/config/paper.toml` contains the exact production public REST/WS endpoints, `/var/lib` data paths, `/run/trenchbot/admin.sock`, `/run/trenchbot/ml.sock`, `127.0.0.1:9464`, frozen universe/risk/fee settings, and no secret field. `deploy/config/ml.toml` contains the Unix socket, content-addressed model root, worker limits/deadline, feature/config digests supplied at release time, and no database/exchange/credential field.
 
 - [ ] **Step 3: Create hardened service units**
 
-Both services use `User/Group=trenchbot`, `UMask=0077`, `NoNewPrivileges`, empty capability sets, `PrivateTmp`, `ProtectSystem=strict`, `ProtectHome`, kernel/control-group/device protections, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, explicit `ReadWritePaths`, `LimitNOFILE=65536`, bounded restart delay, start/stop timeouts, and the slice. `trenchd` uses `Type=notify` with `WatchdogSec=30s`; `trench-ml` uses `Type=simple` and becomes ready only through the Rust handshake. ML has `ConditionPathExists=/var/lib/trenchbot/models/champion.json`; its absence is a valid ML-degraded state, not a restart loop.
+Both services use `User/Group=trenchbot`, `UMask=0077`, `NoNewPrivileges`, empty capability sets, `PrivateTmp`, `ProtectSystem=strict`, `ProtectHome`, kernel/control-group/device protections, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, explicit `ReadWritePaths`, `LimitNOFILE=65536`, bounded restart delay, start/stop timeouts, and the slice. `trenchd` executes `trenchd run --config /etc/trenchbot/paper.toml`, uses `Type=notify`, and has `WatchdogSec=30s`; `trench-ml` executes `trench-ml serve --config /etc/trenchbot/ml.toml`, uses `Type=simple`, and becomes ready only through the Rust handshake. ML has `ConditionPathExists=/var/lib/trenchbot/models/champion.json`; its absence is a valid ML-degraded state, not a restart loop.
 
-Backup/retention units are oneshot, use explicit paths, and run daily/hourly timers with randomized delay and persistent catch-up. No unit reads a private credential.
+Backup/retention units are oneshot admin clients: they execute the current `trenchd backup|compact --config /etc/trenchbot/paper.toml` commands, which contact `/run/trenchbot/admin.sock`; they never open storage directly. They run daily/hourly timers with randomized delay and persistent catch-up. No unit reads a private credential.
 
 - [ ] **Step 4: Validate units and security score**
 
@@ -293,15 +299,15 @@ git commit -m "ops: verify shared VPS prerequisites"
 
 - [ ] **Step 1: Write failing path/digest tests**
 
-Use temporary explicit roots to test bad/missing digest, traversal/symlink escape, wrong owner/mode, existing digest with different content, failed uv sync, bad binary doctor, schema incompatibility, and interrupted activation. Assert no broad recursive deletion, current release remains active on failure, and a repeated identical install is idempotent.
+Use temporary explicit roots to test bad/missing digest, traversal/symlink escape, wrong owner/mode, missing/invalid paper or ML config, existing digest with different content, failed uv sync, bad binary doctor, schema incompatibility, and interrupted activation. Assert no broad recursive deletion, current release/config remain active on failure, and a repeated identical install is idempotent.
 
 - [ ] **Step 2: Implement staged preparation**
 
-The root-run script accepts exactly `--bundle ABSOLUTE_FILE --release-root /opt/trenchbot/releases --data-root /var/lib/trenchbot`. Resolve/validate every target, verify manifest/provenance/file hashes including the bundled `uv`, create a same-filesystem temporary release directory with `mktemp -d`, install the binaries, run the bundled `uv sync --frozen --no-dev` inside staging, validate schema/config/artifacts, run offline `trenchd doctor`, then make files root-owned/read-only.
+The root-run script accepts exactly `--bundle ABSOLUTE_FILE --release-root /opt/trenchbot/releases --config-root /etc/trenchbot --data-root /var/lib/trenchbot`. Resolve/validate every target, verify manifest/provenance/file hashes including the bundled `uv`, create same-filesystem temporary release and config siblings with `mktemp -d`, install the binaries, run the bundled `uv sync --frozen --no-dev` inside staging, and stage both `paper.toml` and `ml.toml`. Validate them through `trenchd doctor` plus `trench-ml config check`, require public/Unix/local paths and exact release digests, set config ownership root:`trenchbot` mode `0640`, then make release files root-owned/read-only.
 
 - [ ] **Step 3: Implement explicit activation**
 
-Create a new symlink sibling and atomically rename it to `/opt/trenchbot/current` only after staging succeeds. Before a forward schema migration, request and verify an online backup; never activate an older schema binary afterward. Retain the previous release and backup. Do not start/restart services inside the installer; activation and service restart are separate observable commands.
+Create new release/config symlink siblings and atomically rename them to `/opt/trenchbot/current`, `/etc/trenchbot/paper.toml`, and `/etc/trenchbot/ml.toml` only after every staged validation succeeds; all three link to files from the same manifest digest. Before a forward schema migration, request and verify an online backup through the running admin socket; never activate an older schema binary afterward. Retain the previous release/config targets and backup. Do not start/restart services inside the installer; activation and service restart are separate observable commands.
 
 - [ ] **Step 4: Run script tests**
 
@@ -401,7 +407,13 @@ Require continuous normalized data, expected hourly universe snapshots, complete
 
 - [ ] **Step 3: Begin the immutable evidence window**
 
-Mark the run `forward_active` through the manual CLI only after the 24-hour burn-in report passes. The daemon then collects predictions/trades automatically; it does not auto-promote, relax minimum trades, backfill missed decisions, or count pre-registration outcomes.
+Invoke the phase-2 Rust admin client explicitly:
+
+```text
+trenchd forward activate --socket /run/trenchbot/admin.sock --run-manifest ABSOLUTE_PATH --burn-in-report ABSOLUTE_PATH
+```
+
+The writer verifies and atomically marks the run `forward_active` only after the 24-hour burn-in report passes. The daemon then schedules both visible strategies and all registered rules/ML shadows automatically; it does not auto-promote, relax minimum trades, backfill missed decisions, or count pre-registration outcomes.
 
 - [ ] **Step 4: Validate daily/weekly operator checks**
 

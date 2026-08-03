@@ -39,7 +39,7 @@ crates/trench-core/
   src/features/mod.rs                          point-in-time feature snapshot API
   src/features/common.rs                       indicators shared by both future strategies
   src/features/rules.rs                        six interpretable signal families
-  src/strategy/mod.rs                          OrderIntent and Strategy trait
+  src/strategy/mod.rs                          signal/cost-acceptance/intent interfaces
   src/strategy/rules.rs                        regime, entry, rank, and exit logic
   src/risk/mod.rs                              authoritative risk-decision API
   src/risk/breakers.rs                         daily/weekly/drawdown/cooldown state machine
@@ -50,6 +50,7 @@ crates/trench-core/
   src/broker/fill.rs                           IOC, partial-fill, mandatory-exit behavior
   src/ledger.rs                                cash, position, equity, and reconciliation
   src/engine.rs                                bar-close arbitration and event transitions
+  src/validation.rs                            rules grid and chronological fold manifests
   tests/ledger_independence.rs                 state-isolation property test
   tests/risk_properties.rs                     risk and accounting properties
 crates/trench-hyperliquid/
@@ -57,6 +58,7 @@ crates/trench-hyperliquid/
   src/lib.rs                                   exports only read-only clients
   src/info.rs                                  `/info` REST requests and response types
   src/ws.rs                                    public WebSocket subscriptions/reconnect
+  src/archive.rs                               explicit local official-archive importer
   src/normalize.rs                             wire payload to trench-core event conversion
   tests/read_only_surface.rs                   proves no action endpoint is constructible
 crates/trench-storage/
@@ -71,10 +73,12 @@ crates/trenchd/
   Cargo.toml
   src/main.rs                                  CLI entry and Tokio runtime
   src/app.rs                                   component wiring and shutdown
+  src/admin.rs                                 authenticated local admin protocol
   src/readiness.rs                             scoped readiness state machine
   src/writer.rs                                bounded persistence writer
   src/commands.rs                              collect, run, replay, doctor subcommands
 tests/fixtures/
+  archive/l2-sample.lz4                        official-format archive parser fixture
   stream/basic.jsonl                           deterministic captured-event fixture
   stream/gap-and-partial.jsonl                 gap/partial-exit fixture
   meta/native-perps.json                       point-in-time metadata fixture
@@ -273,7 +277,7 @@ git commit -m "feat(storage): add atomic SQLite event journal"
 
 - [ ] **Step 1: Write failing fixture and endpoint tests**
 
-Use `wiremock` to require `POST /info` with only these request variants: `metaAndAssetCtxs`, `allMids`, `candleSnapshot`, and historical funding. Deserialize the fixture and assert BTC/ETH/SOL are ordinary native-perp rows with point-in-time leverage/precision. Assert the public client base type exposes no action URL or signer.
+Use `wiremock` to require `POST /info` with only these request variants: `metaAndAssetCtxs`, `allMids`, `l2Book`, `candleSnapshot`, and historical funding. Deserialize the fixture and assert BTC/ETH/SOL are ordinary native-perp rows with point-in-time leverage/precision. Assert the public client base type exposes no action URL or signer.
 
 - [ ] **Step 2: Verify failure**
 
@@ -318,7 +322,7 @@ Expected: FAIL because `WsClient` is absent.
 
 - [ ] **Step 3: Implement bounded async ingestion**
 
-Use rustls, `tokio::select!`, a bounded `mpsc` output, heartbeat timeout, capped exponential reconnect with full jitter, and cancellation tokens. On reconnect, obtain fresh metadata/book snapshots through `InfoClient`, emit the gap interval, then resume incremental data. Duplicate identities are dropped; non-monotonic/crossed data emits quarantine state rather than being repaired.
+Use rustls, `tokio::select!`, a bounded `mpsc` output, heartbeat timeout, capped exponential reconnect with full jitter, and cancellation tokens. On reconnect, obtain fresh metadata/book snapshots through `InfoClient`, request exchange candles covering every recoverable 15-minute/1-hour gap, reconcile them against locally derived OHLCV, emit corrected completed candles only when source trades agree, record unavailable/conflicting spans explicitly, then resume incremental data. Duplicate identities are dropped; non-monotonic/crossed data emits quarantine state rather than being repaired.
 
 - [ ] **Step 4: Run async tests**
 
@@ -331,6 +335,46 @@ Expected: PASS with bounded channel/backpressure and deterministic test time.
 ```bash
 git add crates/trench-hyperliquid
 git commit -m "feat(market): add resilient public WebSocket ingestion"
+```
+
+### Task 6A: Import official historical market archives locally
+
+**Files:**
+- Create: `crates/trench-hyperliquid/src/archive.rs`
+- Modify: `crates/trench-hyperliquid/src/lib.rs`
+- Modify: `crates/trenchd/src/commands.rs`
+- Create: `tests/fixtures/archive/l2-sample.lz4`
+- Test: parser and command integration tests
+
+- [ ] **Step 1: Write failing official-format parser tests**
+
+Parse a minimal byte-for-byte fixture in the official requester-pays archive format and assert normalized market, event time, book/trade identity, decimal precision, ordering, and content digest. Reject truncated compression, unknown record version, path/manifest mismatch, duplicate conflicts, future timestamps, and an interval whose required L2/BBO source is absent.
+
+- [ ] **Step 2: Verify failure**
+
+Run: `cargo test -p trench-hyperliquid archive::tests`
+
+Expected: FAIL because the archive importer is absent.
+
+- [ ] **Step 3: Implement an explicit-path, offline importer**
+
+Add `trenchd import-archive --config PATH --source ABSOLUTE_PATH --manifest ABSOLUTE_PATH`. The command accepts only previously downloaded official archive files beneath the resolved source root, verifies requester-pays source metadata/digests, streams decompression with bounded memory, normalizes through the same wire conversion as live events, and writes ordinary atomic Parquet partitions. It contains no AWS client or credential field; an operator may download requester-pays data on a trusted workstation, but credentials never enter the repository or VPS.
+
+- [ ] **Step 4: Reconcile imported candles and gaps**
+
+Derive candles from imported trades, compare with official candle snapshots, and persist exact unavailable/conflicting intervals. Backtests and rule selection must exclude those intervals; they may not substitute current universe membership, mid prices, or synthesized books.
+
+- [ ] **Step 5: Run importer tests**
+
+Run: `cargo test -p trench-hyperliquid archive::tests && cargo test -p trenchd commands::import_archive_tests`
+
+Expected: PASS with deterministic partition/manifest digests.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/trench-hyperliquid crates/trenchd tests/fixtures/archive
+git commit -m "feat(data): import official historical archives"
 ```
 
 ### Task 7: Build completed candles and point-in-time common features
@@ -414,7 +458,7 @@ git commit -m "feat(universe): select deep native perp markets"
 
 - [ ] **Step 1: Write failing family/regime tests**
 
-Test each family independently with hand-calculated inputs, including sign behavior for momentum and derivatives. Test trend/range/transition/extreme/high-volatility regimes, the exact fixed weight table, three-family agreement, cost gate, adverse-swing stop bounds, 2R target, opposite-signal exit, and four-bar timeout. Serialize the explanation and assert it contains all six scores, weights, threshold, regime, cost estimate, and rejection reasons.
+Test each family independently with hand-calculated inputs, including sign behavior for momentum and derivatives. Test trend/range/transition/extreme/high-volatility regimes, the exact fixed weight table, three-family agreement, adverse-swing stop bounds, 2R target, opposite-signal exit, and four-bar timeout. Separately test that an un-sized signal accepts/rejects a public `CostQuote` using the exact 1.5x edge gate without seeing the sealed order. Serialize the explanation and assert it contains all six scores, weights, threshold, regime, cost estimate, and rejection reasons.
 
 - [ ] **Step 2: Verify failure**
 
@@ -424,7 +468,7 @@ Expected: FAIL because rule scoring does not exist.
 
 - [ ] **Step 3: Implement the exact approved formulas**
 
-Implement `robust_z`, `unit`, imbalance, all six clipped families, regime selection, and the table in design section 7.2 without configurable weights. `RulesStrategy::on_bar` returns zero or more un-sized `OrderIntent`s carrying market, side, sleeve, confidence/edge, stop, target, time exit, snapshot hash, and full explanation. It never sees ledger PnL, quantity, margin, leverage, or ML output.
+Implement `robust_z`, `unit`, imbalance, all six clipped families, regime selection, and the table in design section 7.2 without configurable weights. `RulesStrategy::on_bar` returns zero or more un-sized `SignalCandidate`s carrying market, side, sleeve, gross edge, stop, target, time exit, snapshot hash, and full explanation. `Strategy::accept_cost(candidate, CostQuote)` may return an `OrderIntent` containing the opaque `quote_id`, but `CostQuote` exposes only total/attributed cost fractions, freshness/source digests, and feasibility reasons. It never exposes ledger PnL, quantity, margin, leverage, the sealed approved order, or ML output.
 
 - [ ] **Step 4: Run score and snapshot tests**
 
@@ -450,7 +494,7 @@ git commit -m "feat(strategy): add interpretable rules signals"
 
 - [ ] **Step 1: Write failing breaker/accounting tests**
 
-Use a 100 USDC ledger to trigger exactly 0.5% trade budget, 1.5% daily, 4% weekly, and 8% high-water drawdown boundaries. Assert three realized losses create a 12-hour cooldown, six UTC-day entries allow no seventh, daily/weekly reset only after reconciliation, and hard drawdown stays latched. Apply identical fills to two ledgers then mutate one; assert the other is byte-identical to its pre-mutation state.
+Use a 100 USDC ledger to trigger exactly 0.5% trade budget, 1.5% daily, 4% weekly, and 8% high-water drawdown boundaries. Assert three realized losses create a 12-hour cooldown, six UTC-day entries allow no seventh, daily/weekly reset only after reconciliation, and hard drawdown stays latched. For an open long, prove unrealized PnL and breaker equity use a size-aware executable bid-side exit quote; for a short, use the ask side. Apply identical fills to two ledgers then mutate one; assert the other is byte-identical to its pre-mutation state.
 
 - [ ] **Step 2: Verify failure**
 
@@ -460,7 +504,7 @@ Expected: FAIL because breaker/ledger state is absent.
 
 - [ ] **Step 3: Implement exact accounting transitions**
 
-Ledger state contains cash, isolated margin, one optional position, realized/unrealized PnL, fees, funding, equity, high-water mark, UTC anchors, entry count, consecutive losses, cooldown, and breaker states. Every mutation returns a journalable transition plus the new state; reject negative size, overlapping positions, averaging, pyramiding, cross-ledger netting, and unreconciled resets.
+Ledger state contains cash, isolated margin, one optional position, realized/unrealized PnL, fees, funding, equity, high-water mark, UTC anchors, entry count, consecutive losses, cooldown, and breaker states. Every mutation returns a journalable transition plus the new state; reject negative size, overlapping positions, averaging, pyramiding, cross-ledger netting, and unreconciled resets. `mark_to_book` walks enough opposite-side depth to close the full remaining size, subtracts estimated exit fees/funding, and uses the 200-bps mandatory-exit boundary price for any visible-depth shortfall while flagging `liquidity_incomplete`; it never marks at mid or mark price. A missing/stale book preserves the last executable valuation with a stale flag and blocks new entries until a fresh executable mark arrives.
 
 - [ ] **Step 4: Add accounting properties**
 
@@ -489,7 +533,7 @@ For `q=1`, `p_ref=100`, isolated equity `5`, maintenance rate `0.025`, and deduc
 
 - [ ] **Step 2: Write failing sizing properties**
 
-Build deterministic book/cost fixtures and assert the selected rounded notional is the greatest one whose entry-to-stressed-stop loss plus both fees and funding reserve is at most 0.5% equity. Assert margin stays at or below 25% equity, the lowest safe integer leverage in `5..=20` wins, venue leverage/precision/minimums apply, and increasing any cost cannot increase size.
+Build deterministic book/cost fixtures and assert the selected rounded notional is the greatest one whose entry-to-stressed-stop loss plus both fees and funding reserve is at most 0.5% equity. Assert margin stays at or below 25% equity, the lowest safe integer leverage in `5..=20` wins, venue leverage/precision/minimums apply, and increasing any cost cannot increase size. Quote several candidates from the same immutable flat-ledger/book snapshot, expose only their public costs, consume exactly one sealed approval by `quote_id`, and reject reuse or a quote whose ledger/book/config digest changed.
 
 - [ ] **Step 3: Verify failure**
 
@@ -499,7 +543,7 @@ Expected: FAIL because liquidation/sizing are absent.
 
 - [ ] **Step 4: Implement deterministic solvers**
 
-Implement the exact reference-equity liquidation equation from design section 8.2 and piecewise tier search. Implement decimal bisection over venue-rounded notional, stressed impact as `max(2*current, trailing_30d_p99)`, worst scheduled funding reserve, all breaker/asset/depth/cost caps, then lowest safe leverage selection. Return either a fully explained `RiskApproval` or exhaustive machine-readable `RiskRejection` values. Record 5x/10x/15x/20x counterfactuals without influencing approval.
+Implement the exact reference-equity liquidation equation from design section 8.2 and piecewise tier search. Implement decimal bisection over venue-rounded notional, stressed impact as `max(2*current, trailing_30d_p99)`, worst scheduled funding reserve, all non-edge breaker/asset/depth/cost caps, then lowest safe leverage selection. `RiskEngine::quote_candidate` returns a `RiskQuote` containing a public `CostQuote` plus a private sealed `ApprovedOrder`; the seal binds quote ID, candidate, ledger, book, universe, config, and event digests. `consume_quote` releases the approved order exactly once only after strategy cost acceptance. Return exhaustive machine-readable rejections and record 5x/10x/15x/20x counterfactuals without influencing approval.
 
 - [ ] **Step 5: Run focused, property, and lint checks**
 
@@ -525,7 +569,7 @@ git commit -m "feat(risk): size isolated positions with liquidation limits"
 
 - [ ] **Step 1: Write failing entry/fill tests**
 
-Test 7.5 bps per-side fixed fees, visible-level walking, first valid post-decision book selection, observed latency attribution, partial entry cancellation, below-minimum dust forced exit, mark-triggered stop/TP, worse post-gap fill, and funding at venue timestamps. Cost output must separate protocol fee, builder fee, spread, depth, latency, funding, and gross alpha.
+Test 7.5 bps per-side fixed fees, visible-level walking, first valid post-decision book selection, observed latency attribution, partial entry cancellation, below-minimum dust forced exit, mark-triggered stop/TP, worse post-gap fill, and funding at venue timestamps. Cost output must separate protocol fee, builder fee, spread, depth, latency, funding, and gross alpha. Assert marked equity and every daily/weekly/drawdown check use the broker's executable full-exit quote, never mid/mark.
 
 - [ ] **Step 2: Write failing mandatory-exit tests**
 
@@ -564,7 +608,7 @@ git commit -m "feat(broker): simulate realistic perpetual fills"
 
 - [ ] **Step 1: Write a failing bar-close integration test**
 
-Feed two markets and two sleeves at one boundary. Assert candidates rank by conservative cost-adjusted edge, only the best risk-passing candidate enters, an open ledger rejects new entries, exit priority is breaker/liquidation prevention, stop, TP, opposite signal, then time, and every input/decision/rejection/fill transition shares one causality ID.
+Feed two markets and two sleeves at one boundary. Assert the engine obtains sealed risk-sized quotes for every signal from the same immutable ledger/book snapshot, strategies see only public costs, accepted candidates rank by conservative net edge, and only the best accepted quote is consumed. Assert stale/unselected quotes cannot execute, an open ledger rejects new entries, exit priority is breaker/liquidation prevention, stop, TP, opposite signal, then time, and every input/quote/decision/rejection/fill transition shares one causality ID.
 
 - [ ] **Step 2: Verify failure**
 
@@ -574,7 +618,7 @@ Expected: FAIL because `Engine` is absent.
 
 - [ ] **Step 3: Implement a pure transition engine**
 
-`Engine::apply(event, prior_state, context) -> Vec<Transition>` owns no clock or I/O. It updates market state, detects completed boundaries, requests rules intents, ranks, calls risk, routes paper orders, applies fills/funding/marks, and emits atomic persistence batches. It must allow mandatory exits while strategy readiness is false and must never call a strategy during replay with a mismatched config/version hash.
+`Engine::apply(event, prior_state, context) -> Vec<Transition>` owns no clock or I/O. It updates market state, detects completed boundaries, requests un-sized signals, asks risk for sealed risk-sized quotes against one immutable snapshot, passes only each public cost quote back to the owning strategy, ranks accepted intents by conservative net edge, consumes one still-fresh sealed quote, routes its paper order, applies fills/funding/executable-book marks, and emits atomic persistence batches. This signal → sealed quote → cost acceptance → single consume sequence is the only entry path in runtime and replay. It must allow mandatory exits while strategy readiness is false and must never call a strategy during replay with a mismatched config/version hash.
 
 - [ ] **Step 4: Persist an engine batch atomically**
 
@@ -638,6 +682,7 @@ git commit -m "feat(replay): persist and replay market events"
 
 **Files:**
 - Create: `crates/trenchd/src/app.rs`
+- Create: `crates/trenchd/src/admin.rs`
 - Create: `crates/trenchd/src/readiness.rs`
 - Create: `crates/trenchd/src/writer.rs`
 - Create: `crates/trenchd/src/commands.rs`
@@ -646,7 +691,7 @@ git commit -m "feat(replay): persist and replay market events"
 
 - [ ] **Step 1: Write failing readiness/startup tests**
 
-Test global blockers for NTP, SQLite/reconciliation, storage, stream, metadata, and fresh books; per-market quarantine; and rules-only warmup/config readiness. Test that an open position can still reach mandatory-exit handling. Reopen a database with an interrupted state and assert startup reconstructs ledger/equity/breakers before subscribing.
+Test global blockers for NTP, SQLite/reconciliation, storage, stream, metadata, and fresh books; per-market quarantine; and rules-only warmup/config readiness. Test that an open position can still reach mandatory-exit handling. Reopen a database with an interrupted state and assert startup reconstructs ledger/equity/breakers before subscribing. Test the local admin socket rejects non-owner peers, unknown schema/request types, oversized/truncated frames, and every state-changing request before readiness/reconciliation.
 
 - [ ] **Step 2: Verify failure**
 
@@ -660,12 +705,15 @@ Use clap subcommands:
 
 ```text
 trenchd doctor --config PATH
-trenchd collect --config PATH
+trenchd collect --config PATH [--duration DURATION]
 trenchd run --config PATH
 trenchd replay --config PATH --manifest PATH
+trenchd status --socket PATH [--json]
 ```
 
 `app` must use `tokio::select!`, bounded channels, cancellation, graceful drain, and exact shutdown checkpoints. The writer owns `SqliteStore`; network tasks never write directly. Startup follows design section 11.3 and records missed decisions rather than recreating them. `doctor` is read-only and exits nonzero with machine-readable reason codes.
+
+`admin` binds only a configured Unix socket under a `0700` runtime directory, sets the socket to `0600`, checks Linux `SO_PEERCRED` for the daemon UID or root, uses a versioned length-prefixed bounded protocol, and routes requests into the authority event loop over a bounded channel. Phase 1 exposes status/readiness/reconciliation only; later plans add shadow, backup, retention, and forward-run commands through the same writer-owned path. No admin TCP port or raw database handle exists.
 
 - [ ] **Step 4: Run daemon tests and offline doctor**
 
@@ -726,6 +774,52 @@ git add scripts/check-paper-boundary.sh AGENTS.md
 git commit -m "test: enforce paper-only platform invariants"
 ```
 
+### Task 17: Select and freeze `rules_only` with nested walk-forward replay
+
+**Files:**
+- Create: `crates/trench-core/src/validation.rs`
+- Modify: `crates/trench-core/src/lib.rs`
+- Modify: `crates/trenchd/src/commands.rs`
+- Modify: `crates/trench-storage/src/replay.rs`
+- Test: chronological-fold and end-to-end selection tests
+
+- [ ] **Step 1: Write failing fold and grid tests**
+
+Assert each outer fold uses 305 development days, 60 chronological no-tuning calibration days, and 30 untouched test days, rolling 30 days. Inner folds train/select on days `1-185`, `1-215`, `1-245`, and `1-275` and validate on the next 30 days, with four-hour purge/embargo. Enumerate exactly the 12 declared rule configurations from threshold `{0.55,0.60,0.65}`, ATR floor `{1.25,1.50}`, and take-profit `{1.5R,2R}`; reject undeclared parameters.
+
+- [ ] **Step 2: Write a failing authoritative-selection test**
+
+Replay every candidate/fold through the same universe, sealed risk quote, paper broker, executable-book marking, fees, funding, and ledger engine used at runtime. Assert selection uses median inner-fold net expectancy then lower turnover, never calibration/test outcomes. Require three outer tests and 100 aggregate closed trades before forward eligibility; insufficient trustworthy history returns a hard ineligible report.
+
+- [ ] **Step 3: Verify failure**
+
+Run: `cargo test -p trench-core validation::tests && cargo test -p trenchd commands::rules_research_tests`
+
+Expected: FAIL because rules walk-forward selection is absent.
+
+- [ ] **Step 4: Implement the deterministic research command**
+
+Add:
+
+```text
+trenchd research rules --config PATH --manifest PATH --output DIRECTORY
+```
+
+The command builds point-in-time folds from the replay manifest, runs declared candidates through `Engine`, writes one immutable prediction/intent/trade/cost stream per candidate/fold, freezes the selected rules config before each outer test, and emits a canonical `rules-validation.json`. That report includes code/config/data/universe/schema digests, fold boundaries, excluded gaps, every tried selection, inner/test outcomes, trade count, and a content-addressed `rules-artifact.json`. It does not calculate a second approximate cost model.
+
+- [ ] **Step 5: Prove no test reuse and stable freezing**
+
+Alter an outer-test outcome and assert the selected config for that fold is unchanged; alter a development outcome and assert the new artifact/report digest captures any legitimate change. Run: `cargo test -p trench-core validation::tests && cargo test -p trenchd commands::rules_research_tests`
+
+Expected: PASS with byte-stable reports for fixed fixtures.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/trench-core crates/trenchd crates/trench-storage
+git commit -m "feat(research): validate and freeze rules strategy"
+```
+
 ## Phase-1 completion gate
 
-Phase 1 is complete only when the workspace gate passes, both golden replays are deterministic, `rules_only` can collect public data and maintain an auditable 100-USDC ledger, failures preserve or force-close exposure exactly as specified, and the static boundary check proves no live-action or Telegram surface exists. Do not begin the ML plan against a failing phase-1 baseline.
+Phase 1 is complete only when the workspace gate passes, both golden replays are deterministic, `rules_only` can collect public data and maintain an auditable 100-USDC ledger, failures preserve or force-close exposure exactly as specified, the static boundary check proves no live-action or Telegram surface exists, and the rules research command either produces a valid frozen outer-fold artifact or truthfully reports insufficient history. Statistical robustness, generic replacement shadows, and final forward promotion are completed in phase 2; do not begin that plan against a failing phase-1 baseline.

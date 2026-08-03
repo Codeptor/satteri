@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a separately validated LightGBM `ml_champion` ledger, reproducible temporal research pipeline, frozen inference worker, and forward-shadow promotion system without weakening the Rust risk authority.
+**Goal:** Add a separately validated LightGBM `ml_champion` ledger plus the shared robustness, forward-shadow, and promotion machinery required to validate both `rules_only` and ML without weakening the Rust risk authority.
 
 **Architecture:** Rust remains authoritative for features, deadlines, risk, paper fills, ledgers, and replay; Python trains and serves immutable models over a versioned MessagePack Unix socket. Point-in-time Parquet datasets feed chronological walk-forward jobs, while content-addressed artifacts and SQLite registrations make every prediction and promotion auditable. ML failure degrades only the ML ledger.
 
@@ -12,7 +12,7 @@
 
 ## Scope and prerequisites
 
-Execute this only after [the rules-platform plan](2026-08-03-trench-rules-platform.md) passes its completion gate. This phase implements the approved [ML design](../specs/2026-08-03-trench-paper-trading-bot-design.md) and leaves `rules_only` behavior unchanged. It creates no live executor, wallet, Telegram integration, TCP inference port, online learning, automatic promotion, or production use of research-only foundation-model artifacts.
+Execute this only after [the rules-platform plan](2026-08-03-trench-rules-platform.md) passes its completion gate. This phase implements the approved [ML design](../specs/2026-08-03-trench-paper-trading-bot-design.md), consumes the frozen rules walk-forward artifact, and applies the same robustness/forward gates to rules without changing its production logic. It creates no live executor, wallet, Telegram integration, TCP inference port, online learning, automatic promotion, or production use of research-only foundation-model artifacts.
 
 Use `@test-driven-development`, `@quantitative-research`, `@backtesting-frameworks`, `@statistical-analysis`, `@risk-metrics-calculation`, and `@api-security-best-practices` during execution. Use `uv` for every Python environment/package/test command.
 
@@ -28,13 +28,17 @@ config/ml.example.toml                          non-secret offline/runtime ML se
 Cargo.toml                                     adds the shared MessagePack dependency
 Cargo.lock                                     pins the expanded Rust graph
 crates/trench-core/src/features/ml.rs           declared feature vector and schema hash
+crates/trench-core/src/labels.rs                durable four-bar BBO/book-cost observations
 crates/trench-core/src/strategy/ml.rs           forecast-to-intent/exit policy
 crates/trench-core/src/shadow.rs                evaluation-only ledger copies
 crates/trench-core/tests/ml_ledger.rs            strategy independence/replay tests
-crates/trench-storage/migrations/0002_ml.sql     artifacts, forecasts, shadows, reports
-crates/trench-storage/src/ml.rs                 atomic ML registrations and journals
+crates/trench-storage/migrations/0002_strategy_validation.sql
+                                                 artifacts, forecasts, shadows, reports
+crates/trench-storage/src/strategy.rs           atomic strategy registrations and journals
 crates/trenchd/src/ml_client.rs                 deadline-bound Unix-socket client
+crates/trenchd/src/admin.rs                     shadow/forward admin protocol extensions
 crates/trenchd/src/app.rs                       ML readiness/inference wiring
+crates/trenchd/src/commands.rs                  Rust broker evaluation/shadow/run commands
 ml/
   pyproject.toml                                package, dependencies, tool policy
   uv.lock                                       fully resolved environment
@@ -47,6 +51,7 @@ ml/
   src/trench_ml/models/lightgbm.py              bounded search and dual heads
   src/trench_ml/models/calibration.py           temperature and split-conformal fit
   src/trench_ml/models/artifact.py              safe serialization/fingerprints
+  src/trench_ml/evaluation_bridge.py            invokes authoritative Rust replay evaluator
   src/trench_ml/evaluation/metrics.py           cost/calibration/trading metrics
   src/trench_ml/evaluation/robustness.py        bootstrap/PBO/DSR/stress suite
   src/trench_ml/evaluation/promotion.py         exact absolute/paired gates
@@ -60,7 +65,7 @@ models/.gitkeep                                 runtime artifacts remain ignored
 
 ## Cross-language invariants
 
-- `schema_version=1`; unknown versions or fields fail closed.
+- `schema_version=1`; each envelope has an explicit `payload_type`; unknown versions, payload types, or fields fail closed.
 - Feature order is declared once in Rust, exported with a BLAKE3 schema digest, and checked by Python. Names are never silently reordered.
 - IPC envelopes carry `event_id`, `event_time`, `as_of_time`, `producer_version`, `run_id`, `config_hash`, payload type, and payload.
 - Python never receives quantity, wallet, margin authority, a database write handle, or exchange client.
@@ -84,7 +89,7 @@ models/.gitkeep                                 runtime artifacts remain ignored
 Test valid request/response round trips and rejection of unknown schema version, unknown field, non-finite feature, stale `as_of_time`, duplicate market/sleeve rows, probability sum outside tolerance, missing feature, digest mismatch, and response ID mismatch. Use this payload shape:
 
 ```python
-request = InferenceRequest(
+request = Envelope(
     schema_version=1,
     event_id="evt-1",
     event_time_ns=1_786_000_000_000_000_000,
@@ -92,8 +97,12 @@ request = InferenceRequest(
     producer_version="test",
     run_id="run-1",
     config_hash="b3:test",
-    feature_schema_hash="b3:features-v1",
-    rows=(FeatureRow(market="SOL", sleeve="15m", values=(0.1, 0.2)),),
+    payload_type="inference_request",
+    payload=InferenceRequest(
+        feature_schema_hash="b3:features-v1",
+        artifact_ids=("b3:champion",),
+        rows=(FeatureRow(market="SOL", sleeve="15m", values=(0.1, 0.2)),),
+    ),
 )
 ```
 
@@ -126,18 +135,20 @@ git commit -m "build(ml): scaffold locked inference project"
 
 **Files:**
 - Create: `crates/trench-core/src/features/ml.rs`
+- Create: `crates/trench-core/src/labels.rs`
 - Modify: `crates/trench-core/src/features/mod.rs`
+- Modify: `crates/trench-core/src/engine.rs`
 - Modify: `crates/trench-storage/src/parquet.rs`
 - Create: `tests/fixtures/ml/tiny-features.parquet`
 - Test: inline Rust tests
 
 - [ ] **Step 1: Write failing schema and no-lookahead tests**
 
-Assert the feature order exactly covers returns `1/2/4/8/16/32`, EMA ratio/slopes, RSI14, ADX14, ATR14, realized volatility `8/20/64`, Donchian20 position, volume robust z, funding level/percentile, premium, OI changes `1/4/16`, spread/depth/trade imbalance, impact, cross-sectional return ranks `4/16/96`, breadth, and cyclic UTC hour/day. Assert it contains no rules-family score. Mutating data after `as_of_time` must not change a row or schema hash.
+Assert the feature order exactly covers returns `1/2/4/8/16/32`, EMA ratio/slopes, RSI14, ADX14, ATR14, realized volatility `8/20/64`, Donchian20 position, volume robust z, funding level/percentile, premium, OI changes `1/4/16`, spread/depth/trade imbalance, impact, cross-sectional return ranks `4/16/96`, breadth, and cyclic UTC hour/day. Assert it contains no rules-family score. Mutating data after `as_of_time` must not change a row or schema hash. For every completed bar, assert a pending label anchor captures the first valid post-close BBO/book; exactly four sleeve bars later it finalizes from the first valid book with both long/short fixed-100-USDC VWAP impact, fees, intervening funding, universe state, gap flags, and source event IDs.
 
 - [ ] **Step 2: Verify failure**
 
-Run: `cargo test -p trench-core features::ml::tests`
+Run: `cargo test -p trench-core features::ml::tests && cargo test -p trench-core labels::tests`
 
 Expected: FAIL because ML feature export is absent.
 
@@ -145,9 +156,11 @@ Expected: FAIL because ML feature export is absent.
 
 Add `MlFeatureRow { market, sleeve, as_of_time, universe_snapshot_id, names, values, completeness, schema_hash }`. Build only from the phase-1 immutable common snapshot; reject missing/non-finite inputs rather than impute. Serialize names in canonical order and derive the digest from type/name/unit/window metadata, not sample values. Extend Parquet output with event-time, receive-time, universe/config digests, and source-event range.
 
+Add `LabelObservation` as a compact engine state machine keyed by `(market,sleeve,bar_close)`. It stores `p0/p1` mids, side-specific 100-USDC entry/exit VWAP impacts, fees, observed funding path, conservative `cost_probe=max(long_cost,short_cost)`, data-quality/universe flags, and exact source IDs. Finalized observations are immutable Parquet rows retained indefinitely; invalid/gapped anchors are finalized with exclusion reasons. Live events and imported official archive events use the same materializer, so raw BBO/L2 can expire without deleting training labels.
+
 - [ ] **Step 4: Generate and verify the tiny fixture**
 
-Generate the committed fixture from deterministic source events, reopen it in Rust, and assert its content digest. Run: `cargo test -p trench-core features::ml::tests && cargo test -p trench-storage parquet`
+Generate the committed fixture and finalized label observations from deterministic source events, reopen them in Rust, and assert their content digests. Run: `cargo test -p trench-core features::ml::tests && cargo test -p trench-core labels::tests && cargo test -p trench-storage parquet`
 
 Expected: PASS.
 
@@ -173,7 +186,7 @@ Assert Python verifies Parquet schema/content/config/universe digests, monotonic
 
 - [ ] **Step 2: Write failing label tests**
 
-For every row, select `p0` from the first valid BBO after bar close and `p1` from the first BBO at/after four sleeve bars. Compute `log(p1/p0)` and a fixed-100-USDC point-in-time round-trip cost using fees, funding, and book impact. Assert short/flat/long thresholds exactly match design section 7.3 and samples with gaps/non-tradeable state are absent rather than imputed.
+For every row, consume the Rust-materialized `LabelObservation`, verify its source IDs/times and fixed-100-USDC long/short book walks, then compute `log(p1/p0)` and use its conservative cost probe. Assert short/flat/long thresholds exactly match design section 7.3 and samples with gaps/non-tradeable state are absent rather than imputed. A raw BBO/L2 lookup in Python is a test failure; those high-rate partitions may already have expired.
 
 - [ ] **Step 3: Verify failure**
 
@@ -183,7 +196,7 @@ Expected: FAIL because data modules are absent.
 
 - [ ] **Step 4: Implement immutable dataset builders**
 
-Return typed pandas frames with stable row IDs, explicit outcome timestamps, gross return, cost probe, and integer class `0=short,1=flat,2=long`. Refuse duplicated rows, timezone-naive timestamps, missing cost inputs, or any join whose source timestamp exceeds its row cutoff. Persist a data manifest with source partition digests and excluded-row reason counts.
+Return typed pandas frames with stable row IDs, explicit outcome timestamps, gross return, side-specific costs, conservative cost probe, and integer class `0=short,1=flat,2=long`. Refuse duplicated rows, timezone-naive timestamps, missing cost inputs, or any feature join whose source timestamp exceeds its row cutoff. Persist a data manifest with feature/label/archive partition digests and excluded-row reason counts.
 
 - [ ] **Step 5: Run tests and lint**
 
@@ -236,32 +249,43 @@ git commit -m "feat(ml): add purged temporal folds"
 **Files:**
 - Create: `ml/src/trench_ml/models/__init__.py`
 - Create: `ml/src/trench_ml/models/lightgbm.py`
+- Create: `ml/src/trench_ml/evaluation_bridge.py`
 - Create: `ml/tests/models/test_lightgbm.py`
+- Create: `ml/tests/test_evaluation_bridge.py`
+- Modify: `crates/trenchd/src/commands.rs`
 
 - [ ] **Step 1: Write failing deterministic-search tests**
 
-Train twice on the tiny fixture with the same seeds and assert identical predictions, chosen parameters, feature order, and model-text digest. Assert the search is exactly the Cartesian grid: leaves `{15,31}`, learning rate `{0.03,0.05}`, minimum leaf data `{200,1000}`, feature fraction `{0.7,1.0}`, L2 `{1,10}`; all other settings match the design. A changed seed must be declared in the manifest.
+Train twice on the tiny fixture with the same seeds and assert identical predictions, chosen parameters, feature order, and model-text digest. Assert the search is exactly the Cartesian grid: leaves `{15,31}`, learning rate `{0.03,0.05}`, minimum leaf data `{200,1000}`, feature fraction `{0.7,1.0}`, L2 `{1,10}`; all other settings match the design. A changed seed must be declared in the manifest. Write candidate predictions to Parquet, evaluate them twice through the Rust bridge, and assert byte-identical intents, sealed costs, fills, and net-expectancy results.
 
 - [ ] **Step 2: Verify failure**
 
-Run: `cd ml && uv run pytest tests/models/test_lightgbm.py -q`
+Run: `cd ml && uv run pytest tests/models/test_lightgbm.py tests/test_evaluation_bridge.py -q`
 
 Expected: FAIL because model training is absent.
 
 - [ ] **Step 3: Implement dual-head training and selection**
 
-Train one Huber regression (`alpha=0.9`) and one three-class model per sleeve. Use development-fold inverse-frequency class weights, `deterministic=true`, `force_col_wise=true`, at most 2,000 trees, early stopping 100, bagging fraction 0.8/frequency 1, declared NumPy/LightGBM seeds, and one native thread count recorded in the manifest. Score each candidate through the phase-1 paper-cost evaluator; select median inner-fold net expectancy then lower complexity. Refit only on the 305 development days.
+Add the authoritative command:
+
+```text
+trenchd evaluate-forecasts --config PATH --replay-manifest PATH --forecast-parquet PATH --output DIRECTORY
+```
+
+It verifies row/data/config/schema digests, replays forecasts through the same signal → sealed risk quote → cost acceptance → broker/ledger engine as runtime, and atomically emits trades, attributed costs, rejections, daily equity, and a result digest. It has no alternate sizing/fill implementation.
+
+`RustBrokerEvaluator` invokes that binary with an argv list (never a shell), explicit timeout/temp directory, and verifies the returned manifest/digests before exposing net expectancy. Train one Huber regression (`alpha=0.9`) and one three-class model per sleeve. Use development-fold inverse-frequency class weights, `deterministic=true`, `force_col_wise=true`, at most 2,000 trees, early stopping 100, bagging fraction 0.8/frequency 1, declared NumPy/LightGBM seeds, and one native thread count recorded in the manifest. Score every candidate only through this bridge; select median inner-fold net expectancy then lower complexity. Refit only on the 305 development days.
 
 - [ ] **Step 4: Run model tests**
 
-Run: `cd ml && uv run pytest tests/models/test_lightgbm.py -q && uv run ruff check src/trench_ml/models tests/models`
+Run: `cargo test -p trenchd commands::evaluate_forecasts_tests && cd ml && uv run pytest tests/models/test_lightgbm.py tests/test_evaluation_bridge.py -q && uv run ruff check src/trench_ml/models src/trench_ml/evaluation_bridge.py tests/models tests/test_evaluation_bridge.py`
 
 Expected: PASS. Tests may use a reduced fixture but cannot alter production grid definitions.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add ml/src/trench_ml/models ml/tests/models
+git add crates/trenchd/src/commands.rs ml/src/trench_ml/models ml/src/trench_ml/evaluation_bridge.py ml/tests/models ml/tests/test_evaluation_bridge.py
 git commit -m "feat(ml): train deterministic LightGBM heads"
 ```
 
@@ -314,7 +338,7 @@ git commit -m "feat(ml): freeze calibrated model artifacts"
 
 - [ ] **Step 1: Write failing worker protocol tests**
 
-Start the worker in a temporary directory; assert socket mode `0600`, length-prefixed MessagePack framing, maximum frame/row limits, exact request-response ID, model/config/schema digest echo, finite outputs, calibrated `short/flat/long` probabilities, regression point estimate, and directional conformal lower bound. Test stale, duplicate, oversized, truncated, wrong-UID (where supported), and deadline-cancelled requests.
+Start the worker in a temporary directory; assert socket mode `0600`, length-prefixed MessagePack framing, maximum frame/row limits, exact request-response ID, model/config/schema digest echo, finite outputs, calibrated `short/flat/long` probabilities, regression point estimate, and directional conformal lower bound. Register up to three immutable shadow artifacts by digest, request champion plus candidate inference in one bar batch, and prove candidate failure cannot alter champion output. Test stale, duplicate, oversized, truncated, wrong-UID (where supported), unregistered artifact, fourth candidate, digest collision, and deadline-cancelled requests.
 
 - [ ] **Step 2: Verify failure**
 
@@ -324,7 +348,9 @@ Expected: FAIL because the worker is absent.
 
 - [ ] **Step 3: Implement bounded inference**
 
-Load one verified champion artifact per sleeve at process start and never reload in place. Bind only an explicitly configured Unix path beneath a `0700` directory, remove only a stale socket owned by the current UID, cap concurrent requests with an asyncio semaphore, and use bounded frame reads. Return structured errors without stack traces or environment dumps. Candidate shadow artifacts are separate immutable registry entries and can never replace the champion pointer in this process.
+Load one verified champion artifact per sleeve at process start and never reload a digest in place. Bind only an explicitly configured Unix path beneath a `0700` directory, remove only a stale socket owned by the current UID, cap concurrent requests with an asyncio semaphore, and use bounded frame reads. Return structured errors without stack traces or environment dumps.
+
+Implement explicit `register_shadow`, `list_artifacts`, and `infer` payload types. Only the authenticated Rust daemon peer may register a content-addressed artifact path resolved beneath the configured model root with no symlink escape; the worker verifies all artifact/license/schema/config digests, loads at most three production-eligible shadows, and never changes the champion pointer. Inference requests name exact artifact digests and responses are keyed by digest. On restart the worker starts champion-only; the Rust handshake re-registers active database shadows before their next bar, with missed boundaries recorded rather than backfilled.
 
 - [ ] **Step 4: Generate compatibility fixtures and rerun**
 
@@ -352,7 +378,7 @@ git commit -m "feat(ml): serve frozen Unix-socket inference"
 
 - [ ] **Step 1: Write failing compatibility/deadline tests**
 
-Decode Python request/response fixtures in Rust and assert field-for-field parity; encode through the declared canonical field order and compare with the fixture bytes. Test unknown schema, stale response, digest mismatch, duplicate response ID, non-finite output, worker disconnect, and a fixed two-second default deadline. Assert every failure skips only that ML boundary while global and `rules_only` readiness remain unchanged.
+Decode Python request/response fixtures in Rust and assert field-for-field parity; encode through the declared canonical field order and compare with the fixture bytes. Test unknown schema/payload type, stale response, digest mismatch, duplicate response ID, non-finite output, worker disconnect, shadow registration/list recovery, candidate-only failure, and a fixed two-second default deadline. Assert champion failure skips only that ML boundary, candidate failure skips only that shadow, and global/`rules_only` readiness remain unchanged.
 
 - [ ] **Step 2: Verify failure**
 
@@ -362,7 +388,7 @@ Expected: FAIL because `MlClient` is absent.
 
 - [ ] **Step 3: Implement the bounded client**
 
-Add `rmp-serde` to the workspace and use a Unix stream, length-prefixed MessagePack, maximum frame/row limits, exact schema structs, one in-flight request per connection, and `tokio::time::timeout`. Construct each request from a frozen Rust feature batch and persist request timestamp before send; persist the response or failure with actual latency. Never retry a missed bar-close forecast or open TCP.
+Add `rmp-serde` to the workspace and use a Unix stream, length-prefixed MessagePack, maximum frame/row limits, exact schema structs, one in-flight request per connection, and `tokio::time::timeout`. Construct each request from a frozen Rust feature batch plus the registered champion/active-shadow digest list and persist request timestamps before send; persist every per-artifact response/failure with actual latency. Expose bounded register/list calls used by startup reconciliation. Never retry a missed bar-close forecast or open TCP.
 
 - [ ] **Step 4: Run Rust/Python contract tests**
 
@@ -387,7 +413,7 @@ git commit -m "feat(daemon): add scoped ML inference client"
 
 - [ ] **Step 1: Write failing entry/exit tests**
 
-Assert entry requires regression/class sign agreement, calibrated directional probability at least 0.58, one-sided 80% lower directional net return above zero, and predicted gross movement at least 1.5 times the current risk-sized full cost. Assert it uses the same ATR/swing stop, configured 2R target, four-bar timeout, and gated opposite-class exit as rules. Reject mismatched artifact/config/feature hashes and late forecasts.
+Assert an ML forecast first produces an un-sized `SignalCandidate`. After the engine obtains a sealed risk quote, entry requires regression/class sign agreement, calibrated directional probability at least 0.58, one-sided 80% lower directional net return above zero, and predicted gross movement at least 1.5 times the quote's public risk-sized full cost. Assert the strategy never receives quantity/leverage/margin or the sealed order and uses the same ATR/swing stop, configured 2R target, four-bar timeout, and gated opposite-class exit as rules. Reject mismatched artifact/config/feature hashes and late forecasts.
 
 - [ ] **Step 2: Write failing independence tests**
 
@@ -401,7 +427,7 @@ Expected: FAIL because the ML strategy/ledger path is absent.
 
 - [ ] **Step 4: Implement forecast events and ML arbitration**
 
-Record each accepted/failed response as an immutable decision input with its request ID and receive time. `MlStrategy` receives no rules scores and emits the same un-sized `OrderIntent` type. The existing risk/broker path is reused unchanged with independent state. At a missed/failed forecast, emit an auditable skip and continue rules processing.
+Record each accepted/failed response as an immutable decision input with its request ID and receive time. `MlStrategy` receives no rules scores, emits the same un-sized `SignalCandidate` type, and applies the common public-cost acceptance interface to produce an `OrderIntent` bound to an opaque quote ID. The existing sealed risk/broker path is reused unchanged with independent state. At a missed/failed forecast, emit an auditable skip and continue rules processing.
 
 - [ ] **Step 5: Run strategy and independence tests**
 
@@ -431,7 +457,7 @@ git commit -m "feat(strategy): add independent ML champion ledger"
 
 - [ ] **Step 1: Write failing metric tests**
 
-Use hand-calculated fixtures for net expectancy, Sharpe/Sortino/Calmar/Omega, maximum drawdown, ECE, multiclass Brier, PSI, asset/month concentration, and paired daily return. Test missing/NaN/zero-variance behavior explicitly; undefined metrics fail eligibility rather than become zero.
+Use hand-calculated fixtures for both the frozen rules report and ML trades: net expectancy, Sharpe/Sortino/Calmar/Omega, maximum drawdown, ECE, multiclass Brier, PSI, asset/month concentration, and paired daily return. Test missing/NaN/zero-variance behavior explicitly; undefined required metrics fail eligibility rather than become zero, while ML-only calibration metrics are explicitly not applicable to rules.
 
 - [ ] **Step 2: Write failing robustness tests**
 
@@ -439,7 +465,7 @@ Use seeded stationary bootstrap from `arch`, block-trade Monte Carlo, cost/laten
 
 - [ ] **Step 3: Write failing gate-table tests**
 
-Express every design section 10.3 threshold in a typed gate table. Test each gate failing alone: 90 days, 100 trades, 95% bootstrap lower mean above zero, DSR probability 0.95, PBO 0.20, positive 1.5x expectancy, no 2x breaker, 35% asset/40% month concentration, positive without best asset, ECE/weekly drift/PSI limits, zero liquidation, no 8% breaker, stress survival, and paired lower bound/no-worse drawdown for replacements.
+Express every design section 10.3 threshold in a typed gate table keyed by `strategy_kind=rules|ml`. Test each common gate failing alone: 90 days, 100 trades, 95% bootstrap lower mean above zero, DSR probability 0.95, PBO 0.20, positive 1.5x expectancy, no 2x breaker, 35% asset/40% month concentration, positive without best asset, zero liquidation, no 8% breaker, stress survival, and paired lower bound/no-worse drawdown for replacements. Test ECE/weekly drift/PSI only for ML and prove they cannot accidentally block or silently pass a required common rules gate.
 
 - [ ] **Step 4: Verify failure**
 
@@ -449,7 +475,7 @@ Expected: FAIL because evaluation modules are absent.
 
 - [ ] **Step 5: Implement deterministic reports**
 
-Reports must separate gross alpha, protocol fee, builder fee, spread, depth, latency, funding, and liquidation; include every gate as pass/fail/not-applicable plus evidence digest; and distinguish offline outer-fold, provisional bootstrap, forward absolute, and paired replacement eligibility. Never auto-relax or auto-promote.
+The evaluator accepts either the phase-1 content-addressed `rules-artifact.json` plus its authoritative Rust trade streams or an ML artifact plus its authoritative forecast evaluation streams. Reports must separate gross alpha, protocol fee, builder fee, spread, depth, latency, funding, and liquidation; include every gate as pass/fail/not-applicable plus evidence digest; and distinguish offline outer-fold, provisional bootstrap, forward absolute, and paired replacement eligibility for each strategy kind. Rules and ML never share selection results or signals. Never auto-relax or auto-promote.
 
 - [ ] **Step 6: Run evaluation tests**
 
@@ -467,42 +493,57 @@ git commit -m "feat(research): add robust promotion gates"
 ### Task 11: Add immutable shadow-run persistence and execution
 
 **Files:**
-- Create: `crates/trench-storage/migrations/0002_ml.sql`
-- Create: `crates/trench-storage/src/ml.rs`
+- Create: `crates/trench-storage/migrations/0002_strategy_validation.sql`
+- Create: `crates/trench-storage/src/strategy.rs`
 - Modify: `crates/trench-storage/src/lib.rs`
 - Create: `crates/trench-core/src/shadow.rs`
 - Modify: `crates/trench-core/src/lib.rs`
 - Modify: `crates/trench-core/src/engine.rs`
+- Modify: `crates/trenchd/src/admin.rs`
+- Modify: `crates/trenchd/src/app.rs`
+- Modify: `crates/trenchd/src/commands.rs`
+- Modify: `crates/trenchd/src/ml_client.rs`
 - Test: storage and core unit tests
 
 - [ ] **Step 1: Write failing registration tests**
 
-Register a candidate with immutable code/config/feature/model/data-cutoff/license digests before its first prediction. Assert an altered digest, late registration, more than three production-eligible shadows, duplicate active version, research-only artifact, or mutation after outcomes is rejected.
+Register both a rules-config candidate and an ML artifact with immutable kind/code/config/feature/model-or-rules/data-cutoff/license digests before their first decision. Assert an altered digest, late registration, more than three production-eligible shadows in aggregate, duplicate active version, research-only artifact, or mutation after outcomes is rejected. Test versioned admin commands for register/list/pause and `forward activate`; non-owner, stale report, non-reconciled run, and already-started outcomes fail closed.
 
 - [ ] **Step 2: Write failing shadow-isolation tests**
 
-Drive a shadow through the same market events, broker, and risk engine with its own synthetic 100 USDC. Assert it cannot affect visible ledger state, universe, readiness, or order source; its timestamped prediction must precede the corresponding outcome. Replay must reproduce it from recorded predictions.
+Drive rules and ML shadows through the same market events, sealed quote flow, broker, and risk engine with separate synthetic 100 USDC states. Assert they cannot affect visible ledger state, universe, readiness, or order source; each timestamped rules signal/ML prediction must be durably journaled before its corresponding broker outcome. Restart the worker and daemon, reconcile active registrations, and assert scheduling resumes only after exact artifact handshakes. Replay must reproduce shadows from recorded decisions without invoking Python.
 
 - [ ] **Step 3: Verify failure**
 
-Run: `cargo test -p trench-storage ml::tests && cargo test -p trench-core shadow::tests`
+Run: `cargo test -p trench-storage strategy::tests && cargo test -p trench-core shadow::tests`
 
-Expected: FAIL because ML tables/shadow state are absent.
+Expected: FAIL because strategy-validation tables/shadow state are absent.
 
 - [ ] **Step 4: Implement the generic evaluation-only lifecycle**
 
-The migration adds `model_artifacts`, `artifact_files`, `shadow_runs`, `shadow_predictions`, `shadow_ledger_transitions`, and `promotion_reports` with immutable triggers/constraints. `ShadowRun` wraps an isolated engine/ledger and is never a `LedgerId`; expose results only to evaluation/reporting. Active shadow count is checked transactionally.
+The migration adds generic `strategy_artifacts` (`kind=rules|ml`), `artifact_files`, `shadow_runs`, `shadow_decisions`, `shadow_ledger_transitions`, `forward_runs`, and `promotion_reports` with immutable triggers/constraints. `ShadowRun` wraps an isolated engine/ledger and is never a `LedgerId`; expose results only to evaluation/reporting. Active shadow count is checked transactionally.
+
+Extend the authenticated admin protocol with:
+
+```text
+trenchd shadow register --socket PATH --kind rules|ml --artifact-manifest PATH
+trenchd shadow list --socket PATH
+trenchd shadow pause --socket PATH --run-id ID --reason TEXT
+trenchd forward activate --socket PATH --run-manifest PATH --burn-in-report PATH
+```
+
+For ML, the daemon first asks the worker to load/verify the inert content-addressed artifact, then atomically registers it with an activation boundary before any prediction can be requested. For rules, it verifies the frozen rules artifact locally. At each completed bar the daemon schedules visible champion plus every active ML shadow in one bounded inference batch and computes active rules shadows locally; it journals each decision before routing it through that shadow's isolated engine. Worker/candidate failure pauses only that shadow. Startup reconciles database registrations with the worker list before scheduling.
 
 - [ ] **Step 5: Run persistence/isolation tests**
 
-Run: `cargo test -p trench-storage ml::tests && cargo test -p trench-core shadow::tests`
+Run: `cargo test -p trench-storage strategy::tests && cargo test -p trench-core shadow::tests && cargo test -p trenchd admin::shadow_tests`
 
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/trench-storage crates/trench-core
+git add crates/trench-storage crates/trench-core crates/trenchd
 git commit -m "feat(research): add isolated forward shadow runs"
 ```
 
@@ -554,14 +595,14 @@ Test these commands against temporary paths:
 
 ```text
 trench-ml dataset build --config ...
+trench-ml config check --config ...
 trench-ml train --config ... --sleeve 15m|1h
-trench-ml evaluate --artifact ... --manifest ...
-trench-ml shadow register --artifact ...
+trench-ml evaluate --kind rules|ml --artifact ... --manifest ...
 trench-ml promote --artifact ... --report ... --target ...
 trench-ml serve --config ...
 ```
 
-Assert nonzero exit for insufficient history, incomplete folds, failed gate, research-only license, stale report/artifact mismatch, existing target, and non-atomic target filesystem. Assert `promote` requires an explicit report path and never runs from `evaluate`.
+Rust admin CLI tests from Task 11 cover shadow registration and forward activation. Here assert nonzero exit for insufficient history, incomplete folds, failed common/rules/ML gates, research-only license, stale report/artifact mismatch, existing target, and non-atomic target filesystem. Assert `promote` requires an explicit report path and never runs from `evaluate`.
 
 - [ ] **Step 2: Verify failure**
 
@@ -571,7 +612,7 @@ Expected: FAIL because CLI entry points are absent.
 
 - [ ] **Step 3: Implement orchestration without hidden state**
 
-Each command resolves one strict config, prints a concise structured summary, writes a manifest/report atomically, and exits. `promote` verifies absolute/paired requirements, artifact/report/data/code/license digests, then installs into a new immutable directory and atomically replaces `champion.json`; it never edits a model. LightGBM v1 may use the provisional no-incumbent path only after offline eligibility and must be labeled provisional until 90 days/100 forward trades pass.
+Each command resolves one strict config, prints a concise structured summary, writes a manifest/report atomically, and exits. `evaluate` accepts the frozen rules artifact/trade streams or an ML artifact/forecast streams and applies the correct typed gate table. `promote` verifies absolute/paired requirements, artifact/report/data/code/license digests, then installs into a new immutable staging directory and emits an approved release pointer for an explicit operator activation; it never edits a model or running strategy. LightGBM v1 may use the provisional no-incumbent path only after offline eligibility and must be labeled provisional until 90 days/100 forward trades pass. Rules replacements always require the same absolute and paired forward evidence before an approved release is emitted.
 
 - [ ] **Step 4: Run CLI quality checks**
 
@@ -635,4 +676,4 @@ git commit -m "test: validate independent rules and ML ledgers"
 
 ## Phase-2 completion gate
 
-Phase 2 is complete when both visible ledgers replay independently through the shared risk/broker, Python and Rust agree on a frozen artifact, late/bad inference pauses only ML, all research outputs are point-in-time and reproducible, and shadow/promotion/license gates fail closed. Real forward promotion remains impossible until the untouched 90-day/100-trade evidence exists; that waiting period is an experimental requirement, not unfinished software.
+Phase 2 is complete when both visible ledgers replay independently through the shared sealed-quote risk/broker, Python and Rust agree on a frozen ML artifact, the frozen rules artifact has passed its separate generic robustness report, late/bad inference pauses only ML, all research outputs are point-in-time and reproducible, active rules/ML shadows are automatically scheduled and recovered, and shadow/promotion/license gates fail closed. Real forward promotion remains impossible until the untouched 90-day/100-trade evidence exists; that waiting period is an experimental requirement, not unfinished software.
