@@ -506,22 +506,22 @@ impl CandleAggregator {
             });
         }
 
+        self.pending.keys().try_for_each(|key| {
+            key.open_time
+                .checked_add(key.interval.duration())
+                .map(|_| ())
+                .map_err(CandleError::from)
+        })?;
         let complete = self
             .pending
             .keys()
-            .map(|key| {
+            .filter(|key| {
                 key.open_time
                     .checked_add(key.interval.duration())
-                    .map(|close| (key.clone(), close))
-                    .map_err(CandleError::from)
+                    .is_ok_and(|close| close <= watermark)
             })
-            .collect::<Result<Vec<_>, _>>()
-            .map(|pending| {
-                pending
-                    .into_iter()
-                    .filter_map(|(key, close)| (close <= watermark).then_some(key))
-                    .collect::<Vec<_>>()
-            })?;
+            .cloned()
+            .collect::<Vec<_>>();
         let candles = complete
             .iter()
             .map(|key| {
@@ -774,6 +774,31 @@ mod tests {
         assert_eq!(aggregator.finalized, finalized_before);
         assert_eq!(aggregator.finalized_order, finalized_order_before);
         assert_eq!(aggregator.watermark, None);
+    }
+
+    #[test]
+    fn finalization_with_many_future_buckets_keeps_all_pending_buckets() {
+        let mut aggregator = CandleAggregator::new();
+        for trade_id in 1_u64..=2_048 {
+            let event_time = i128::from(trade_id) * 900_000_000_000 + 1;
+            aggregator
+                .ingest(&trade(event_time, trade_id, dec!(100)))
+                .expect("future pending trade must be accepted");
+        }
+        let pending_before = aggregator.pending.clone();
+        let seen_before = aggregator.seen.clone();
+        let hourly_trade_ids_before = aggregator.hourly_trade_ids.clone();
+
+        assert!(
+            aggregator
+                .complete_through(timestamp(0))
+                .expect("a watermark before every pending close must be valid")
+                .is_empty()
+        );
+        assert_eq!(aggregator.pending, pending_before);
+        assert_eq!(aggregator.seen, seen_before);
+        assert_eq!(aggregator.hourly_trade_ids, hourly_trade_ids_before);
+        assert_eq!(aggregator.watermark, Some(timestamp(0)));
     }
 
     #[test]

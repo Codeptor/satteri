@@ -1653,6 +1653,10 @@ impl CommonFeatureEngine {
         let required_primary = derivative_bars.checked_add(4)?;
         let primary_history = self.candle_history(market, sleeve, as_of_time);
         let primary_history = contiguous_tail(&primary_history, required_primary, sleeve)?;
+        primary_history
+            .iter()
+            .all(|candle| candle_was_available_at_close(candle))
+            .then_some(())?;
         (primary_history.last()?.close_time().ok()? == as_of_time).then_some(())?;
         let sampled_contexts =
             sampled_sources(&self.context_samples, market, sleeve, primary_history)?;
@@ -1721,6 +1725,10 @@ impl CommonFeatureEngine {
             MAX_HOURLY_CANDLE_HISTORY,
             CandleInterval::OneHour,
         )?;
+        hourly_history
+            .iter()
+            .all(|candle| candle_was_available_at_close(candle))
+            .then_some(())?;
         let hourly_as_of_time = hourly_history.last()?.close_time().ok()?;
         (hourly_as_of_time.value() == floor_one_hour(as_of_time)).then_some(())?;
         let current_hourly_realized_volatility_20 =
@@ -2793,6 +2801,12 @@ fn contiguous_tail<'a>(
     Some(tail)
 }
 
+fn candle_was_available_at_close(candle: &Candle) -> bool {
+    candle
+        .close_time()
+        .is_ok_and(|close| candle.source_available_at() <= close)
+}
+
 fn floor_one_hour(as_of_time: TimestampNs) -> i64 {
     let hour_ns = CandleInterval::OneHour.duration().value();
     as_of_time.value() - as_of_time.value() % hour_ns
@@ -2930,6 +2944,9 @@ fn verify_candle_provenance_history(
         if candle.open_time_ns != expected_open {
             return Err(LongHorizonHistoryError::NonContiguous { field });
         }
+        let expected_close = expected_open
+            .checked_add(interval_ns)
+            .ok_or(LongHorizonHistoryError::TimeArithmetic)?;
         for (timestamp, timestamp_field) in [
             (candle.open_time_ns, "candle open time"),
             (candle.first_event_time_ns, "candle first event time"),
@@ -2965,6 +2982,7 @@ fn verify_candle_provenance_history(
             || first > last
             || candle.source_available_at_ns < candle.first_received_at_ns
             || candle.source_available_at_ns < candle.last_received_at_ns
+            || candle.source_available_at_ns > expected_close
             || candle.source_available_at_ns > as_of_time.value()
         {
             return Err(LongHorizonHistoryError::InvalidCandleProvenance { field });
@@ -4689,6 +4707,9 @@ mod tests {
         assert_eq!(history.funding_history().len(), 30 * 24 * 4);
         assert!(history.completeness().is_complete());
         assert!(!history.input_digest().is_empty());
+        history
+            .verify()
+            .expect("a constructed long-horizon history must satisfy its wire invariant");
         assert!(
             history
                 .premium_history()
@@ -4700,6 +4721,64 @@ mod tests {
         let decoded: super::LongHorizonFeatureHistory =
             serde_json::from_str(&encoded).expect("history must deserialize");
         assert_eq!(decoded, history);
+    }
+
+    #[test]
+    fn delayed_older_hourly_candle_fails_closed_before_entering_realized_volatility_history() {
+        const DELAYED_HOURLY_FINAL_TRADE: u64 = 19;
+
+        let market = market("BTC");
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        let decision = populate_long_history(
+            &mut engine,
+            &mut aggregator,
+            market.clone(),
+            ReceiptDelays {
+                direct_at: None,
+                trade_at: Some(DELAYED_HOURLY_FINAL_TRADE),
+            },
+        );
+
+        assert!(
+            engine
+                .long_horizon_history_at(
+                    &market,
+                    crate::event::CandleInterval::FifteenMinutes,
+                    decision,
+                )
+                .is_none(),
+            "an old hourly candle received after its own close must never rewrite the 90-day distribution"
+        );
+    }
+
+    #[test]
+    fn delayed_older_primary_candle_fails_closed_before_entering_thirty_day_history() {
+        const DELAYED_PRIMARY_TRADE: u64 = 8_622;
+
+        let market = market("BTC");
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        let decision = populate_long_history(
+            &mut engine,
+            &mut aggregator,
+            market.clone(),
+            ReceiptDelays {
+                direct_at: None,
+                trade_at: Some(DELAYED_PRIMARY_TRADE),
+            },
+        );
+
+        assert!(
+            engine
+                .long_horizon_history_at(
+                    &market,
+                    crate::event::CandleInterval::FifteenMinutes,
+                    decision,
+                )
+                .is_none(),
+            "an old primary candle received after its own close must never rewrite the 30-day history"
+        );
     }
 
     #[test]
