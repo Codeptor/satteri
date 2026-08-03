@@ -12,4 +12,7 @@ pub use normalize::{
     AssetContext, BookLevel, Candle, FundingRecord, L2Book, MetaAndAssetContexts, PerpAsset,
     SignedRate, VenueMaxLeverage,
 };
-pub use ws::{WsClient, WsConfig, WsError, WsLimits};
+pub use ws::{
+    GapClosed, GapEvent, GapExhausted, GapOpened, GapReason, RejectedUpdate, RejectionReason,
+    WsClient, WsConfig, WsError, WsLimits, WsOutput, WsStream,
+};

@@ -28,14 +28,20 @@ fn websocket_config_rejects_empty_or_duplicate_market_universes() {
             market: market("BTC")
         })
     );
+    assert_eq!(
+        WsConfig::new(vec![market("@107")]),
+        Err(WsError::NonNativeMarket {
+            market: market("@107")
+        })
+    );
 }
 
 #[test]
 fn websocket_limits_stay_below_public_connection_and_subscription_budgets() {
-    let too_many_markets = (0..334).map(|index| market(&format!("M{index}"))).collect();
+    let too_many_markets = (0..34).map(|index| market(&format!("M{index}"))).collect();
     assert_eq!(
         WsConfig::new(too_many_markets),
-        Err(WsError::TooManyMarkets { max_markets: 333 })
+        Err(WsError::TooManyMarkets { max_markets: 33 })
     );
 
     assert_eq!(
@@ -52,6 +58,22 @@ fn websocket_limits_stay_below_public_connection_and_subscription_budgets() {
         Err(WsError::InvalidConfig {
             field: "heartbeat_interval",
             requirement: "must be shorter than 60 seconds",
+        })
+    );
+    assert_eq!(
+        WsLimits::new(
+            Duration::from_secs(5),
+            Duration::from_secs(45),
+            Duration::from_secs(25),
+            Duration::from_secs(3),
+            Duration::from_secs(30),
+            5,
+            64 * 1024,
+            32,
+        ),
+        Err(WsError::InvalidConfig {
+            field: "reconnect_min_delay",
+            requirement: "must be at least 4 seconds",
         })
     );
 }

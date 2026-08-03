@@ -104,4 +104,49 @@ trench-hyperliquid = {{ path = {:?} }}
         stderr.contains("new_loopback_for_test"),
         "release compiler failure did not identify the test hook: {stderr}"
     );
+
+    for (method, source) in [
+        (
+            "new_for_test",
+            r#"fn main() {
+    let config = trench_hyperliquid::WsConfig::new(Vec::new()).unwrap();
+    let _ = trench_hyperliquid::WsClient::new_for_test(config, "ws://127.0.0.1:32123".to_owned());
+}
+"#,
+        ),
+        (
+            "post",
+            r#"fn main() {
+    let config = trench_hyperliquid::WsConfig::new(Vec::new()).unwrap();
+    let client = trench_hyperliquid::WsClient::new(config);
+    let _ = client.post();
+}
+"#,
+        ),
+        (
+            "action",
+            r#"fn main() {
+    let config = trench_hyperliquid::WsConfig::new(Vec::new()).unwrap();
+    let client = trench_hyperliquid::WsClient::new(config);
+    let _ = client.action();
+}
+"#,
+        ),
+        (
+            "new",
+            r#"fn main() {
+    let config = trench_hyperliquid::WsConfig::new(Vec::new()).unwrap();
+    let _ = trench_hyperliquid::WsClient::new(config, "wss://example.invalid/ws");
+}
+"#,
+        ),
+    ] {
+        let output = cargo_check(project, &target, source, true);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "`{method}` unexpectedly public");
+        assert!(
+            stderr.contains(method),
+            "release compiler failure did not identify `{method}`: {stderr}"
+        );
+    }
 }
