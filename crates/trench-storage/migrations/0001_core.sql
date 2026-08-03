@@ -56,7 +56,8 @@ CREATE TABLE events (
     event_time_ns INTEGER NOT NULL CHECK (event_time_ns >= 0),
     event_kind TEXT NOT NULL CHECK (length(event_kind) BETWEEN 1 AND 64),
     payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
-    UNIQUE (run_id, event_time_ns, event_id)
+    UNIQUE (run_id, event_time_ns, event_id),
+    UNIQUE (run_id, event_id)
 ) STRICT;
 
 CREATE TABLE universe_snapshots (
@@ -70,19 +71,20 @@ CREATE TABLE universe_snapshots (
 CREATE TABLE feature_snapshots (
     snapshot_id TEXT PRIMARY KEY NOT NULL CHECK (length(snapshot_id) BETWEEN 1 AND 128),
     run_id TEXT NOT NULL REFERENCES runs(run_id),
-    event_id TEXT NOT NULL REFERENCES events(event_id),
+    event_id TEXT NOT NULL,
     as_of_time_ns INTEGER NOT NULL CHECK (as_of_time_ns >= 0),
     market TEXT NOT NULL CHECK (length(market) BETWEEN 1 AND 32),
     sleeve TEXT NOT NULL CHECK (sleeve IN ('15m', '1h')),
     schema_hash TEXT NOT NULL CHECK (length(schema_hash) BETWEEN 1 AND 128),
     snapshot_json TEXT NOT NULL CHECK (json_valid(snapshot_json)),
-    UNIQUE (run_id, market, sleeve, as_of_time_ns)
+    UNIQUE (run_id, market, sleeve, as_of_time_ns),
+    FOREIGN KEY (run_id, event_id) REFERENCES events(run_id, event_id)
 ) STRICT;
 
 CREATE TABLE signals (
     signal_id TEXT PRIMARY KEY NOT NULL CHECK (length(signal_id) BETWEEN 1 AND 128),
     run_id TEXT NOT NULL REFERENCES runs(run_id),
-    event_id TEXT NOT NULL REFERENCES events(event_id),
+    event_id TEXT NOT NULL,
     ledger_id TEXT NOT NULL CHECK (ledger_id IN ('rules_only', 'ml_champion')),
     as_of_time_ns INTEGER NOT NULL CHECK (as_of_time_ns >= 0),
     market TEXT NOT NULL CHECK (length(market) BETWEEN 1 AND 32),
@@ -90,38 +92,42 @@ CREATE TABLE signals (
     direction TEXT NOT NULL CHECK (direction IN ('long', 'flat', 'short')),
     score_decimal TEXT NOT NULL CHECK (typeof(score_decimal) = 'text' AND length(score_decimal) BETWEEN 1 AND 128 AND instr(score_decimal, char(0)) = 0 AND score_decimal NOT GLOB '*[^!-~]*' AND json_valid(score_decimal) AND substr(score_decimal, 1, 1) GLOB '[-0-9]' AND score_decimal NOT GLOB '*[eE]*' AND score_decimal <> '-0' AND (instr(score_decimal, '.') = 0 OR substr(score_decimal, -1, 1) <> '0')),
     explanation_json TEXT NOT NULL CHECK (json_valid(explanation_json)),
-    UNIQUE (run_id, ledger_id, event_id, signal_id)
+    UNIQUE (run_id, ledger_id, event_id, signal_id),
+    FOREIGN KEY (run_id, event_id) REFERENCES events(run_id, event_id)
 ) STRICT;
 
 CREATE TABLE order_intents (
     intent_id TEXT PRIMARY KEY NOT NULL CHECK (length(intent_id) BETWEEN 1 AND 128),
     run_id TEXT NOT NULL REFERENCES runs(run_id),
-    event_id TEXT NOT NULL REFERENCES events(event_id),
+    event_id TEXT NOT NULL,
     ledger_id TEXT NOT NULL CHECK (ledger_id IN ('rules_only', 'ml_champion')),
     created_at_ns INTEGER NOT NULL CHECK (created_at_ns >= 0),
     market TEXT NOT NULL CHECK (length(market) BETWEEN 1 AND 32),
     side TEXT NOT NULL CHECK (side IN ('buy', 'sell')),
     quantity_decimal TEXT NOT NULL CHECK (typeof(quantity_decimal) = 'text' AND length(quantity_decimal) BETWEEN 1 AND 128 AND instr(quantity_decimal, char(0)) = 0 AND quantity_decimal NOT GLOB '*[^!-~]*' AND json_valid(quantity_decimal) AND substr(quantity_decimal, 1, 1) GLOB '[-0-9]' AND quantity_decimal NOT GLOB '*[eE]*' AND quantity_decimal <> '-0' AND (instr(quantity_decimal, '.') = 0 OR substr(quantity_decimal, -1, 1) <> '0')),
     expected_price_decimal TEXT NOT NULL CHECK (typeof(expected_price_decimal) = 'text' AND length(expected_price_decimal) BETWEEN 1 AND 128 AND instr(expected_price_decimal, char(0)) = 0 AND expected_price_decimal NOT GLOB '*[^!-~]*' AND json_valid(expected_price_decimal) AND substr(expected_price_decimal, 1, 1) GLOB '[-0-9]' AND expected_price_decimal NOT GLOB '*[eE]*' AND expected_price_decimal <> '-0' AND (instr(expected_price_decimal, '.') = 0 OR substr(expected_price_decimal, -1, 1) <> '0')),
-    UNIQUE (run_id, ledger_id, event_id, intent_id)
+    UNIQUE (run_id, ledger_id, event_id, intent_id),
+    UNIQUE (run_id, ledger_id, intent_id),
+    FOREIGN KEY (run_id, event_id) REFERENCES events(run_id, event_id)
 ) STRICT;
 
 CREATE TABLE risk_decisions (
     decision_id TEXT PRIMARY KEY NOT NULL CHECK (length(decision_id) BETWEEN 1 AND 128),
     run_id TEXT NOT NULL REFERENCES runs(run_id),
-    event_id TEXT NOT NULL REFERENCES events(event_id),
+    event_id TEXT NOT NULL,
     ledger_id TEXT NOT NULL CHECK (ledger_id IN ('rules_only', 'ml_champion')),
     decided_at_ns INTEGER NOT NULL CHECK (decided_at_ns >= 0),
     outcome TEXT NOT NULL CHECK (outcome IN ('accepted', 'rejected')),
     reason_code TEXT NOT NULL CHECK (length(reason_code) BETWEEN 1 AND 64),
     details_json TEXT NOT NULL CHECK (json_valid(details_json)),
-    UNIQUE (run_id, ledger_id, event_id, decision_id)
+    UNIQUE (run_id, ledger_id, event_id, decision_id),
+    FOREIGN KEY (run_id, event_id) REFERENCES events(run_id, event_id)
 ) STRICT;
 
 CREATE TABLE paper_orders (
     order_id TEXT PRIMARY KEY NOT NULL CHECK (length(order_id) BETWEEN 1 AND 128),
     run_id TEXT NOT NULL REFERENCES runs(run_id),
-    intent_id TEXT NOT NULL REFERENCES order_intents(intent_id),
+    intent_id TEXT NOT NULL,
     ledger_id TEXT NOT NULL CHECK (ledger_id IN ('rules_only', 'ml_champion')),
     created_at_ns INTEGER NOT NULL CHECK (created_at_ns >= 0),
     market TEXT NOT NULL CHECK (length(market) BETWEEN 1 AND 32),
@@ -129,21 +135,26 @@ CREATE TABLE paper_orders (
     status TEXT NOT NULL CHECK (status IN ('open', 'partially_filled', 'filled', 'cancelled', 'rejected')),
     quantity_decimal TEXT NOT NULL CHECK (typeof(quantity_decimal) = 'text' AND length(quantity_decimal) BETWEEN 1 AND 128 AND instr(quantity_decimal, char(0)) = 0 AND quantity_decimal NOT GLOB '*[^!-~]*' AND json_valid(quantity_decimal) AND substr(quantity_decimal, 1, 1) GLOB '[-0-9]' AND quantity_decimal NOT GLOB '*[eE]*' AND quantity_decimal <> '-0' AND (instr(quantity_decimal, '.') = 0 OR substr(quantity_decimal, -1, 1) <> '0')),
     limit_price_decimal TEXT NOT NULL CHECK (typeof(limit_price_decimal) = 'text' AND length(limit_price_decimal) BETWEEN 1 AND 128 AND instr(limit_price_decimal, char(0)) = 0 AND limit_price_decimal NOT GLOB '*[^!-~]*' AND json_valid(limit_price_decimal) AND substr(limit_price_decimal, 1, 1) GLOB '[-0-9]' AND limit_price_decimal NOT GLOB '*[eE]*' AND limit_price_decimal <> '-0' AND (instr(limit_price_decimal, '.') = 0 OR substr(limit_price_decimal, -1, 1) <> '0')),
-    UNIQUE (run_id, ledger_id, order_id)
+    UNIQUE (run_id, ledger_id, order_id),
+    FOREIGN KEY (run_id, ledger_id, intent_id)
+        REFERENCES order_intents(run_id, ledger_id, intent_id)
 ) STRICT;
 
 CREATE TABLE fills (
     fill_id TEXT PRIMARY KEY NOT NULL CHECK (length(fill_id) BETWEEN 1 AND 128),
     run_id TEXT NOT NULL REFERENCES runs(run_id),
-    event_id TEXT NOT NULL REFERENCES events(event_id),
-    order_id TEXT NOT NULL REFERENCES paper_orders(order_id),
+    event_id TEXT NOT NULL,
+    order_id TEXT NOT NULL,
     ledger_id TEXT NOT NULL CHECK (ledger_id IN ('rules_only', 'ml_champion')),
     fill_time_ns INTEGER NOT NULL CHECK (fill_time_ns >= 0),
     price_decimal TEXT NOT NULL CHECK (typeof(price_decimal) = 'text' AND length(price_decimal) BETWEEN 1 AND 128 AND instr(price_decimal, char(0)) = 0 AND price_decimal NOT GLOB '*[^!-~]*' AND json_valid(price_decimal) AND substr(price_decimal, 1, 1) GLOB '[-0-9]' AND price_decimal NOT GLOB '*[eE]*' AND price_decimal <> '-0' AND (instr(price_decimal, '.') = 0 OR substr(price_decimal, -1, 1) <> '0')),
     quantity_decimal TEXT NOT NULL CHECK (typeof(quantity_decimal) = 'text' AND length(quantity_decimal) BETWEEN 1 AND 128 AND instr(quantity_decimal, char(0)) = 0 AND quantity_decimal NOT GLOB '*[^!-~]*' AND json_valid(quantity_decimal) AND substr(quantity_decimal, 1, 1) GLOB '[-0-9]' AND quantity_decimal NOT GLOB '*[eE]*' AND quantity_decimal <> '-0' AND (instr(quantity_decimal, '.') = 0 OR substr(quantity_decimal, -1, 1) <> '0')),
     fee_decimal TEXT NOT NULL CHECK (typeof(fee_decimal) = 'text' AND length(fee_decimal) BETWEEN 1 AND 128 AND instr(fee_decimal, char(0)) = 0 AND fee_decimal NOT GLOB '*[^!-~]*' AND json_valid(fee_decimal) AND substr(fee_decimal, 1, 1) GLOB '[-0-9]' AND fee_decimal NOT GLOB '*[eE]*' AND fee_decimal <> '-0' AND (instr(fee_decimal, '.') = 0 OR substr(fee_decimal, -1, 1) <> '0')),
     liquidity TEXT NOT NULL CHECK (liquidity IN ('maker', 'taker')),
-    UNIQUE (run_id, ledger_id, event_id, fill_id)
+    UNIQUE (run_id, ledger_id, event_id, fill_id),
+    FOREIGN KEY (run_id, event_id) REFERENCES events(run_id, event_id),
+    FOREIGN KEY (run_id, ledger_id, order_id)
+        REFERENCES paper_orders(run_id, ledger_id, order_id)
 ) STRICT;
 
 CREATE TABLE positions (
@@ -158,19 +169,23 @@ CREATE TABLE positions (
     entry_price_decimal TEXT NOT NULL CHECK (typeof(entry_price_decimal) = 'text' AND length(entry_price_decimal) BETWEEN 1 AND 128 AND instr(entry_price_decimal, char(0)) = 0 AND entry_price_decimal NOT GLOB '*[^!-~]*' AND json_valid(entry_price_decimal) AND substr(entry_price_decimal, 1, 1) GLOB '[-0-9]' AND entry_price_decimal NOT GLOB '*[eE]*' AND entry_price_decimal <> '-0' AND (instr(entry_price_decimal, '.') = 0 OR substr(entry_price_decimal, -1, 1) <> '0')),
     realized_pnl_decimal TEXT NOT NULL CHECK (typeof(realized_pnl_decimal) = 'text' AND length(realized_pnl_decimal) BETWEEN 1 AND 128 AND instr(realized_pnl_decimal, char(0)) = 0 AND realized_pnl_decimal NOT GLOB '*[^!-~]*' AND json_valid(realized_pnl_decimal) AND substr(realized_pnl_decimal, 1, 1) GLOB '[-0-9]' AND realized_pnl_decimal NOT GLOB '*[eE]*' AND realized_pnl_decimal <> '-0' AND (instr(realized_pnl_decimal, '.') = 0 OR substr(realized_pnl_decimal, -1, 1) <> '0')),
     unrealized_pnl_decimal TEXT NOT NULL CHECK (typeof(unrealized_pnl_decimal) = 'text' AND length(unrealized_pnl_decimal) BETWEEN 1 AND 128 AND instr(unrealized_pnl_decimal, char(0)) = 0 AND unrealized_pnl_decimal NOT GLOB '*[^!-~]*' AND json_valid(unrealized_pnl_decimal) AND substr(unrealized_pnl_decimal, 1, 1) GLOB '[-0-9]' AND unrealized_pnl_decimal NOT GLOB '*[eE]*' AND unrealized_pnl_decimal <> '-0' AND (instr(unrealized_pnl_decimal, '.') = 0 OR substr(unrealized_pnl_decimal, -1, 1) <> '0')),
-    UNIQUE (run_id, ledger_id, market, position_id)
+    UNIQUE (run_id, ledger_id, market, position_id),
+    UNIQUE (run_id, ledger_id, position_id)
 ) STRICT;
 
 CREATE TABLE funding_entries (
     entry_id TEXT PRIMARY KEY NOT NULL CHECK (length(entry_id) BETWEEN 1 AND 128),
     run_id TEXT NOT NULL REFERENCES runs(run_id),
-    event_id TEXT NOT NULL REFERENCES events(event_id),
-    position_id TEXT NOT NULL REFERENCES positions(position_id),
+    event_id TEXT NOT NULL,
+    position_id TEXT NOT NULL,
     ledger_id TEXT NOT NULL CHECK (ledger_id IN ('rules_only', 'ml_champion')),
     funding_time_ns INTEGER NOT NULL CHECK (funding_time_ns >= 0),
     rate_decimal TEXT NOT NULL CHECK (typeof(rate_decimal) = 'text' AND length(rate_decimal) BETWEEN 1 AND 128 AND instr(rate_decimal, char(0)) = 0 AND rate_decimal NOT GLOB '*[^!-~]*' AND json_valid(rate_decimal) AND substr(rate_decimal, 1, 1) GLOB '[-0-9]' AND rate_decimal NOT GLOB '*[eE]*' AND rate_decimal <> '-0' AND (instr(rate_decimal, '.') = 0 OR substr(rate_decimal, -1, 1) <> '0')),
     amount_decimal TEXT NOT NULL CHECK (typeof(amount_decimal) = 'text' AND length(amount_decimal) BETWEEN 1 AND 128 AND instr(amount_decimal, char(0)) = 0 AND amount_decimal NOT GLOB '*[^!-~]*' AND json_valid(amount_decimal) AND substr(amount_decimal, 1, 1) GLOB '[-0-9]' AND amount_decimal NOT GLOB '*[eE]*' AND amount_decimal <> '-0' AND (instr(amount_decimal, '.') = 0 OR substr(amount_decimal, -1, 1) <> '0')),
-    UNIQUE (run_id, ledger_id, event_id, entry_id)
+    UNIQUE (run_id, ledger_id, event_id, entry_id),
+    FOREIGN KEY (run_id, event_id) REFERENCES events(run_id, event_id),
+    FOREIGN KEY (run_id, ledger_id, position_id)
+        REFERENCES positions(run_id, ledger_id, position_id)
 ) STRICT;
 
 CREATE TABLE equity_snapshots (
@@ -215,20 +230,23 @@ BEGIN
 END;
 
 CREATE TABLE breaker_transitions (
-    transition_id TEXT PRIMARY KEY NOT NULL REFERENCES transition_ids(transition_id) CHECK (length(transition_id) BETWEEN 1 AND 128),
+    transition_id TEXT PRIMARY KEY NOT NULL CHECK (length(transition_id) BETWEEN 1 AND 128),
     run_id TEXT NOT NULL REFERENCES runs(run_id),
-    event_id TEXT NOT NULL REFERENCES events(event_id),
+    event_id TEXT NOT NULL,
     ledger_id TEXT NOT NULL CHECK (ledger_id IN ('rules_only', 'ml_champion')),
     transitioned_at_ns INTEGER NOT NULL CHECK (transitioned_at_ns >= 0),
     breaker_kind TEXT NOT NULL CHECK (breaker_kind IN ('daily', 'weekly', 'drawdown', 'cooldown')),
     from_state TEXT NOT NULL CHECK (from_state IN ('clear', 'active', 'latched')),
     to_state TEXT NOT NULL CHECK (to_state IN ('clear', 'active', 'latched')),
     reason_code TEXT NOT NULL CHECK (length(reason_code) BETWEEN 1 AND 64),
-    UNIQUE (run_id, ledger_id, transitioned_at_ns, transition_id)
+    UNIQUE (run_id, ledger_id, transitioned_at_ns, transition_id),
+    FOREIGN KEY (run_id, event_id) REFERENCES events(run_id, event_id),
+    FOREIGN KEY (run_id, transition_id)
+        REFERENCES transition_ids(run_id, transition_id) DEFERRABLE INITIALLY DEFERRED
 ) STRICT;
 
 CREATE TRIGGER breaker_transitions_claim_id
-BEFORE INSERT ON breaker_transitions
+AFTER INSERT ON breaker_transitions
 BEGIN
     INSERT INTO transition_ids (transition_id, run_id, owner_table)
     VALUES (NEW.transition_id, NEW.run_id, 'breaker_transitions');
@@ -247,18 +265,20 @@ BEGIN
 END;
 
 CREATE TABLE health_transitions (
-    transition_id TEXT PRIMARY KEY NOT NULL REFERENCES transition_ids(transition_id) CHECK (length(transition_id) BETWEEN 1 AND 128),
+    transition_id TEXT PRIMARY KEY NOT NULL CHECK (length(transition_id) BETWEEN 1 AND 128),
     run_id TEXT NOT NULL REFERENCES runs(run_id),
     observed_at_ns INTEGER NOT NULL CHECK (observed_at_ns >= 0),
     component TEXT NOT NULL CHECK (length(component) BETWEEN 1 AND 64),
     from_state TEXT NOT NULL CHECK (from_state IN ('ready', 'degraded', 'blocked')),
     to_state TEXT NOT NULL CHECK (to_state IN ('ready', 'degraded', 'blocked')),
     reason_code TEXT NOT NULL CHECK (length(reason_code) BETWEEN 1 AND 64),
-    UNIQUE (run_id, observed_at_ns, transition_id)
+    UNIQUE (run_id, observed_at_ns, transition_id),
+    FOREIGN KEY (run_id, transition_id)
+        REFERENCES transition_ids(run_id, transition_id) DEFERRABLE INITIALLY DEFERRED
 ) STRICT;
 
 CREATE TRIGGER health_transitions_claim_id
-BEFORE INSERT ON health_transitions
+AFTER INSERT ON health_transitions
 BEGIN
     INSERT INTO transition_ids (transition_id, run_id, owner_table)
     VALUES (NEW.transition_id, NEW.run_id, 'health_transitions');

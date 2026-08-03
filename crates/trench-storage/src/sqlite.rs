@@ -1,7 +1,8 @@
 //! Single-writer SQLite journal for durable paper-trading transitions.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io::ErrorKind;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -165,7 +166,6 @@ impl SqliteStore {
     /// fails, or a required PRAGMA does not match after initialization.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = resolve_database_path(path.as_ref())?;
-        secure_parent_directory(&path)?;
 
         let options = SqliteConnectOptions::new()
             .filename(&path)
@@ -175,7 +175,6 @@ impl SqliteStore {
             .synchronous(SqliteSynchronous::Full)
             .busy_timeout(BUSY_TIMEOUT);
         let mut connection = SqliteConnection::connect_with(&options).await?;
-        secure_database_file(&path)?;
 
         sqlx::query("PRAGMA journal_mode = WAL")
             .execute(&mut connection)
@@ -380,15 +379,9 @@ fn resolve_database_path(path: &Path) -> Result<PathBuf, StoreError> {
             reason: "path is empty",
         });
     }
-    let file_name = path.file_name().ok_or(StoreError::InvalidPath {
+    path.file_name().ok_or(StoreError::InvalidPath {
         reason: "path must name a database file",
     })?;
-    if path.is_dir() {
-        return Err(StoreError::InvalidPath {
-            reason: "path targets a directory",
-        });
-    }
-
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -407,41 +400,157 @@ fn resolve_database_path(path: &Path) -> Result<PathBuf, StoreError> {
             reason: "database parent cannot be the filesystem root",
         });
     }
-    fs::create_dir_all(parent).map_err(|source| StoreError::Filesystem {
-        operation: "creating the database directory",
-        source,
-    })?;
-    let resolved_parent = parent
-        .canonicalize()
-        .map_err(|source| StoreError::Filesystem {
-            operation: "resolving the database directory",
-            source,
-        })?;
-    Ok(resolved_parent.join(file_name))
+    reject_symlink_components(&absolute)?;
+    ensure_private_directory(parent)?;
+    ensure_private_database_file(&absolute)?;
+    Ok(absolute)
 }
 
-fn secure_parent_directory(path: &Path) -> Result<(), StoreError> {
-    let parent = path.parent().ok_or(StoreError::InvalidPath {
-        reason: "path has no parent directory",
-    })?;
-    #[cfg(unix)]
-    fs::set_permissions(parent, Permissions::from_mode(0o700)).map_err(|source| {
-        StoreError::Filesystem {
-            operation: "securing the database directory",
-            source,
+fn reject_symlink_components(path: &Path) -> Result<(), StoreError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(StoreError::InvalidPath {
+                    reason: "path must not contain parent-directory traversal",
+                });
+            }
+            Component::Normal(segment) => {
+                current.push(segment);
+                match fs::symlink_metadata(&current) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(StoreError::InvalidPath {
+                            reason: "database path must not contain symlinks",
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(source) if source.kind() == ErrorKind::NotFound => {}
+                    Err(source) => {
+                        return Err(StoreError::Filesystem {
+                            operation: "inspecting the database path",
+                            source,
+                        });
+                    }
+                }
+            }
         }
-    })?;
+    }
     Ok(())
 }
 
-fn secure_database_file(path: &Path) -> Result<(), StoreError> {
-    #[cfg(unix)]
-    fs::set_permissions(path, Permissions::from_mode(0o600)).map_err(|source| {
-        StoreError::Filesystem {
-            operation: "securing the database file",
-            source,
+fn ensure_private_directory(path: &Path) -> Result<(), StoreError> {
+    let mut missing = Vec::new();
+    let mut current = path;
+    loop {
+        match fs::symlink_metadata(current) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_dir() {
+                    return Err(StoreError::InvalidPath {
+                        reason: "database parent must be a directory",
+                    });
+                }
+                break;
+            }
+            Err(source) if source.kind() == ErrorKind::NotFound => {
+                missing.push(current.to_path_buf());
+                current = current.parent().ok_or(StoreError::InvalidPath {
+                    reason: "path has no parent directory",
+                })?;
+            }
+            Err(source) => {
+                return Err(StoreError::Filesystem {
+                    operation: "inspecting the database directory",
+                    source,
+                });
+            }
         }
+    }
+
+    for directory in missing.iter().rev() {
+        match fs::create_dir(directory) {
+            Ok(()) => {
+                #[cfg(unix)]
+                fs::set_permissions(directory, Permissions::from_mode(0o700)).map_err(
+                    |source| StoreError::Filesystem {
+                        operation: "securing a newly created database directory",
+                        source,
+                    },
+                )?;
+            }
+            Err(source) if source.kind() == ErrorKind::AlreadyExists => {}
+            Err(source) => {
+                return Err(StoreError::Filesystem {
+                    operation: "creating the database directory",
+                    source,
+                });
+            }
+        }
+    }
+
+    let metadata = fs::symlink_metadata(path).map_err(|source| StoreError::Filesystem {
+        operation: "inspecting the database directory",
+        source,
     })?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(StoreError::InvalidPath {
+            reason: "database parent must be a non-symlink directory",
+        });
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        return Err(StoreError::InvalidPath {
+            reason: "database parent must have mode 0700",
+        });
+    }
+    Ok(())
+}
+
+fn ensure_private_database_file(path: &Path) -> Result<(), StoreError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == ErrorKind::NotFound => {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|source| StoreError::Filesystem {
+                    operation: "creating the database file",
+                    source,
+                })?;
+            #[cfg(unix)]
+            fs::set_permissions(path, Permissions::from_mode(0o600)).map_err(|source| {
+                StoreError::Filesystem {
+                    operation: "securing a newly created database file",
+                    source,
+                }
+            })?;
+            fs::symlink_metadata(path).map_err(|source| StoreError::Filesystem {
+                operation: "inspecting the database file",
+                source,
+            })?
+        }
+        Err(source) => {
+            return Err(StoreError::Filesystem {
+                operation: "inspecting the database file",
+                source,
+            });
+        }
+    };
+
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(StoreError::InvalidPath {
+            reason: "database path must be a non-symlink regular file",
+        });
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o777 != 0o600 {
+        return Err(StoreError::InvalidPath {
+            reason: "database file must have mode 0600",
+        });
+    }
     Ok(())
 }
 

@@ -1,5 +1,10 @@
 use std::path::Path;
 
+#[cfg(unix)]
+use std::os::unix::fs::{PermissionsExt, symlink};
+#[cfg(unix)]
+use std::process::Command;
+
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Connection, SqliteConnection};
 use tempfile::TempDir;
@@ -1227,6 +1232,343 @@ async fn transition_ids_are_unique_across_transition_tables() {
 }
 
 #[tokio::test]
+async fn ignored_invalid_transitions_do_not_claim_registry_ids() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
+    let path = database_path(&temp_dir);
+    let mut store = open_with_run(&path).await;
+    store
+        .append_event_and_risk_rejection(event(), rejection(), AtomicAppend::Commit)
+        .await
+        .expect("source event should be committed");
+    drop(store);
+
+    let mut connection = open_schema_connection(&path).await;
+    for (transition_id, expected_counts) in [
+        ("ignored-breaker-transition", (1, 0, "breaker_transitions")),
+        ("ignored-health-transition", (0, 1, "health_transitions")),
+    ] {
+        match expected_counts.2 {
+            "breaker_transitions" => {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO breaker_transitions \
+                     (transition_id, run_id, event_id, ledger_id, transitioned_at_ns, breaker_kind, from_state, to_state, reason_code) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                )
+                .bind(transition_id)
+                .bind(RUN_ID)
+                .bind(EVENT_ID)
+                .bind("rules_only")
+                .bind(EVENT_TIME_NS + 2)
+                .bind("invalid")
+                .bind("clear")
+                .bind("active")
+                .bind("daily_loss_limit")
+                .execute(&mut connection)
+                .await
+                .expect("ignored invalid breaker transition should not abort the statement");
+            }
+            "health_transitions" => {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO health_transitions \
+                     (transition_id, run_id, observed_at_ns, component, from_state, to_state, reason_code) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .bind(transition_id)
+                .bind(RUN_ID)
+                .bind(EVENT_TIME_NS + 3)
+                .bind("storage")
+                .bind("invalid")
+                .bind("blocked")
+                .bind("sqlite_failure")
+                .execute(&mut connection)
+                .await
+                .expect("ignored invalid health transition should not abort the statement");
+            }
+            _ => unreachable!("only known transition tables are covered"),
+        }
+
+        let rejected_state = sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT \
+                 (SELECT COUNT(*) FROM breaker_transitions WHERE transition_id = ?1), \
+                 (SELECT COUNT(*) FROM health_transitions WHERE transition_id = ?1), \
+                 (SELECT COUNT(*) FROM transition_ids WHERE transition_id = ?1)",
+        )
+        .bind(transition_id)
+        .fetch_one(&mut connection)
+        .await
+        .expect("ignored transition state should be readable");
+        assert_eq!(
+            rejected_state,
+            (0, 0, 0),
+            "ignored invalid transition must not claim a registry ID"
+        );
+
+        match expected_counts.2 {
+            "breaker_transitions" => {
+                sqlx::query(
+                    "INSERT INTO breaker_transitions \
+                     (transition_id, run_id, event_id, ledger_id, transitioned_at_ns, breaker_kind, from_state, to_state, reason_code) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                )
+                .bind(transition_id)
+                .bind(RUN_ID)
+                .bind(EVENT_ID)
+                .bind("rules_only")
+                .bind(EVENT_TIME_NS + 2)
+                .bind("daily")
+                .bind("clear")
+                .bind("active")
+                .bind("daily_loss_limit")
+                .execute(&mut connection)
+                .await
+                .expect("valid breaker transition should claim an unclaimed ID");
+            }
+            "health_transitions" => {
+                sqlx::query(
+                    "INSERT INTO health_transitions \
+                     (transition_id, run_id, observed_at_ns, component, from_state, to_state, reason_code) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .bind(transition_id)
+                .bind(RUN_ID)
+                .bind(EVENT_TIME_NS + 3)
+                .bind("storage")
+                .bind("ready")
+                .bind("blocked")
+                .bind("sqlite_failure")
+                .execute(&mut connection)
+                .await
+                .expect("valid health transition should claim an unclaimed ID");
+            }
+            _ => unreachable!("only known transition tables are covered"),
+        }
+
+        let state = sqlx::query_as::<_, (i64, i64, i64, Option<String>)>(
+            "SELECT \
+                 (SELECT COUNT(*) FROM breaker_transitions WHERE transition_id = ?1), \
+                 (SELECT COUNT(*) FROM health_transitions WHERE transition_id = ?1), \
+                 (SELECT COUNT(*) FROM transition_ids WHERE transition_id = ?1), \
+                 (SELECT owner_table FROM transition_ids WHERE transition_id = ?1)",
+        )
+        .bind(transition_id)
+        .fetch_one(&mut connection)
+        .await
+        .expect("transition state should be readable");
+        assert_eq!(
+            state,
+            (
+                expected_counts.0,
+                expected_counts.1,
+                1,
+                Some(expected_counts.2.to_owned()),
+            )
+        );
+    }
+}
+
+#[tokio::test]
+async fn schema_rejects_cross_run_and_cross_ledger_relationships() {
+    const SECOND_RUN_ID: &str = "run-2026-08-03-b";
+    const SECOND_EVENT_ID: &str = "event-0002";
+
+    let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
+    let path = database_path(&temp_dir);
+    let mut store = open_with_run(&path).await;
+    store
+        .append_event_and_risk_rejection(event(), rejection(), AtomicAppend::Commit)
+        .await
+        .expect("first run event should be committed");
+    drop(store);
+
+    let mut connection = open_schema_connection(&path).await;
+    sqlx::query("INSERT INTO runs (run_id, started_at_ns) VALUES (?1, ?2)")
+        .bind(SECOND_RUN_ID)
+        .bind(EVENT_TIME_NS)
+        .execute(&mut connection)
+        .await
+        .expect("second run should be inserted");
+    sqlx::query(
+        "INSERT INTO events (event_id, run_id, event_time_ns, event_kind, payload_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )
+    .bind(SECOND_EVENT_ID)
+    .bind(SECOND_RUN_ID)
+    .bind(EVENT_TIME_NS + 1)
+    .bind("risk_evaluation")
+    .bind(r#"{"market":"ETH"}"#)
+    .execute(&mut connection)
+    .await
+    .expect("second run event should be inserted");
+    sqlx::query(
+        "INSERT INTO config_manifests \
+         (manifest_id, run_id, config_hash, manifest_json, created_at_ns) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )
+    .bind("manifest-first-run")
+    .bind(RUN_ID)
+    .bind("config-first-run")
+    .bind("{}")
+    .bind(EVENT_TIME_NS)
+    .execute(&mut connection)
+    .await
+    .expect("first-run config manifest should be inserted");
+    sqlx::query(
+        "INSERT INTO order_intents \
+         (intent_id, run_id, event_id, ledger_id, created_at_ns, market, side, quantity_decimal, expected_price_decimal) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )
+    .bind("intent-parent")
+    .bind(RUN_ID)
+    .bind(EVENT_ID)
+    .bind("rules_only")
+    .bind(EVENT_TIME_NS + 2)
+    .bind("BTC")
+    .bind("buy")
+    .bind("1")
+    .bind("100")
+    .execute(&mut connection)
+    .await
+    .expect("same-run order intent should be inserted");
+    sqlx::query(
+        "INSERT INTO paper_orders \
+         (order_id, run_id, intent_id, ledger_id, created_at_ns, market, side, status, quantity_decimal, limit_price_decimal) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )
+    .bind("order-parent")
+    .bind(RUN_ID)
+    .bind("intent-parent")
+    .bind("rules_only")
+    .bind(EVENT_TIME_NS + 3)
+    .bind("BTC")
+    .bind("buy")
+    .bind("open")
+    .bind("1")
+    .bind("100")
+    .execute(&mut connection)
+    .await
+    .expect("same-run paper order should be inserted");
+    sqlx::query(
+        "INSERT INTO positions \
+         (position_id, run_id, ledger_id, updated_at_ns, market, side, status, quantity_decimal, entry_price_decimal, realized_pnl_decimal, unrealized_pnl_decimal) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+    )
+    .bind("position-parent")
+    .bind(RUN_ID)
+    .bind("rules_only")
+    .bind(EVENT_TIME_NS + 4)
+    .bind("BTC")
+    .bind("long")
+    .bind("open")
+    .bind("1")
+    .bind("100")
+    .bind("0")
+    .bind("0")
+    .execute(&mut connection)
+    .await
+    .expect("same-run position should be inserted");
+    sqlx::query(
+        "INSERT INTO breaker_transitions \
+         (transition_id, run_id, event_id, ledger_id, transitioned_at_ns, breaker_kind, from_state, to_state, reason_code) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )
+    .bind("transition-second-run")
+    .bind(SECOND_RUN_ID)
+    .bind(SECOND_EVENT_ID)
+    .bind("rules_only")
+    .bind(EVENT_TIME_NS + 5)
+    .bind("daily")
+    .bind("clear")
+    .bind("active")
+    .bind("daily_loss_limit")
+    .execute(&mut connection)
+    .await
+    .expect("second-run transition should be inserted");
+
+    for (relationship, statement) in [
+        (
+            "config manifest ownership",
+            "INSERT INTO config_manifest_owners (manifest_id, run_id) \
+             VALUES ('manifest-first-run', 'run-2026-08-03-b')",
+        ),
+        (
+            "feature event run",
+            "INSERT INTO feature_snapshots \
+             (snapshot_id, run_id, event_id, as_of_time_ns, market, sleeve, schema_hash, snapshot_json) \
+             VALUES ('feature-cross-run', 'run-2026-08-03', 'event-0002', 1785715200123456790, 'BTC', '15m', 'schema-cross', '{}')",
+        ),
+        (
+            "signal event run",
+            "INSERT INTO signals \
+             (signal_id, run_id, event_id, ledger_id, as_of_time_ns, market, sleeve, direction, score_decimal, explanation_json) \
+             VALUES ('signal-cross-run', 'run-2026-08-03', 'event-0002', 'rules_only', 1785715200123456790, 'BTC', '15m', 'long', '1', '{}')",
+        ),
+        (
+            "order intent event run",
+            "INSERT INTO order_intents \
+             (intent_id, run_id, event_id, ledger_id, created_at_ns, market, side, quantity_decimal, expected_price_decimal) \
+             VALUES ('intent-cross-run', 'run-2026-08-03', 'event-0002', 'rules_only', 1785715200123456790, 'BTC', 'buy', '1', '100')",
+        ),
+        (
+            "risk decision event run",
+            "INSERT INTO risk_decisions \
+             (decision_id, run_id, event_id, ledger_id, decided_at_ns, outcome, reason_code, details_json) \
+             VALUES ('risk-cross-run', 'run-2026-08-03', 'event-0002', 'rules_only', 1785715200123456790, 'rejected', 'cross_run', '{}')",
+        ),
+        (
+            "paper order intent ledger",
+            "INSERT INTO paper_orders \
+             (order_id, run_id, intent_id, ledger_id, created_at_ns, market, side, status, quantity_decimal, limit_price_decimal) \
+             VALUES ('order-cross-ledger', 'run-2026-08-03', 'intent-parent', 'ml_champion', 1785715200123456790, 'BTC', 'buy', 'open', '1', '100')",
+        ),
+        (
+            "fill event run",
+            "INSERT INTO fills \
+             (fill_id, run_id, event_id, order_id, ledger_id, fill_time_ns, price_decimal, quantity_decimal, fee_decimal, liquidity) \
+             VALUES ('fill-cross-event', 'run-2026-08-03', 'event-0002', 'order-parent', 'rules_only', 1785715200123456790, '100', '1', '0', 'maker')",
+        ),
+        (
+            "fill order ledger",
+            "INSERT INTO fills \
+             (fill_id, run_id, event_id, order_id, ledger_id, fill_time_ns, price_decimal, quantity_decimal, fee_decimal, liquidity) \
+             VALUES ('fill-cross-ledger', 'run-2026-08-03', 'event-0001', 'order-parent', 'ml_champion', 1785715200123456790, '100', '1', '0', 'maker')",
+        ),
+        (
+            "funding event run",
+            "INSERT INTO funding_entries \
+             (entry_id, run_id, event_id, position_id, ledger_id, funding_time_ns, rate_decimal, amount_decimal) \
+             VALUES ('funding-cross-event', 'run-2026-08-03', 'event-0002', 'position-parent', 'rules_only', 1785715200123456790, '0', '0')",
+        ),
+        (
+            "funding position ledger",
+            "INSERT INTO funding_entries \
+             (entry_id, run_id, event_id, position_id, ledger_id, funding_time_ns, rate_decimal, amount_decimal) \
+             VALUES ('funding-cross-ledger', 'run-2026-08-03', 'event-0001', 'position-parent', 'ml_champion', 1785715200123456790, '0', '0')",
+        ),
+        (
+            "breaker event run",
+            "INSERT INTO breaker_transitions \
+             (transition_id, run_id, event_id, ledger_id, transitioned_at_ns, breaker_kind, from_state, to_state, reason_code) \
+             VALUES ('transition-cross-event', 'run-2026-08-03', 'event-0002', 'rules_only', 1785715200123456790, 'daily', 'clear', 'active', 'cross_run')",
+        ),
+        (
+            "health transition run",
+            "INSERT INTO health_transitions \
+             (transition_id, run_id, observed_at_ns, component, from_state, to_state, reason_code) \
+             VALUES ('transition-second-run', 'run-2026-08-03', 1785715200123456790, 'storage', 'ready', 'blocked', 'cross_run')",
+        ),
+    ] {
+        let result = sqlx::query(statement).execute(&mut connection).await;
+        assert!(result.is_err(), "{relationship} must reject cross scope");
+    }
+
+    let foreign_key_violations = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&mut connection)
+        .await
+        .expect("foreign-key integrity should be checkable");
+    assert!(foreign_key_violations.is_empty());
+}
+
+#[tokio::test]
 async fn breaker_transition_id_cannot_be_updated_to_health_owned_id() {
     let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
     let path = database_path(&temp_dir);
@@ -1354,8 +1696,6 @@ async fn conflict_algorithms_cannot_replace_transitions_or_registry_ownership() 
 #[cfg(unix)]
 #[tokio::test]
 async fn open_restricts_parent_and_database_permissions() {
-    use std::os::unix::fs::PermissionsExt;
-
     let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
     let path = database_path(&temp_dir);
     let store = SqliteStore::open(&path)
@@ -1375,4 +1715,163 @@ async fn open_restricts_parent_and_database_permissions() {
     drop(store);
 
     assert_eq!((parent_mode, database_mode), (0o700, 0o600));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn open_rejects_caller_owned_cwd_without_mutating() {
+    const CHILD_ENV: &str = "TRENCH_STORAGE_CALLER_CWD_CHILD";
+    const DATABASE_NAME: &str = "caller-owned.sqlite3";
+
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let result = SqliteStore::open(DATABASE_NAME).await;
+        assert!(
+            matches!(result, Err(StoreError::InvalidPath { .. })),
+            "caller-owned working directories must be rejected rather than secured in place"
+        );
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
+    let caller_owned_cwd = temp_dir.path().join("caller-owned-cwd");
+    std::fs::create_dir(&caller_owned_cwd).expect("caller-owned directory should be created");
+    std::fs::set_permissions(&caller_owned_cwd, std::fs::Permissions::from_mode(0o755))
+        .expect("caller-owned directory mode should be configured");
+
+    let status = Command::new(std::env::current_exe().expect("test executable should be known"))
+        .arg("--exact")
+        .arg("open_rejects_caller_owned_cwd_without_mutating")
+        .current_dir(&caller_owned_cwd)
+        .env(CHILD_ENV, "1")
+        .status()
+        .expect("isolated CWD probe should run");
+
+    let mode = std::fs::metadata(&caller_owned_cwd)
+        .expect("caller-owned directory metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert!(
+        status.success(),
+        "isolated CWD probe should reject the path"
+    );
+    assert_eq!(mode, 0o755, "caller-owned CWD mode must remain unchanged");
+    assert!(
+        !caller_owned_cwd.join(DATABASE_NAME).exists(),
+        "rejected caller-owned CWD must not receive a database file"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn open_preserves_tmp_and_rejects_symlink_targets() {
+    let tmp_before = std::fs::metadata("/tmp")
+        .expect("/tmp metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+    let tmp_file =
+        tempfile::NamedTempFile::new_in("/tmp").expect("temporary file in /tmp should be created");
+    let tmp_result = SqliteStore::open(tmp_file.path()).await;
+    let tmp_after = std::fs::metadata("/tmp")
+        .expect("/tmp metadata should remain readable")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert!(matches!(tmp_result, Err(StoreError::InvalidPath { .. })));
+    assert_eq!(tmp_after, tmp_before, "/tmp mode must remain unchanged");
+
+    let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
+    let target_parent = temp_dir.path().join("target-parent");
+    std::fs::create_dir(&target_parent).expect("symlink target parent should be created");
+    std::fs::set_permissions(&target_parent, std::fs::Permissions::from_mode(0o755))
+        .expect("symlink target parent mode should be configured");
+    let parent_link = temp_dir.path().join("parent-link");
+    symlink(&target_parent, &parent_link).expect("parent symlink should be created");
+
+    let parent_result = SqliteStore::open(parent_link.join("journal.sqlite3")).await;
+    let target_parent_mode = std::fs::metadata(&target_parent)
+        .expect("symlink target parent metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert!(matches!(parent_result, Err(StoreError::InvalidPath { .. })));
+    assert_eq!(target_parent_mode, 0o755);
+    assert!(
+        !target_parent.join("journal.sqlite3").exists(),
+        "a symlink parent must not be followed"
+    );
+
+    let dedicated = temp_dir.path().join("dedicated");
+    std::fs::create_dir(&dedicated).expect("dedicated directory should be created");
+    std::fs::set_permissions(&dedicated, std::fs::Permissions::from_mode(0o700))
+        .expect("dedicated directory mode should be configured");
+    let target_file = dedicated.join("target.sqlite3");
+    std::fs::File::create(&target_file).expect("symlink target file should be created");
+    std::fs::set_permissions(&target_file, std::fs::Permissions::from_mode(0o600))
+        .expect("symlink target file mode should be configured");
+    let file_link = dedicated.join("file-link.sqlite3");
+    symlink(&target_file, &file_link).expect("database symlink should be created");
+
+    let file_result = SqliteStore::open(&file_link).await;
+    let target_file_mode = std::fs::metadata(&target_file)
+        .expect("symlink target file metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert!(matches!(file_result, Err(StoreError::InvalidPath { .. })));
+    assert_eq!(target_file_mode, 0o600);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn open_reopens_existing_dedicated_database_without_mutating_permissions() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
+    let dedicated = temp_dir.path().join("dedicated");
+    std::fs::create_dir(&dedicated).expect("dedicated directory should be created");
+    std::fs::set_permissions(&dedicated, std::fs::Permissions::from_mode(0o700))
+        .expect("dedicated directory mode should be configured");
+    let path = dedicated.join("journal.sqlite3");
+    std::fs::File::create(&path).expect("dedicated database file should be created");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .expect("dedicated database file mode should be configured");
+
+    let mut store = SqliteStore::open(&path)
+        .await
+        .expect("existing dedicated database should open");
+    store
+        .create_run(RunInput {
+            run_id: RUN_ID,
+            started_at_ns: EVENT_TIME_NS,
+        })
+        .await
+        .expect("existing dedicated database should remain writable");
+    drop(store);
+
+    let mut reopened = SqliteStore::open(&path)
+        .await
+        .expect("existing dedicated database should reopen");
+    let counts = reopened
+        .journal_counts(RUN_ID)
+        .await
+        .expect("reopened dedicated database should remain readable");
+    let parent_mode = std::fs::metadata(&dedicated)
+        .expect("dedicated directory metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+    let file_mode = std::fs::metadata(&path)
+        .expect("dedicated database metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777;
+
+    assert_eq!(
+        counts,
+        trench_storage::sqlite::JournalCounts {
+            events: 0,
+            risk_decisions: 0
+        }
+    );
+    assert_eq!((parent_mode, file_mode), (0o700, 0o600));
 }
