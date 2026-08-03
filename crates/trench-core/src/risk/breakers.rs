@@ -159,6 +159,33 @@ mod tests {
         assert!(reconciled.hard_drawdown_latched());
     }
 
+    #[test]
+    fn epoch_adjacent_week_anchors_clamp_the_unrepresentable_monday_and_roll_on_monday() {
+        let epoch = timestamp(0);
+        for day in 0..4 {
+            let state = BreakerState::new(timestamp(day * DAY_NS), usdc(dec!(100)))
+                .expect("epoch-adjacent state");
+            assert_eq!(state.weekly().anchor(), epoch, "day {day}");
+        }
+
+        let first_monday = timestamp(4 * DAY_NS);
+        let following_monday = timestamp(11 * DAY_NS);
+        let monday_state =
+            BreakerState::new(first_monday, usdc(dec!(100))).expect("first Monday state");
+        assert_eq!(monday_state.weekly().anchor(), first_monday);
+
+        let sunday_state =
+            BreakerState::new(timestamp(3 * DAY_NS), usdc(dec!(100))).expect("Sunday state");
+        let rollover = sunday_state
+            .reconcile(first_monday, usdc(dec!(100)))
+            .expect("Monday reconcile");
+        assert_eq!(rollover.weekly().anchor(), first_monday);
+
+        let following_monday_state =
+            BreakerState::new(following_monday, usdc(dec!(100))).expect("following Monday state");
+        assert_eq!(following_monday_state.weekly().anchor(), following_monday);
+    }
+
     proptest! {
         #[test]
         fn daily_and_weekly_remaining_budget_are_monotonic_before_reconciliation(
@@ -605,6 +632,12 @@ fn utc_day_start(at: TimestampNs) -> Result<TimestampNs, BreakerError> {
 fn utc_week_start(at: TimestampNs) -> Result<TimestampNs, BreakerError> {
     let day = at.value() / DAY_NS;
     let days_since_monday = (day + 3).rem_euclid(7);
-    TimestampNs::new(i128::from(day - days_since_monday) * i128::from(DAY_NS))
-        .map_err(BreakerError::from)
+    // `TimestampNs` begins at the Unix epoch, so its initial partial UTC week
+    // cannot be anchored to the preceding Monday.
+    let week_start_day = if day < days_since_monday {
+        0
+    } else {
+        day - days_since_monday
+    };
+    TimestampNs::new(i128::from(week_start_day) * i128::from(DAY_NS)).map_err(BreakerError::from)
 }

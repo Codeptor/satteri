@@ -126,6 +126,17 @@ fn ledger_state_exposes_utc_anchors_and_frozen_breaker_counters() {
 }
 
 #[test]
+fn initial_ledger_accepts_each_day_before_the_first_utc_monday() {
+    const DAY_NS: i128 = 86_400_000_000_000;
+
+    for day in 0..4 {
+        let ledger = LedgerState::new(LedgerId::RulesOnly, timestamp(day * DAY_NS))
+            .expect("epoch-adjacent initial ledger");
+        assert_eq!(ledger.weekly_anchor(), timestamp(0), "day {day}");
+    }
+}
+
+#[test]
 fn entries_reject_negative_sizes_and_any_overlap() {
     let at = timestamp(1_785_715_200_000_000_000);
     assert!(matches!(
