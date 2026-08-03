@@ -19,6 +19,7 @@ pub struct Candle {
     last_event_id: EventId,
     first_event_time: TimestampNs,
     last_event_time: TimestampNs,
+    source_available_at: TimestampNs,
     buy_notional: Decimal,
     sell_notional: Decimal,
 }
@@ -58,6 +59,12 @@ impl Candle {
     #[must_use]
     pub const fn last_event_time(&self) -> TimestampNs {
         self.last_event_time
+    }
+
+    /// Returns the latest receipt time among this candle's contributing trades.
+    #[must_use]
+    pub const fn source_available_at(&self) -> TimestampNs {
+        self.source_available_at
     }
 
     /// Returns aggressive-buy quote notional from the completed interval.
@@ -134,6 +141,7 @@ pub enum CandleError {
 struct TradePoint {
     event_id: EventId,
     event_time: TimestampNs,
+    received_at: TimestampNs,
     market: Market,
     side: Side,
     price: Price,
@@ -193,6 +201,7 @@ impl CandleAggregator {
         let point = TradePoint {
             event_id: event.event_id().clone(),
             event_time: event.event_time(),
+            received_at: event.received_at(),
             market: event.market().clone(),
             side: trade.side(),
             price: trade.price(),
@@ -271,13 +280,19 @@ impl CandleAggregator {
             })
             .cloned()
             .collect::<Vec<_>>();
-        let mut candles = Vec::with_capacity(complete.len());
+        let candles = complete
+            .iter()
+            .map(|key| {
+                let trades = self.pending.get(key).ok_or(CandleError::Invariant {
+                    reason: "selected pending bucket must remain present",
+                })?;
+                aggregate(key, trades)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         for key in complete {
-            let trades = self.pending.remove(&key).ok_or(CandleError::Invariant {
+            self.pending.remove(&key).ok_or(CandleError::Invariant {
                 reason: "selected pending bucket must remain present",
             })?;
-            let candle = aggregate(key.clone(), trades)?;
-            candles.push(candle);
         }
         self.watermark = Some(watermark);
         Ok(candles)
@@ -289,7 +304,8 @@ fn bucket_open(time: TimestampNs, interval: CandleInterval) -> Result<TimestampN
     TimestampNs::new(i128::from(time.value() / duration * duration)).map_err(CandleError::from)
 }
 
-fn aggregate(key: BucketKey, mut trades: Vec<TradePoint>) -> Result<Candle, CandleError> {
+fn aggregate(key: &BucketKey, trades: &[TradePoint]) -> Result<Candle, CandleError> {
+    let mut trades = trades.to_vec();
     trades.sort();
     let first = trades.first().ok_or(CandleError::Invariant {
         reason: "pending candle must have at least one trade",
@@ -297,6 +313,14 @@ fn aggregate(key: BucketKey, mut trades: Vec<TradePoint>) -> Result<Candle, Cand
     let last = trades.last().ok_or(CandleError::Invariant {
         reason: "pending candle must have at least one trade",
     })?;
+    let source_available_at =
+        trades
+            .iter()
+            .map(|trade| trade.received_at)
+            .max()
+            .ok_or(CandleError::Invariant {
+                reason: "pending candle must have at least one trade",
+            })?;
     let mut high = first.price;
     let mut low = first.price;
     let mut volume = Decimal::ZERO;
@@ -352,12 +376,13 @@ fn aggregate(key: BucketKey, mut trades: Vec<TradePoint>) -> Result<Candle, Cand
         trade_count,
     )?;
     Ok(Candle {
-        market: key.market,
+        market: key.market.clone(),
         candle,
         first_event_id: first.event_id.clone(),
         last_event_id: last.event_id.clone(),
         first_event_time: first.event_time,
         last_event_time: last.event_time,
+        source_available_at,
         buy_notional,
         sell_notional,
     })
@@ -369,7 +394,7 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use crate::domain::{Market, Price, Quantity, Side};
-    use crate::event::{MarketEvent, TimestampNs, Trade};
+    use crate::event::{CandleInterval, MarketEvent, TimestampNs, Trade};
 
     use super::{CandleAggregator, CandleError};
 
@@ -378,9 +403,18 @@ mod tests {
     }
 
     fn trade(time: i128, trade_id: u64, price: rust_decimal::Decimal) -> MarketEvent {
+        trade_with_receipt(time, time, trade_id, price)
+    }
+
+    fn trade_with_receipt(
+        event_time: i128,
+        received_at: i128,
+        trade_id: u64,
+        price: rust_decimal::Decimal,
+    ) -> MarketEvent {
         MarketEvent::trade(
-            timestamp(time),
-            timestamp(time),
+            timestamp(event_time),
+            timestamp(received_at),
             Market::new("BTC").expect("test market must be valid"),
             Trade::new(
                 trade_id,
@@ -474,6 +508,48 @@ mod tests {
                 .is_empty(),
             "a rejected late trade must not produce a retroactive candle"
         );
+    }
+
+    #[test]
+    fn failed_finalization_leaves_every_pending_bucket_available_for_retry() {
+        let mut aggregator = CandleAggregator::new();
+        aggregator
+            .ingest(&trade(1, 1, dec!(100)))
+            .expect("normal trade must be accepted");
+        aggregator
+            .ingest(&trade(900_000_000_001, 2, rust_decimal::Decimal::MAX))
+            .expect("first maximal trade must be accepted");
+        aggregator
+            .ingest(&trade(900_000_000_002, 3, rust_decimal::Decimal::MAX))
+            .expect("second maximal trade must be accepted");
+        let pending_before = aggregator.pending.clone();
+        let seen_before = aggregator.seen.clone();
+
+        assert_eq!(
+            aggregator.complete_through(timestamp(1_800_000_000_000)),
+            Err(CandleError::Arithmetic {
+                operation: "candle buy notional"
+            })
+        );
+        assert_eq!(aggregator.pending, pending_before);
+        assert_eq!(aggregator.seen, seen_before);
+        assert_eq!(aggregator.watermark, None);
+    }
+
+    #[test]
+    fn completed_candle_records_the_latest_contributing_receipt_time() {
+        let mut aggregator = CandleAggregator::new();
+        aggregator
+            .ingest(&trade_with_receipt(1, 500, 1, dec!(100)))
+            .expect("trade must be accepted");
+
+        let candle = aggregator
+            .complete_through(timestamp(900_000_000_000))
+            .expect("watermark must finalize the candle")
+            .into_iter()
+            .find(|candle| candle.candle().interval() == CandleInterval::FifteenMinutes)
+            .expect("fifteen-minute candle must exist");
+        assert_eq!(candle.source_available_at(), timestamp(500));
     }
 
     proptest! {

@@ -71,6 +71,7 @@ pub struct InputEventSpan {
     last_event_id: EventId,
     first_event_time: TimestampNs,
     last_event_time: TimestampNs,
+    available_at: TimestampNs,
 }
 
 impl InputEventSpan {
@@ -104,6 +105,12 @@ impl InputEventSpan {
         self.last_event_time
     }
 
+    /// Returns the latest source receipt time required to use this span.
+    #[must_use]
+    pub const fn available_at(&self) -> TimestampNs {
+        self.available_at
+    }
+
     fn event(kind: FeatureInputKind, event: &MarketEvent) -> Self {
         Self {
             kind,
@@ -111,6 +118,7 @@ impl InputEventSpan {
             last_event_id: event.event_id().clone(),
             first_event_time: event.event_time(),
             last_event_time: event.event_time(),
+            available_at: event.received_at(),
         }
     }
 
@@ -121,6 +129,7 @@ impl InputEventSpan {
             last_event_id: candle.last_event_id().clone(),
             first_event_time: candle.first_event_time(),
             last_event_time: candle.last_event_time(),
+            available_at: candle.source_available_at(),
         }
     }
 }
@@ -213,6 +222,7 @@ fn input_digest(spans: &[InputEventSpan]) -> String {
         hasher.update(&span.last_event_time.value().to_be_bytes());
         hasher.update(span.last_event_id.as_str().as_bytes());
         hasher.update(&[0]);
+        hasher.update(&span.available_at.value().to_be_bytes());
     }
     hasher.finalize().to_hex().to_string()
 }
@@ -579,9 +589,10 @@ impl CommonFeatureEngine {
             .iter()
             .filter(|((_, candidate_sleeve), candles)| {
                 *candidate_sleeve == sleeve
-                    && candles
-                        .values()
-                        .any(|candle| candle.close_time().is_ok_and(|close| close == as_of_time))
+                    && candles.values().any(|candle| {
+                        candle.close_time().is_ok_and(|close| close == as_of_time)
+                            && candle.source_available_at() <= as_of_time
+                    })
             })
             .map(|((market, _), _)| market.clone())
             .collect()
@@ -725,7 +736,10 @@ impl CommonFeatureEngine {
             .map(|candles| {
                 candles
                     .values()
-                    .filter(|candle| candle.close_time().is_ok_and(|close| close <= as_of_time))
+                    .filter(|candle| {
+                        candle.close_time().is_ok_and(|close| close <= as_of_time)
+                            && candle.source_available_at() <= as_of_time
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -774,7 +788,9 @@ impl CommonFeatureEngine {
             .get(market)
             .into_iter()
             .flat_map(|events| events.values())
-            .filter(move |event| event.event_time() <= as_of_time)
+            .filter(move |event| {
+                event.event_time() <= as_of_time && event.received_at() <= as_of_time
+            })
     }
 }
 
@@ -1453,6 +1469,12 @@ mod tests {
         step: Decimal,
     }
 
+    #[derive(Clone, Copy, Default)]
+    struct ReceiptDelays {
+        direct_at: Option<u64>,
+        trade_at: Option<u64>,
+    }
+
     fn populate(
         engine: &mut CommonFeatureEngine,
         aggregator: &mut CandleAggregator,
@@ -1483,15 +1505,43 @@ mod tests {
         range: PopulateRange,
         zero_open_interest_at: Option<u64>,
     ) {
+        populate_with_receipt_delays(
+            engine,
+            aggregator,
+            market,
+            range,
+            zero_open_interest_at,
+            ReceiptDelays::default(),
+        );
+    }
+
+    fn populate_with_receipt_delays(
+        engine: &mut CommonFeatureEngine,
+        aggregator: &mut CandleAggregator,
+        market: Market,
+        range: PopulateRange,
+        zero_open_interest_at: Option<u64>,
+        receipt_delays: ReceiptDelays,
+    ) {
         for index in range.start..range.start + range.count {
             let open = i128::from(index) * FIFTEEN_MINUTES_NS;
             let close = open + FIFTEEN_MINUTES_NS;
             let value = range.offset + Decimal::from(index) * range.step;
             let bid = price(value - dec!(0.5));
             let ask = price(value + dec!(0.5));
+            let trade_received_at = if receipt_delays.trade_at == Some(index) {
+                close + 1
+            } else {
+                close - 1
+            };
+            let direct_received_at = if receipt_delays.direct_at == Some(index) {
+                close + 1
+            } else {
+                close
+            };
             let trade = MarketEvent::trade(
                 timestamp(close - 1),
-                timestamp(close - 1),
+                timestamp(trade_received_at),
                 market.clone(),
                 Trade::new(index + 1, Side::Buy, price(value), quantity(dec!(1)))
                     .expect("test trade must be valid"),
@@ -1507,7 +1557,7 @@ mod tests {
 
             let context = MarketEvent::asset_context(
                 timestamp(close),
-                timestamp(close),
+                timestamp(direct_received_at),
                 market.clone(),
                 AssetContext::new(
                     price(value),
@@ -1526,7 +1576,7 @@ mod tests {
             .expect("test context must be valid");
             let bbo = MarketEvent::bbo(
                 timestamp(close),
-                timestamp(close),
+                timestamp(direct_received_at),
                 market.clone(),
                 Bbo::new(
                     index + 1,
@@ -1538,7 +1588,7 @@ mod tests {
             .expect("test BBO event must be valid");
             let book = MarketEvent::book_snapshot(
                 timestamp(close),
-                timestamp(close),
+                timestamp(direct_received_at),
                 market.clone(),
                 BookSnapshot::new(
                     index + 1,
@@ -1555,7 +1605,7 @@ mod tests {
             .expect("test book event must be valid");
             let funding = MarketEvent::funding(
                 timestamp(close),
-                timestamp(close),
+                timestamp(direct_received_at),
                 market.clone(),
                 Funding::new(
                     FundingRate::new(Decimal::from(index) / dec!(10000)),
@@ -1637,6 +1687,76 @@ mod tests {
         assert_eq!(
             before,
             engine.snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision)
+        );
+    }
+
+    #[test]
+    fn delayed_direct_events_are_excluded_from_decision_provenance() {
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        let receipt_delays = ReceiptDelays {
+            direct_at: Some(127),
+            trade_at: None,
+        };
+        for (market, offset) in [(market("BTC"), dec!(100)), (market("ETH"), dec!(200))] {
+            populate_with_receipt_delays(
+                &mut engine,
+                &mut aggregator,
+                market,
+                PopulateRange {
+                    start: 0,
+                    count: 128,
+                    offset,
+                    step: dec!(1),
+                },
+                None,
+                receipt_delays,
+            );
+        }
+        let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
+        complete(&mut engine, &mut aggregator, decision);
+
+        for snapshot in engine.snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision)
+        {
+            assert!(snapshot.is_ready(), "unexpected snapshot: {snapshot:#?}");
+            assert!(
+                snapshot
+                    .input_range()
+                    .expect("ready snapshot must retain provenance")
+                    .spans()
+                    .iter()
+                    .all(|span| span.available_at() <= decision)
+            );
+        }
+    }
+
+    #[test]
+    fn delayed_candle_is_unavailable_at_its_completed_bar_boundary() {
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        populate_with_receipt_delays(
+            &mut engine,
+            &mut aggregator,
+            market("BTC"),
+            PopulateRange {
+                start: 0,
+                count: 128,
+                offset: dec!(100),
+                step: dec!(1),
+            },
+            None,
+            ReceiptDelays {
+                direct_at: None,
+                trade_at: Some(127),
+            },
+        );
+        let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
+        complete(&mut engine, &mut aggregator, decision);
+
+        assert!(
+            engine
+                .snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision)
+                .is_empty()
         );
     }
 
