@@ -13,6 +13,7 @@ blake3.workspace = true
 libm.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 url.workspace = true
@@ -20,4 +21,3 @@ url.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 rust_decimal_macros.workspace = true
-serde_json.workspace = true

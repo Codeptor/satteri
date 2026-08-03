@@ -4,6 +4,10 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::{Decimal, RoundingStrategy};
 use thiserror::Error;
 
+use crate::domain::{Market, Sleeve};
+use crate::event::{CandleInterval, TimestampNs};
+use crate::features::common::{FeatureSnapshot, LongHorizonFeatureHistory};
+
 const UNIT_DECIMAL_PLACES: u32 = 12;
 
 /// A rule-scoring input could not be evaluated without weakening a frozen rule.
@@ -52,10 +56,10 @@ pub enum RuleScoreError {
 /// Completed-hour inputs used for the frozen rules regime classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HourlyRuleInputs {
-    ema_8: Decimal,
-    ema_32: Decimal,
-    atr_14: Decimal,
-    adx_14: Decimal,
+    pub(crate) ema_8: Decimal,
+    pub(crate) ema_32: Decimal,
+    pub(crate) atr_14: Decimal,
+    pub(crate) adx_14: Decimal,
 }
 
 impl HourlyRuleInputs {
@@ -91,35 +95,35 @@ impl HourlyRuleInputs {
 /// snapshot and its checked long-horizon companion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleInputs {
-    close: Decimal,
-    ema_8: Decimal,
-    ema_32: Decimal,
-    ema_8_slope_4: Decimal,
-    atr_14: Decimal,
-    atrp_14: Decimal,
-    adx_14: Decimal,
-    return_4: Decimal,
-    return_16: Decimal,
-    donchian_20_position: Decimal,
-    volume_robust_z_20: Decimal,
-    close_ema_20_residual_robust_z_20: Decimal,
-    bid_depth_10bps: Decimal,
-    ask_depth_10bps: Decimal,
-    bid_depth_25bps: Decimal,
-    ask_depth_25bps: Decimal,
-    bid_depth_50bps: Decimal,
-    ask_depth_50bps: Decimal,
-    trade_imbalance_5m: Decimal,
-    trade_imbalance_15m: Decimal,
-    spread_bps: Decimal,
-    premium: Decimal,
-    open_interest_change_4: Decimal,
-    funding_level: Decimal,
-    cross_return_4_rank: Decimal,
-    cross_return_16_rank: Decimal,
-    low_10: Decimal,
-    high_10: Decimal,
-    hourly: HourlyRuleInputs,
+    pub(crate) close: Decimal,
+    pub(crate) ema_8: Decimal,
+    pub(crate) ema_32: Decimal,
+    pub(crate) ema_8_slope_4: Decimal,
+    pub(crate) atr_14: Decimal,
+    pub(crate) atrp_14: Decimal,
+    pub(crate) adx_14: Decimal,
+    pub(crate) return_4: Decimal,
+    pub(crate) return_16: Decimal,
+    pub(crate) donchian_20_position: Decimal,
+    pub(crate) volume_robust_z_20: Decimal,
+    pub(crate) close_ema_20_residual_robust_z_20: Decimal,
+    pub(crate) bid_depth_10bps: Decimal,
+    pub(crate) ask_depth_10bps: Decimal,
+    pub(crate) bid_depth_25bps: Decimal,
+    pub(crate) ask_depth_25bps: Decimal,
+    pub(crate) bid_depth_50bps: Decimal,
+    pub(crate) ask_depth_50bps: Decimal,
+    pub(crate) trade_imbalance_5m: Decimal,
+    pub(crate) trade_imbalance_15m: Decimal,
+    pub(crate) spread_bps: Decimal,
+    pub(crate) premium: Decimal,
+    pub(crate) open_interest_change_4: Decimal,
+    pub(crate) funding_level: Decimal,
+    pub(crate) cross_return_4_rank: Decimal,
+    pub(crate) cross_return_16_rank: Decimal,
+    pub(crate) low_10: Decimal,
+    pub(crate) high_10: Decimal,
+    pub(crate) hourly: HourlyRuleInputs,
 }
 
 impl RuleInputs {
@@ -163,11 +167,253 @@ impl RuleInputs {
 /// Bounded historical inputs required by the frozen derivatives and volatility rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleHistory {
-    premium: Vec<Decimal>,
-    open_interest_change_4: Vec<Decimal>,
-    funding: Vec<Decimal>,
-    hourly_realized_volatility_20: Vec<Decimal>,
-    current_hourly_realized_volatility_20: Decimal,
+    pub(crate) premium: Vec<Decimal>,
+    pub(crate) open_interest_change_4: Vec<Decimal>,
+    pub(crate) funding: Vec<Decimal>,
+    pub(crate) hourly_realized_volatility_20: Vec<Decimal>,
+    pub(crate) current_hourly_realized_volatility_20: Decimal,
+}
+
+/// A checked, strategy-ready rule input frame derived only from immutable features.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuleFeatureFrame {
+    market: Market,
+    sleeve: Sleeve,
+    as_of_time: TimestampNs,
+    snapshot_digest: String,
+    universe_digest: String,
+    history_digest: String,
+    inputs: RuleInputs,
+    history: RuleHistory,
+}
+
+impl RuleFeatureFrame {
+    /// Reconstructs rules inputs from a point-in-time common snapshot and its exact history.
+    pub(crate) fn from_snapshot(
+        snapshot: &FeatureSnapshot,
+        long_history: &LongHorizonFeatureHistory,
+    ) -> Result<Self, RuleFeatureInputError> {
+        if !snapshot.is_ready() {
+            return Err(RuleFeatureInputError::SnapshotNotReady);
+        }
+        long_history
+            .verify()
+            .map_err(|_| RuleFeatureInputError::LongHorizonInvalid)?;
+        if snapshot.market().as_str() != long_history.market() {
+            return Err(RuleFeatureInputError::MarketMismatch);
+        }
+        let sleeve = sleeve_from_interval(snapshot.sleeve());
+        if sleeve_name(sleeve) != long_history.sleeve() {
+            return Err(RuleFeatureInputError::SleeveMismatch);
+        }
+        if snapshot.as_of_time().value() != long_history.as_of_time_ns() {
+            return Err(RuleFeatureInputError::TimeMismatch);
+        }
+        let universe_digest = snapshot
+            .input_range()
+            .and_then(|range| range.universe_digest())
+            .filter(|digest| !digest.is_empty())
+            .ok_or(RuleFeatureInputError::UniverseProvenanceMissing)?
+            .to_owned();
+        let values = snapshot.values();
+        let inputs = RuleInputs {
+            close: value(values, "close")?,
+            ema_8: value(values, "ema_8")?,
+            ema_32: value(values, "ema_32")?,
+            ema_8_slope_4: value(values, "ema_8_slope_4")?,
+            atr_14: value(values, "atr_14")?,
+            atrp_14: value(values, "atrp_14")?,
+            adx_14: value(values, "adx_14")?,
+            return_4: value(values, "return_4")?,
+            return_16: value(values, "return_16")?,
+            donchian_20_position: value(values, "donchian_20_position")?,
+            volume_robust_z_20: value(values, "volume_robust_z_20")?,
+            close_ema_20_residual_robust_z_20: value(values, "close_ema_20_residual_robust_z_20")?,
+            bid_depth_10bps: value(values, "bid_depth_10bps")?,
+            ask_depth_10bps: value(values, "ask_depth_10bps")?,
+            bid_depth_25bps: value(values, "bid_depth_25bps")?,
+            ask_depth_25bps: value(values, "ask_depth_25bps")?,
+            bid_depth_50bps: value(values, "bid_depth_50bps")?,
+            ask_depth_50bps: value(values, "ask_depth_50bps")?,
+            trade_imbalance_5m: value(values, "trade_imbalance_5m")?,
+            trade_imbalance_15m: value(values, "trade_imbalance_15m")?,
+            spread_bps: value(values, "spread_bps")?,
+            premium: value(values, "premium")?,
+            open_interest_change_4: value(values, "open_interest_change_4")?,
+            funding_level: value(values, "funding_level")?,
+            cross_return_4_rank: value(values, "cross_return_4_rank")?,
+            cross_return_16_rank: value(values, "cross_return_16_rank")?,
+            low_10: value(values, "low_10")?,
+            high_10: value(values, "high_10")?,
+            hourly: hourly_inputs(snapshot)?,
+        };
+        let history = RuleHistory {
+            premium: long_history
+                .premium_history()
+                .iter()
+                .map(|value| value.value())
+                .collect(),
+            open_interest_change_4: long_history
+                .open_interest_change_4_history()
+                .iter()
+                .map(|value| value.value())
+                .collect(),
+            funding: long_history
+                .funding_history()
+                .iter()
+                .map(|value| value.value())
+                .collect(),
+            hourly_realized_volatility_20: long_history
+                .hourly_realized_volatility_20_history()
+                .iter()
+                .map(|value| value.value())
+                .collect(),
+            current_hourly_realized_volatility_20: long_history
+                .current_hourly_realized_volatility_20(),
+        };
+        validate_current_history_values(&inputs, &history)?;
+        Ok(Self {
+            market: snapshot.market().clone(),
+            sleeve,
+            as_of_time: snapshot.as_of_time(),
+            snapshot_digest: snapshot.snapshot_hash().to_owned(),
+            universe_digest,
+            history_digest: long_history.input_digest().to_owned(),
+            inputs,
+            history,
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn market(&self) -> &Market {
+        &self.market
+    }
+
+    #[must_use]
+    pub(crate) const fn sleeve(&self) -> Sleeve {
+        self.sleeve
+    }
+
+    #[must_use]
+    pub(crate) const fn as_of_time(&self) -> TimestampNs {
+        self.as_of_time
+    }
+
+    #[must_use]
+    pub(crate) fn snapshot_digest(&self) -> &str {
+        &self.snapshot_digest
+    }
+
+    #[must_use]
+    pub(crate) fn universe_digest(&self) -> &str {
+        &self.universe_digest
+    }
+
+    #[must_use]
+    pub(crate) fn history_digest(&self) -> &str {
+        &self.history_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn inputs(&self) -> &RuleInputs {
+        &self.inputs
+    }
+
+    #[must_use]
+    pub(crate) const fn history(&self) -> &RuleHistory {
+        &self.history
+    }
+}
+
+/// Immutable common-feature inputs cannot supply an auditable rule evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub(crate) enum RuleFeatureInputError {
+    /// Snapshot was not fully ready at its explicit completed-bar boundary.
+    #[error("common feature snapshot is not strategy-ready")]
+    SnapshotNotReady,
+    /// A declared common-feature schema value was missing.
+    #[error("required rule feature {field} is absent")]
+    MissingValue {
+        /// Stable missing schema field.
+        field: &'static str,
+    },
+    /// Long-horizon history failed its own complete provenance verification.
+    #[error("long-horizon rule history is invalid")]
+    LongHorizonInvalid,
+    /// Snapshot and history named different markets.
+    #[error("snapshot and long-horizon history markets differ")]
+    MarketMismatch,
+    /// Snapshot and history used different sleeves.
+    #[error("snapshot and long-horizon history sleeves differ")]
+    SleeveMismatch,
+    /// Snapshot and history used different explicit completed-bar boundaries.
+    #[error("snapshot and long-horizon history boundaries differ")]
+    TimeMismatch,
+    /// Snapshot provenance had no frozen universe membership digest.
+    #[error("snapshot is missing frozen-universe provenance")]
+    UniverseProvenanceMissing,
+    /// Current snapshot derivatives were not the final values in their exact histories.
+    #[error("snapshot derivatives do not match their long-horizon histories")]
+    CurrentHistoryMismatch,
+}
+
+fn value(
+    values: &std::collections::BTreeMap<String, Decimal>,
+    field: &'static str,
+) -> Result<Decimal, RuleFeatureInputError> {
+    values
+        .get(field)
+        .copied()
+        .ok_or(RuleFeatureInputError::MissingValue { field })
+}
+
+fn hourly_inputs(snapshot: &FeatureSnapshot) -> Result<HourlyRuleInputs, RuleFeatureInputError> {
+    let regime = snapshot
+        .regime()
+        .ok_or(RuleFeatureInputError::MissingValue {
+            field: "hourly_regime",
+        })?;
+    Ok(HourlyRuleInputs {
+        ema_8: regime.ema_8(),
+        ema_32: regime.ema_32(),
+        atr_14: regime.atr_14(),
+        adx_14: regime.adx_14(),
+    })
+}
+
+fn validate_current_history_values(
+    inputs: &RuleInputs,
+    history: &RuleHistory,
+) -> Result<(), RuleFeatureInputError> {
+    let matches = history
+        .premium
+        .last()
+        .is_some_and(|value| *value == inputs.premium)
+        && history
+            .open_interest_change_4
+            .last()
+            .is_some_and(|value| *value == inputs.open_interest_change_4)
+        && history
+            .funding
+            .last()
+            .is_some_and(|value| *value == inputs.funding_level);
+    matches
+        .then_some(())
+        .ok_or(RuleFeatureInputError::CurrentHistoryMismatch)
+}
+
+const fn sleeve_from_interval(sleeve: CandleInterval) -> Sleeve {
+    match sleeve {
+        CandleInterval::FifteenMinutes => Sleeve::FifteenMinute,
+        CandleInterval::OneHour => Sleeve::OneHour,
+    }
+}
+
+const fn sleeve_name(sleeve: Sleeve) -> &'static str {
+    match sleeve {
+        Sleeve::FifteenMinute => "15m",
+        Sleeve::OneHour => "1h",
+    }
 }
 
 /// One of the immutable rules regimes.
@@ -374,7 +620,7 @@ pub fn score(inputs: &RuleInputs, history: &RuleHistory) -> Result<RuleScores, R
     validate_unit_interval("cross_return_4_rank", inputs.cross_return_4_rank)?;
     validate_unit_interval("cross_return_16_rank", inputs.cross_return_16_rank)?;
 
-    let trend_scale = clip(
+    let trend_scale = clip_range(
         inputs
             .adx_14
             .checked_sub(Decimal::from(15))
@@ -385,6 +631,8 @@ pub fn score(inputs: &RuleInputs, history: &RuleHistory) -> Result<RuleScores, R
             .ok_or(RuleScoreError::Arithmetic {
                 operation: "trend ADX scale",
             })?,
+        Decimal::ZERO,
+        Decimal::ONE,
     );
     let ema_gap = inputs
         .ema_8
@@ -451,12 +699,14 @@ pub fn score(inputs: &RuleInputs, history: &RuleHistory) -> Result<RuleScores, R
         ])?
         .checked_mul(
             Decimal::ONE
-                .checked_sub(clip(
+                .checked_sub(clip_range(
                     inputs.spread_bps.checked_div(Decimal::from(15)).ok_or(
                         RuleScoreError::Arithmetic {
                             operation: "microstructure spread scale",
                         },
                     )?,
+                    Decimal::ZERO,
+                    Decimal::ONE,
                 ))
                 .ok_or(RuleScoreError::Arithmetic {
                     operation: "microstructure spread confidence",
@@ -748,6 +998,27 @@ mod tests {
             score(&inputs, &golden_history()),
             Err(RuleScoreError::UnusableVolatilityScale { .. })
         ));
+    }
+
+    #[test]
+    fn trend_and_microstructure_confidence_use_zero_one_not_signed_clipping() {
+        let mut low_adx = golden_inputs();
+        low_adx.adx_14 = dec!(0);
+        assert_eq!(
+            score(&low_adx, &golden_history())
+                .expect("valid score")
+                .trend(),
+            dec!(0)
+        );
+
+        let mut wide_spread = golden_inputs();
+        wide_spread.spread_bps = dec!(30);
+        assert_eq!(
+            score(&wide_spread, &golden_history())
+                .expect("valid score")
+                .microstructure(),
+            dec!(0)
+        );
     }
 
     #[test]
