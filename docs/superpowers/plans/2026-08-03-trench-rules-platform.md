@@ -313,7 +313,7 @@ git commit -m "feat(market): add read-only Hyperliquid info client"
 
 - [ ] **Step 1: Write failing subscription and disconnect tests**
 
-Assert subscriptions can be built only for `allMids`, `l2Book`, `bbo`, `trades`, and active-asset context. Feed duplicate trades, out-of-order books, malformed frames, ping/pong, and a forced disconnect. Expected outputs are normalized events plus explicit `GapOpened`/`GapClosed` control events; no strategy-ready signal may appear before a fresh snapshot.
+Assert subscriptions can be built only for `allMids`, `l2Book`, `bbo`, `trades`, and active-asset context. Feed duplicate trades, out-of-order books, malformed frames, ping/pong, and a forced disconnect. Expected outputs are normalized events plus explicit `GapOpened` and post-snapshot `GapRecoveryRequest` control records; no strategy-ready signal may appear before an independent recovery result.
 
 - [ ] **Step 2: Verify failure**
 
@@ -423,7 +423,7 @@ git commit -m "feat(features): add point-in-time market features"
 
 - [ ] **Step 1: Write failing live-gap reconciliation tests**
 
-Feed a Task-6 `GapRecoveryRequest`, mock `candleSnapshot` responses for the exact 15-minute/1-hour range, and provide locally derived trades. Assert matching OHLCV closes the gap and rebuilds warmup, a mismatch persists a conflict/quarantine span, and an unavailable interval stays unavailable. No strategy-ready event may occur before every required interval is resolved or explicitly unavailable.
+Feed a Task-6 `GapRecoveryRequest`, mock `candleSnapshot` responses for the exact 15-minute/1-hour range, and provide locally derived trades. Assert matching OHLCV reconciles the span and rebuilds warmup, a mismatch persists a conflict/quarantine span, and an unavailable interval stays unavailable. No strategy-ready event may occur before every required interval is resolved or explicitly unavailable.
 
 - [ ] **Step 2: Write failing archive reconciliation tests**
 

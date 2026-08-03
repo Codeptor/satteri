@@ -23,8 +23,10 @@ use tokio::time::{Instant, timeout};
 use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 use tokio_util::sync::CancellationToken;
-use trench_core::domain::{Market, Price, Quantity, Side};
+use trench_core::domain::{EventId, Market, Price, Quantity, Side};
 use trench_core::event::{Bbo, BookLevel, BookSnapshot, MarketEvent, TimestampNs, Trade};
+
+use crate::recovery::GapRecoveryRequest;
 
 // Three subscriptions per market and a four-second reconnect floor bound a
 // pathological reconnect storm to 1,584 subscription frames per minute.
@@ -467,6 +469,11 @@ pub enum WsOutput {
     MarketEvent(MarketEvent),
     /// An append-only transport-gap record that gates execution readiness.
     Gap(GapEvent),
+    /// A typed handoff emitted after its fresh post-gap L2 market event.
+    ///
+    /// This does not close the gap or restore readiness. A downstream pure
+    /// recovery coordinator must reconcile explicit evidence first.
+    RecoveryRequest(GapRecoveryRequest),
     /// A rejected wire update retained for observability without its raw body.
     Rejected(RejectedUpdate),
     /// A non-recoverable bounded-stream condition that ends this epoch.
@@ -497,16 +504,13 @@ impl TradeIdentityLimit {
 /// One append-only interruption record, kept separate from market facts.
 ///
 /// A [`GapEvent::Opened`] never asserts trade continuity. Consumers must gate
-/// paper execution for the affected market until the matching
-/// [`GapEvent::Closed`] arrives after a newly received valid full L2 snapshot.
-/// [`GapEvent::ReconnectExhausted`] leaves that gate closed and marks the
-/// bounded stream as terminal.
+/// paper execution for the affected market until a matching recovery request
+/// has been independently reconciled. [`GapEvent::ReconnectExhausted`] leaves
+/// that gate closed and marks the bounded stream as terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GapEvent {
     /// A connection failure made one selected market's continuity unknown.
     Opened(GapOpened),
-    /// A new full L2 snapshot arrived after a recorded gap.
-    Closed(GapClosed),
     /// The bounded reconnect budget ended while this gap remained open.
     ReconnectExhausted(GapExhausted),
 }
@@ -532,6 +536,9 @@ pub struct GapOpened {
     reason: GapReason,
     last_event_time: Option<TimestampNs>,
     last_received_at: Option<TimestampNs>,
+    last_trade_event_time: Option<TimestampNs>,
+    last_trade_received_at: Option<TimestampNs>,
+    last_trade_event_id: Option<EventId>,
 }
 
 impl GapOpened {
@@ -564,61 +571,27 @@ impl GapOpened {
     pub const fn last_received_at(&self) -> Option<TimestampNs> {
         self.last_received_at
     }
-}
 
-/// Evidence that a previously-opened gap has a fresh L2 recovery point.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GapClosed {
-    generation: u64,
-    market: Market,
-    reason: GapReason,
-    last_event_time: Option<TimestampNs>,
-    last_received_at: Option<TimestampNs>,
-    reconnect_received_at: TimestampNs,
-    reconnect_attempt: u32,
-}
-
-impl GapClosed {
-    /// Returns the interruption generation being closed.
+    /// Returns the final accepted trade's exchange timestamp before the gap.
+    ///
+    /// This remains separate from the generic feed cursor because a later BBO
+    /// or L2 event cannot delimit missing trade/candle evidence.
     #[must_use]
-    pub const fn generation(&self) -> u64 {
-        self.generation
+    pub const fn last_trade_event_time(&self) -> Option<TimestampNs> {
+        self.last_trade_event_time
     }
 
-    /// Returns the market whose fresh L2 snapshot recovered this gap.
+    /// Returns the receipt timestamp of the final accepted trade, when known.
     #[must_use]
-    pub const fn market(&self) -> &Market {
-        &self.market
+    pub const fn last_trade_received_at(&self) -> Option<TimestampNs> {
+        self.last_trade_received_at
     }
 
-    /// Returns the reason that originally opened the gap.
+    /// Returns the final accepted trade identity, completing its canonical
+    /// `(event_time, received_at, event_id)` ordering cursor when present.
     #[must_use]
-    pub const fn reason(&self) -> GapReason {
-        self.reason
-    }
-
-    /// Returns the last authoritative exchange event time before the interruption.
-    #[must_use]
-    pub const fn last_event_time(&self) -> Option<TimestampNs> {
-        self.last_event_time
-    }
-
-    /// Returns the receipt timestamp of the final pre-gap market fact.
-    #[must_use]
-    pub const fn last_received_at(&self) -> Option<TimestampNs> {
-        self.last_received_at
-    }
-
-    /// Returns the receipt timestamp of the fresh post-reconnect L2 snapshot.
-    #[must_use]
-    pub const fn reconnect_received_at(&self) -> TimestampNs {
-        self.reconnect_received_at
-    }
-
-    /// Returns the bounded reconnect attempt that obtained the fresh snapshot.
-    #[must_use]
-    pub const fn reconnect_attempt(&self) -> u32 {
-        self.reconnect_attempt
+    pub const fn last_trade_event_id(&self) -> Option<&EventId> {
+        self.last_trade_event_id.as_ref()
     }
 }
 
@@ -1192,13 +1165,18 @@ async fn handle_frame(
                         .then(|| event.market().clone())
                     });
                     for event in events {
-                        let gap = state.record_event(&event);
+                        let recovery_request = state.record_event(&event);
                         if !send_output(output, io.cancellation, WsOutput::MarketEvent(event)).await
                         {
                             return FrameOutcome::OutputClosed;
                         }
-                        if let Some(gap) = gap
-                            && !send_output(output, io.cancellation, WsOutput::Gap(gap)).await
+                        if let Some(request) = recovery_request
+                            && !send_output(
+                                output,
+                                io.cancellation,
+                                WsOutput::RecoveryRequest(request),
+                            )
+                            .await
                         {
                             return FrameOutcome::OutputClosed;
                         }
@@ -1358,6 +1336,24 @@ struct StreamState {
     pending_gaps: BTreeMap<Market, PendingGap>,
     last_event_times: BTreeMap<Market, TimestampNs>,
     last_received_at: BTreeMap<Market, TimestampNs>,
+    last_trade_cursors: BTreeMap<Market, TradeCursor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TradeCursor {
+    event_time: TimestampNs,
+    received_at: TimestampNs,
+    event_id: EventId,
+}
+
+impl TradeCursor {
+    fn from_event(event: &MarketEvent) -> Self {
+        Self {
+            event_time: event.event_time(),
+            received_at: event.received_at(),
+            event_id: event.event_id().clone(),
+        }
+    }
 }
 
 struct PendingGap {
@@ -1373,6 +1369,7 @@ impl StreamState {
             pending_gaps: BTreeMap::new(),
             last_event_times: BTreeMap::new(),
             last_received_at: BTreeMap::new(),
+            last_trade_cursors: BTreeMap::new(),
         }
     }
 
@@ -1394,6 +1391,18 @@ impl StreamState {
                     generation: self.generation,
                     last_event_time: self.last_event_times.get(&market).copied(),
                     last_received_at: self.last_received_at.get(&market).copied(),
+                    last_trade_event_time: self
+                        .last_trade_cursors
+                        .get(&market)
+                        .map(|cursor| cursor.event_time),
+                    last_trade_received_at: self
+                        .last_trade_cursors
+                        .get(&market)
+                        .map(|cursor| cursor.received_at),
+                    last_trade_event_id: self
+                        .last_trade_cursors
+                        .get(&market)
+                        .map(|cursor| cursor.event_id.clone()),
                     market: market.clone(),
                     reason,
                 };
@@ -1432,12 +1441,22 @@ impl StreamState {
             .collect()
     }
 
-    fn record_event(&mut self, event: &MarketEvent) -> Option<GapEvent> {
+    fn record_event(&mut self, event: &MarketEvent) -> Option<GapRecoveryRequest> {
         let market = event.market().clone();
         self.last_event_times
             .insert(market.clone(), event.event_time());
         self.last_received_at
             .insert(market.clone(), event.received_at());
+        if matches!(event.kind(), trench_core::event::MarketEventKind::Trade(_)) {
+            let cursor = TradeCursor::from_event(event);
+            if self
+                .last_trade_cursors
+                .get(&market)
+                .is_none_or(|current| cursor > *current)
+            {
+                self.last_trade_cursors.insert(market.clone(), cursor);
+            }
+        }
         if !matches!(
             event.kind(),
             trench_core::event::MarketEventKind::BookSnapshot(_)
@@ -1445,16 +1464,7 @@ impl StreamState {
             return None;
         }
         self.pending_gaps.remove(&market).map(|pending| {
-            let opened = pending.opened;
-            GapEvent::Closed(GapClosed {
-                generation: opened.generation,
-                market,
-                reason: opened.reason,
-                last_event_time: opened.last_event_time,
-                last_received_at: opened.last_received_at,
-                reconnect_received_at: event.received_at(),
-                reconnect_attempt: pending.reconnect_attempt,
-            })
+            GapRecoveryRequest::from_gap_snapshot(&pending.opened, event, pending.reconnect_attempt)
         })
     }
 }
@@ -2681,6 +2691,155 @@ mod tests {
     }
 
     #[test]
+    fn recovery_request_keeps_a_trade_cursor_when_a_later_bbo_advances_the_feed_cursor() {
+        let received_at = TimestampNs::new(1_700_000_000_003_000_000)
+            .expect("test receipt timestamp must be valid");
+        let mut decoder = Decoder::new([market("BTC")]);
+        let mut state = super::StreamState::new(vec![market("BTC")]);
+        let trade = json!({
+            "channel": "trades",
+            "data": [{
+                "coin": "BTC", "side": "B", "px": "1", "sz": "1",
+                "time": 1_700_000_000_000_i64, "tid": 1
+            }]
+        })
+        .to_string();
+        let bbo = json!({
+            "channel": "bbo",
+            "data": {
+                "coin": "BTC", "time": 1_700_000_000_001_i64,
+                "bbo": [
+                    {"px": "1", "sz": "1", "n": 1},
+                    {"px": "2", "sz": "1", "n": 1}
+                ]
+            }
+        })
+        .to_string();
+        let snapshot = json!({
+            "channel": "l2Book",
+            "data": {
+                "coin": "BTC", "time": 1_700_000_000_002_i64,
+                "levels": [
+                    [{"px": "1", "sz": "1", "n": 1}],
+                    [{"px": "2", "sz": "1", "n": 1}]
+                ]
+            }
+        })
+        .to_string();
+
+        let DecodedFrame::MarketEvents(mut events) = decoder
+            .decode(&trade, received_at)
+            .expect("trade must decode")
+        else {
+            panic!("trade frame must produce an event");
+        };
+        let trade_event = events.pop().expect("trade event must remain present");
+        let expected_trade_id = trade_event.event_id().clone();
+        state.record_event(&trade_event);
+        let DecodedFrame::MarketEvents(mut events) =
+            decoder.decode(&bbo, received_at).expect("BBO must decode")
+        else {
+            panic!("BBO frame must produce an event");
+        };
+        state.record_event(&events.pop().expect("BBO event must remain present"));
+
+        let _ = state.open_gaps(GapReason::TransportClosed);
+        state.record_reconnect_connection();
+        let DecodedFrame::MarketEvents(mut events) = decoder
+            .decode(&snapshot, received_at)
+            .expect("snapshot must decode")
+        else {
+            panic!("snapshot frame must produce an event");
+        };
+        let request = state
+            .record_event(&events.pop().expect("snapshot event must remain present"))
+            .expect("fresh snapshot must create a recovery request");
+
+        assert_eq!(
+            request.predecessor_event_time(),
+            Some(TimestampNs::new(1_700_000_000_001_000_000).expect("BBO time must fit"))
+        );
+        assert_eq!(
+            request.trade_predecessor_event_time(),
+            Some(TimestampNs::new(1_700_000_000_000_000_000).expect("trade time must fit"))
+        );
+        assert_eq!(
+            request.trade_predecessor_event_id(),
+            Some(&expected_trade_id)
+        );
+    }
+
+    #[test]
+    fn recovery_request_uses_the_maximum_full_trade_cursor_from_a_trade_batch() {
+        let received_at = TimestampNs::new(1_700_000_000_003_000_000)
+            .expect("test receipt timestamp must be valid");
+        let mut decoder = Decoder::new([market("BTC")]);
+        let mut state = super::StreamState::new(vec![market("BTC")]);
+        let trades = json!({
+            "channel": "trades",
+            "data": [
+                {"coin": "BTC", "side": "B", "px": "1", "sz": "1", "time": 1_700_000_000_000_i64, "tid": 1},
+                {"coin": "BTC", "side": "B", "px": "1", "sz": "1", "time": 1_700_000_000_000_i64, "tid": 2},
+                {"coin": "BTC", "side": "B", "px": "1", "sz": "1", "time": 1_700_000_000_000_i64, "tid": 3}
+            ]
+        })
+        .to_string();
+        let snapshot = json!({
+            "channel": "l2Book",
+            "data": {
+                "coin": "BTC", "time": 1_700_000_000_002_i64,
+                "levels": [
+                    [{"px": "1", "sz": "1", "n": 1}],
+                    [{"px": "2", "sz": "1", "n": 1}]
+                ]
+            }
+        })
+        .to_string();
+
+        let DecodedFrame::MarketEvents(events) = decoder
+            .decode(&trades, received_at)
+            .expect("trade batch must decode")
+        else {
+            panic!("trade batch must produce market events");
+        };
+        let expected = events
+            .iter()
+            .max_by(|left, right| {
+                left.event_time()
+                    .cmp(&right.event_time())
+                    .then_with(|| left.received_at().cmp(&right.received_at()))
+                    .then_with(|| left.event_id().cmp(right.event_id()))
+            })
+            .map(|event| {
+                (
+                    event.event_time(),
+                    event.received_at(),
+                    event.event_id().clone(),
+                )
+            })
+            .expect("trade batch must be nonempty");
+        for event in events {
+            state.record_event(&event);
+        }
+
+        let _ = state.open_gaps(GapReason::TransportClosed);
+        state.record_reconnect_connection();
+        let DecodedFrame::MarketEvents(mut events) = decoder
+            .decode(&snapshot, received_at)
+            .expect("snapshot must decode")
+        else {
+            panic!("snapshot must produce an event");
+        };
+        let request = state
+            .record_event(&events.pop().expect("snapshot event must remain present"))
+            .expect("fresh snapshot must create a recovery request");
+
+        assert_eq!(request.trade_predecessor_event_time(), Some(expected.0));
+        assert_eq!(request.trade_predecessor_received_at(), Some(expected.1));
+        assert_eq!(request.trade_predecessor_event_id(), Some(&expected.2));
+    }
+
+    #[test]
     fn reconnect_backoff_is_seeded_bounded_and_deterministic_for_tests() {
         let limits = WsLimits::default();
         let mut first = super::ReconnectBackoff::new(7);
@@ -2792,7 +2951,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disconnect_creates_append_only_gap_and_requires_a_fresh_l2_to_close() {
+    async fn disconnect_emits_a_recovery_request_after_the_fresh_l2_snapshot() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind loopback WebSocket server");
@@ -2860,15 +3019,23 @@ mod tests {
             .expect("fresh snapshot before timeout")
             .expect("stream remains open");
         assert!(matches!(second, WsOutput::MarketEvent(_)));
-        let gap_closed = timeout(Duration::from_secs(1), stream.recv())
+        let recovery_request = timeout(Duration::from_secs(1), stream.recv())
             .await
-            .expect("gap closure before timeout")
+            .expect("recovery request before timeout")
             .expect("stream remains open");
-        let WsOutput::Gap(GapEvent::Closed(closed)) = gap_closed else {
-            panic!("only a fresh L2 snapshot can close a typed gap");
+        let WsOutput::RecoveryRequest(request) = recovery_request else {
+            panic!("fresh L2 must be followed by a typed recovery request, never false readiness");
         };
-        assert_eq!(closed.generation(), 1);
-        assert_eq!(closed.reconnect_attempt(), 1);
+        assert_eq!(request.generation(), 1);
+        assert_eq!(request.reconnect_attempt(), 1);
+        assert_eq!(request.market(), &market("BTC"));
+        assert!(request.predecessor_event_time().is_some());
+        assert!(
+            request.snapshot_event_time()
+                > request
+                    .predecessor_event_time()
+                    .expect("predecessor cursor")
+        );
         stream.cancel();
         server.await.expect("server task must complete");
     }
@@ -3281,7 +3448,7 @@ mod tests {
         .expect("test configuration is valid");
         let mut stream = WsClient::new_for_test(config, endpoint).start();
         let mut fresh_l2s = 0;
-        let mut recovered_gaps = 0;
+        let mut recovery_requests = 0;
         let mut exhausted = Vec::new();
         while let Some(output) = timeout(Duration::from_secs(1), stream.recv())
             .await
@@ -3289,14 +3456,14 @@ mod tests {
         {
             match output {
                 WsOutput::MarketEvent(_) => fresh_l2s += 1,
-                WsOutput::Gap(GapEvent::Closed(_)) => recovered_gaps += 1,
+                WsOutput::RecoveryRequest(_) => recovery_requests += 1,
                 WsOutput::Gap(GapEvent::ReconnectExhausted(gap)) => exhausted.push(gap),
                 WsOutput::Gap(GapEvent::Opened(_)) | WsOutput::Rejected(_) => {}
                 WsOutput::Terminal(_) => panic!("identity cap must not end this recovery test"),
             }
         }
         assert_eq!(fresh_l2s, 2);
-        assert_eq!(recovered_gaps, 2);
+        assert_eq!(recovery_requests, 2);
         assert_eq!(exhausted.len(), 2);
         assert!(exhausted.iter().all(|gap| gap.reconnect_attempts() == 2));
         server
@@ -3433,15 +3600,15 @@ mod tests {
             .await
             .expect("server must not observe a reconnect after the recovery budget exhausts");
 
-        let mut closed_markets = Vec::new();
+        let mut recovery_markets = Vec::new();
         let mut exhausted_markets = Vec::new();
         while let Some(output) = timeout(Duration::from_secs(1), stream.recv())
             .await
             .expect("typed output before timeout")
         {
             match output {
-                WsOutput::Gap(GapEvent::Closed(closed)) => {
-                    closed_markets.push(closed.market().clone());
+                WsOutput::RecoveryRequest(request) => {
+                    recovery_markets.push(request.market().clone());
                 }
                 WsOutput::Gap(GapEvent::ReconnectExhausted(exhausted)) => {
                     exhausted_markets.push(exhausted.market().clone());
@@ -3452,7 +3619,7 @@ mod tests {
                 WsOutput::Terminal(_) => panic!("identity cap must not end this recovery test"),
             }
         }
-        assert_eq!(closed_markets, vec![market("BTC"), market("BTC")]);
+        assert_eq!(recovery_markets, vec![market("BTC"), market("BTC")]);
         assert_eq!(exhausted_markets, vec![market("BTC"), market("ETH")]);
     }
 
@@ -3885,15 +4052,15 @@ mod tests {
             .expect("later fresh L2 before timeout")
             .expect("stream remains open");
         assert!(matches!(recovered, WsOutput::MarketEvent(_)));
-        let closed = timeout(Duration::from_secs(1), stream.recv())
+        let recovery_request = timeout(Duration::from_secs(1), stream.recv())
             .await
-            .expect("matching gap closure before timeout")
+            .expect("matching recovery request before timeout")
             .expect("stream remains open");
-        let WsOutput::Gap(GapEvent::Closed(closed)) = closed else {
-            panic!("later L2 must close the original gap generation");
+        let WsOutput::RecoveryRequest(request) = recovery_request else {
+            panic!("later L2 must emit a recovery request without closing the original gap");
         };
-        assert_eq!(closed.generation(), 1);
-        assert_eq!(closed.reconnect_attempt(), 2);
+        assert_eq!(request.generation(), 1);
+        assert_eq!(request.reconnect_attempt(), 2);
         stream.cancel();
         server.await.expect("server task must complete");
     }

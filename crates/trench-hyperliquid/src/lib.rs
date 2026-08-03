@@ -3,6 +3,7 @@
 mod archive;
 mod info;
 mod normalize;
+mod recovery;
 mod ws;
 
 pub use archive::{
@@ -17,7 +18,13 @@ pub use normalize::{
     AssetContext, BookLevel, Candle, FundingRecord, L2Book, MetaAndAssetContexts, PerpAsset,
     SignedRate, VenueMaxLeverage,
 };
+pub use recovery::{
+    GapRecovery, GapRecoveryRequest, MAX_OUTSTANDING_RECOVERY_REQUESTS,
+    MAX_PROCESSED_RECOVERY_REQUESTS, MAX_RECOVERY_LOCAL_TRADES, MAX_RECOVERY_OFFICIAL_CANDLES,
+    RecoveryError, RecoveryEvidence, RecoveryResult, RecoverySource, RecoveryStatus,
+    RecoveryUnavailable,
+};
 pub use ws::{
-    GapClosed, GapEvent, GapExhausted, GapOpened, GapReason, RejectedUpdate, RejectionReason,
+    GapEvent, GapExhausted, GapOpened, GapReason, RejectedUpdate, RejectionReason,
     TradeIdentityLimit, WsClient, WsConfig, WsError, WsLimits, WsOutput, WsStream, WsTerminal,
 };

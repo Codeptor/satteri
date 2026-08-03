@@ -43,6 +43,13 @@ trench-hyperliquid = {{ path = {:?} }}
 
     for (method, source) in [
         (
+            "GapRecoveryRequest::new",
+            r#"fn main() {
+    let _ = trench_hyperliquid::GapRecoveryRequest::new();
+}
+"#,
+        ),
+        (
             "post_json",
             r#"fn main() {
     let client = trench_hyperliquid::InfoClient::new("https://api.hyperliquid.xyz/info").unwrap();

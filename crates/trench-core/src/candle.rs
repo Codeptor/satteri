@@ -51,7 +51,9 @@ pub struct Candle {
 ///
 /// The optional start is absent only when the stream had not yet accepted a
 /// predecessor event. In that case every earlier candle is conservatively
-/// unavailable until `end`.
+/// unavailable until `end`. Because the durable gap representation does not
+/// retain an event identity, new trades at a known lower-bound timestamp are
+/// conservatively rejected too: multiple trades can share one exchange time.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CandleGap {
     market: Market,
@@ -83,7 +85,10 @@ impl CandleGap {
         &self.market
     }
 
-    /// Returns the authoritative event-time predecessor, when one exists.
+    /// Returns the authoritative predecessor timestamp, when one exists.
+    ///
+    /// New trades at this exact timestamp remain unavailable conservatively,
+    /// because this representation cannot distinguish their event identities.
     #[must_use]
     pub const fn start(&self) -> Option<TimestampNs> {
         self.start
@@ -468,7 +473,7 @@ pub struct CandleAggregator {
     pending: BTreeMap<BucketKey, PendingCandle>,
     hourly_trade_ids: BTreeMap<BucketKey, BTreeSet<EventId>>,
     unavailable_gaps: Vec<CandleGap>,
-    watermark: Option<TimestampNs>,
+    watermarks: BTreeMap<Market, TimestampNs>,
 }
 
 impl CandleAggregator {
@@ -491,7 +496,7 @@ impl CandleAggregator {
     /// Returns [`CandleError`] when the span is invalid, would revise finalized
     /// output, or exceeds the fixed journal capacity.
     pub fn mark_gap_unavailable(&mut self, gap: CandleGap) -> Result<(), CandleError> {
-        if let Some(watermark) = self.watermark
+        if let Some(watermark) = self.watermarks.get(gap.market()).copied()
             && gap.start().is_none_or(|start| start < watermark)
         {
             return Err(CandleError::GapBeforeWatermark { watermark });
@@ -548,7 +553,10 @@ impl CandleAggregator {
         }
         if self.unavailable_gaps.iter().any(|gap| {
             gap.market() == &point.market
-                && gap.start().is_none_or(|start| point.event_time > start)
+                // A gap stores only a timestamp lower bound. It must therefore
+                // conservatively include that whole timestamp: distinct trades
+                // can share an exchange block time with the known predecessor.
+                && gap.start().is_none_or(|start| point.event_time >= start)
                 && point.event_time < gap.end()
         }) {
             return Err(CandleError::TradeWithinUnavailableGap {
@@ -582,7 +590,7 @@ impl CandleAggregator {
                 open_time: bucket_open(point.event_time, interval)?,
             });
         }
-        if let Some(watermark) = self.watermark {
+        if let Some(watermark) = self.watermarks.get(&point.market).copied() {
             for key in &keys {
                 let close = key
                     .open_time
@@ -627,7 +635,8 @@ impl CandleAggregator {
         Ok(())
     }
 
-    /// Closes every interval whose exchange-time close is at or before `watermark`.
+    /// Closes every known market interval whose exchange-time close is at or
+    /// before `watermark`.
     ///
     /// Only nonempty intervals emit a candle, but elapsed empty intervals are
     /// closed too: a later trade for either kind of interval is rejected.
@@ -640,28 +649,67 @@ impl CandleAggregator {
     /// Returns [`CandleError`] when the watermark moves backwards or exact
     /// candle aggregation cannot be represented.
     pub fn complete_through(&mut self, watermark: TimestampNs) -> Result<Vec<Candle>, CandleError> {
-        if let Some(previous) = self.watermark
-            && watermark < previous
-        {
-            return Err(CandleError::BackwardWatermark {
-                previous,
-                current: watermark,
-            });
+        let markets = self
+            .pending
+            .keys()
+            .map(|key| key.market.clone())
+            .chain(self.watermarks.keys().cloned())
+            .collect::<BTreeSet<_>>();
+        self.complete_markets_through(&markets, watermark)
+    }
+
+    /// Closes one market's intervals through an explicit exchange-time
+    /// watermark without advancing any other market's replay state.
+    ///
+    /// Recovery uses this scoped form so an independently reconciled market
+    /// cannot finalize candles across another market's outstanding gap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CandleError`] when this market's watermark moves backwards or
+    /// exact candle aggregation cannot be represented.
+    pub fn complete_market_through(
+        &mut self,
+        market: &Market,
+        watermark: TimestampNs,
+    ) -> Result<Vec<Candle>, CandleError> {
+        self.complete_markets_through(&BTreeSet::from([market.clone()]), watermark)
+    }
+
+    fn complete_markets_through(
+        &mut self,
+        markets: &BTreeSet<Market>,
+        watermark: TimestampNs,
+    ) -> Result<Vec<Candle>, CandleError> {
+        for market in markets {
+            if let Some(previous) = self.watermarks.get(market)
+                && watermark < *previous
+            {
+                return Err(CandleError::BackwardWatermark {
+                    previous: *previous,
+                    current: watermark,
+                });
+            }
         }
 
-        self.pending.keys().try_for_each(|key| {
-            key.open_time
-                .checked_add(key.interval.duration())
-                .map(|_| ())
-                .map_err(CandleError::from)
-        })?;
+        self.pending
+            .keys()
+            .filter(|key| markets.contains(&key.market))
+            .try_for_each(|key| {
+                key.open_time
+                    .checked_add(key.interval.duration())
+                    .map(|_| ())
+                    .map_err(CandleError::from)
+            })?;
         let complete = self
             .pending
             .keys()
             .filter(|key| {
-                key.open_time
-                    .checked_add(key.interval.duration())
-                    .is_ok_and(|close| close <= watermark)
+                markets.contains(&key.market)
+                    && key
+                        .open_time
+                        .checked_add(key.interval.duration())
+                        .is_ok_and(|close| close <= watermark)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -708,7 +756,9 @@ impl CandleAggregator {
                 }
             }
         }
-        self.watermark = Some(watermark);
+        for market in markets {
+            self.watermarks.insert(market.clone(), watermark);
+        }
         Ok(candles)
     }
 
@@ -897,6 +947,43 @@ mod tests {
     }
 
     #[test]
+    fn market_scoped_watermarks_do_not_finalize_another_markets_gap() {
+        let btc = Market::new("BTC").expect("test market must be valid");
+        let eth = Market::new("ETH").expect("test market must be valid");
+        let mut aggregator = CandleAggregator::new();
+        aggregator
+            .ingest(&trade(1, 1, dec!(100)))
+            .expect("BTC trade must be accepted");
+        aggregator
+            .ingest(
+                &MarketEvent::trade(
+                    timestamp(1),
+                    timestamp(1),
+                    eth.clone(),
+                    Trade::new(
+                        2,
+                        Side::Buy,
+                        Price::new(dec!(100)).expect("test price must be valid"),
+                        Quantity::new(dec!(1)).expect("test quantity must be valid"),
+                    )
+                    .expect("test trade must be valid"),
+                )
+                .expect("test event must be valid"),
+            )
+            .expect("ETH trade must be accepted");
+
+        let completed = aggregator
+            .complete_market_through(&btc, timestamp(900_000_000_000))
+            .expect("BTC watermark must be valid");
+        assert!(completed.iter().all(|candle| candle.market() == &btc));
+        let eth_gap = CandleGap::new(eth, Some(timestamp(1)), timestamp(900_000_000_000))
+            .expect("ETH gap must be valid");
+        aggregator
+            .mark_gap_unavailable(eth_gap)
+            .expect("BTC recovery must not finalize ETH's unresolved gap");
+    }
+
+    #[test]
     fn rejects_a_late_trade_for_an_empty_interval_closed_by_the_watermark() {
         let mut aggregator = CandleAggregator::new();
         aggregator
@@ -943,7 +1030,7 @@ mod tests {
         );
         assert_eq!(aggregator.pending, pending_before);
         assert_eq!(aggregator.seen, seen_before);
-        assert_eq!(aggregator.watermark, None);
+        assert!(aggregator.watermarks.is_empty());
     }
 
     #[test]
@@ -969,7 +1056,7 @@ mod tests {
         assert_eq!(aggregator.hourly_trade_ids, hourly_trade_ids_before);
         assert_eq!(aggregator.finalized, finalized_before);
         assert_eq!(aggregator.finalized_order, finalized_order_before);
-        assert_eq!(aggregator.watermark, None);
+        assert!(aggregator.watermarks.is_empty());
     }
 
     #[test]
@@ -994,7 +1081,12 @@ mod tests {
         assert_eq!(aggregator.pending, pending_before);
         assert_eq!(aggregator.seen, seen_before);
         assert_eq!(aggregator.hourly_trade_ids, hourly_trade_ids_before);
-        assert_eq!(aggregator.watermark, Some(timestamp(0)));
+        assert_eq!(
+            aggregator
+                .watermarks
+                .get(&Market::new("BTC").expect("test market")),
+            Some(&timestamp(0))
+        );
     }
 
     #[test]
