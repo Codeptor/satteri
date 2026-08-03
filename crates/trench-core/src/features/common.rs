@@ -854,12 +854,7 @@ impl LongHorizonFeatureHistory {
         let as_of_time = checked_history_timestamp(self.as_of_time_ns, "snapshot boundary")?;
         let hourly_as_of_time =
             checked_history_timestamp(self.hourly_as_of_time_ns, "hourly snapshot boundary")?;
-        let hour_ns = CandleInterval::OneHour.duration().value();
-        let expected_hourly_as_of = as_of_time.value() - as_of_time.value() % hour_ns;
-        if hourly_as_of_time.value() > as_of_time.value()
-            || hourly_as_of_time.value() % hour_ns != 0
-            || hourly_as_of_time.value() != expected_hourly_as_of
-        {
+        if hourly_as_of_time.value() != floor_one_hour(as_of_time) {
             return Err(LongHorizonHistoryError::InvalidHourlyAsOf);
         }
         if !self.completeness.is_complete() {
@@ -1727,6 +1722,7 @@ impl CommonFeatureEngine {
             CandleInterval::OneHour,
         )?;
         let hourly_as_of_time = hourly_history.last()?.close_time().ok()?;
+        (hourly_as_of_time.value() == floor_one_hour(as_of_time)).then_some(())?;
         let current_hourly_realized_volatility_20 =
             realized_volatility(hourly_history, HOURLY_REALIZED_VOLATILITY_WINDOW)?;
         let hourly_realized_volatility_20_history = (HOURLY_REALIZED_VOLATILITY_WINDOW
@@ -1867,6 +1863,12 @@ impl CommonFeatureEngine {
         });
         let hourly_history = self.candle_history(&market, CandleInterval::OneHour, as_of_time);
         let hourly_history = contiguous_tail(&hourly_history, 32, CandleInterval::OneHour);
+        let hourly_history = hourly_history.filter(|history| {
+            history
+                .last()
+                .and_then(|candle| candle.close_time().ok())
+                .is_some_and(|close| close.value() == floor_one_hour(as_of_time))
+        });
         let hourly_history_pruned = hourly_history.is_none()
             && self
                 .pruned_candle_through
@@ -2789,6 +2791,11 @@ fn contiguous_tail<'a>(
         }
     }
     Some(tail)
+}
+
+fn floor_one_hour(as_of_time: TimestampNs) -> i64 {
+    let hour_ns = CandleInterval::OneHour.duration().value();
+    as_of_time.value() - as_of_time.value() % hour_ns
 }
 
 fn sampled_sources<'a>(
@@ -3854,6 +3861,47 @@ mod tests {
         timestamp(i128::from(BARS) * FIFTEEN_MINUTES_NS)
     }
 
+    fn populate_long_history_delaying_latest_hourly_candle(
+        engine: &mut CommonFeatureEngine,
+        aggregator: &mut CandleAggregator,
+        market: Market,
+    ) -> TimestampNs {
+        const BARS: u64 = 90 * 24 * 4 + 20 * 4 + 8;
+
+        for start in (0..BARS).step_by(512) {
+            let count = (BARS - start).min(512);
+            populate_with_receipt_delays(
+                engine,
+                aggregator,
+                market.clone(),
+                PopulateRange {
+                    start,
+                    count,
+                    offset: dec!(100),
+                    step: dec!(1),
+                    volume_spike: None,
+                },
+                None,
+                ReceiptDelays::default(),
+            );
+            let close = timestamp(i128::from(start + count) * FIFTEEN_MINUTES_NS);
+            for candle in aggregator
+                .complete_through(close)
+                .expect("watermark must be valid")
+            {
+                let is_delayed_current_hour = start + count == BARS
+                    && candle.candle().interval() == crate::event::CandleInterval::OneHour
+                    && candle.close_time() == Ok(close);
+                if !is_delayed_current_hour {
+                    engine
+                        .ingest_candle(candle)
+                        .expect("candle must be accepted");
+                }
+            }
+        }
+        timestamp(i128::from(BARS) * FIFTEEN_MINUTES_NS)
+    }
+
     #[test]
     fn same_exchange_time_uses_receipt_time_before_identity_for_latest_bbo_and_book() {
         let market = market("BTC");
@@ -4714,6 +4762,63 @@ mod tests {
                 history
             );
         }
+    }
+
+    #[test]
+    fn delayed_latest_hourly_candle_fails_closed_at_an_off_hour_decision() {
+        const BARS: u64 = 90 * 24 * 4 + 20 * 4 + 8;
+
+        let market = market("BTC");
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        let completed_hour = populate_long_history_delaying_latest_hourly_candle(
+            &mut engine,
+            &mut aggregator,
+            market.clone(),
+        );
+        populate_with_receipt_delays(
+            &mut engine,
+            &mut aggregator,
+            market.clone(),
+            PopulateRange {
+                start: BARS,
+                count: 1,
+                offset: dec!(100),
+                step: dec!(1),
+                volume_spike: None,
+            },
+            None,
+            ReceiptDelays::default(),
+        );
+        let decision = timestamp(i128::from(BARS + 1) * FIFTEEN_MINUTES_NS);
+        complete(&mut engine, &mut aggregator, decision);
+        assert_eq!(
+            decision.value(),
+            completed_hour.value()
+                + i64::try_from(FIFTEEN_MINUTES_NS).expect("fixed interval fits")
+        );
+
+        assert!(
+            engine
+                .long_horizon_history_at(
+                    &market,
+                    crate::event::CandleInterval::FifteenMinutes,
+                    decision,
+                )
+                .is_none(),
+            "the missing receipt-available hourly candle must not fall back to its predecessor"
+        );
+
+        let snapshot = engine
+            .snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision)
+            .into_iter()
+            .find(|snapshot| snapshot.market() == &market)
+            .expect("current fifteen-minute candle must produce a snapshot");
+        assert!(!snapshot.completeness().regime());
+        assert_eq!(
+            snapshot.unready_reason(),
+            Some(FeatureUnreadyReason::HourlyRegime)
+        );
     }
 
     #[test]
