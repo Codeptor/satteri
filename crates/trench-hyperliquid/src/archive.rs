@@ -23,6 +23,8 @@ const MAX_RECORD_BYTES: usize = 1_024 * 1_024;
 const MAX_EVENTS_PER_SOURCE: usize = 5_000_000;
 const DIGEST_BUFFER_BYTES: usize = 64 * 1_024;
 const CONTENT_DIGEST_DOMAIN: &str = "trench.archive.content.v1";
+const LZ4_FRAME_MAGIC: [u8; 4] = [0x04, 0x22, 0x4d, 0x18];
+const LZ4_CONTENT_CHECKSUM_FLAG: u8 = 0b0000_0100;
 
 /// The market-data channel contained by a local archive object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -743,28 +745,108 @@ fn read_source(
         }
         events.push(event);
     }
-    let compressed = reader.into_inner().into_inner();
+    let mut decoder = reader.into_inner();
+    let trailing = decoder
+        .fill_buf()
+        .map_err(|source| ArchiveError::Decompression {
+            path: path.clone(),
+            source,
+        })?;
+    if !trailing.is_empty() {
+        return Err(incomplete_lz4_frame(&path));
+    }
+    let mut compressed = decoder.into_inner();
+    compressed.drain_to_end(&path)?;
+    if !compressed.has_complete_lz4_terminal() {
+        return Err(incomplete_lz4_frame(&path));
+    }
     verify_streamed_source(&path, compressed_bytes, compressed_digest, compressed)?;
     Ok(events)
 }
 
 struct DigestingReader<R> {
     bytes_read: u64,
+    first_bytes: [u8; 5],
+    first_bytes_len: usize,
     hasher: Hasher,
     inner: R,
+    trailing_bytes: [u8; 8],
+    trailing_bytes_len: usize,
 }
 
 impl<R> DigestingReader<R> {
     fn new(inner: R) -> Self {
         Self {
             bytes_read: 0,
+            first_bytes: [0; 5],
+            first_bytes_len: 0,
             hasher: Hasher::new(),
             inner,
+            trailing_bytes: [0; 8],
+            trailing_bytes_len: 0,
         }
+    }
+
+    fn drain_to_end(&mut self, path: &Path) -> Result<(), ArchiveError>
+    where
+        R: Read,
+    {
+        let mut buffer = [0_u8; DIGEST_BUFFER_BYTES];
+        while self
+            .read(&mut buffer)
+            .map_err(|source| ArchiveError::SourceIo {
+                path: path.to_path_buf(),
+                source,
+            })?
+            != 0
+        {}
+        Ok(())
+    }
+
+    fn has_complete_lz4_terminal(&self) -> bool {
+        if self.first_bytes_len < self.first_bytes.len() || self.first_bytes[..4] != LZ4_FRAME_MAGIC
+        {
+            return false;
+        }
+        let terminal_length = if self.first_bytes[4] & LZ4_CONTENT_CHECKSUM_FLAG != 0 {
+            8
+        } else {
+            4
+        };
+        if self.trailing_bytes_len < terminal_length {
+            return false;
+        }
+        let terminal_start = self.trailing_bytes_len - terminal_length;
+        self.trailing_bytes[terminal_start..terminal_start + 4]
+            .iter()
+            .all(|byte| *byte == 0)
     }
 
     fn finish(self) -> (u64, ArchiveDigest) {
         (self.bytes_read, ArchiveDigest::from_hasher(self.hasher))
+    }
+
+    fn observe(&mut self, bytes: &[u8]) {
+        let prefix_remaining = self.first_bytes.len() - self.first_bytes_len;
+        let prefix_len = prefix_remaining.min(bytes.len());
+        self.first_bytes[self.first_bytes_len..self.first_bytes_len + prefix_len]
+            .copy_from_slice(&bytes[..prefix_len]);
+        self.first_bytes_len += prefix_len;
+
+        let trailing_capacity = self.trailing_bytes.len();
+        if bytes.len() >= trailing_capacity {
+            self.trailing_bytes
+                .copy_from_slice(&bytes[bytes.len() - trailing_capacity..]);
+            self.trailing_bytes_len = trailing_capacity;
+            return;
+        }
+        let retained = self.trailing_bytes_len.min(trailing_capacity - bytes.len());
+        self.trailing_bytes.copy_within(
+            self.trailing_bytes_len - retained..self.trailing_bytes_len,
+            0,
+        );
+        self.trailing_bytes[retained..retained + bytes.len()].copy_from_slice(bytes);
+        self.trailing_bytes_len = retained + bytes.len();
     }
 }
 
@@ -773,7 +855,18 @@ impl<R: Read> Read for DigestingReader<R> {
         let read = self.inner.read(buffer)?;
         self.bytes_read = self.bytes_read.saturating_add(read as u64);
         self.hasher.update(&buffer[..read]);
+        self.observe(&buffer[..read]);
         Ok(read)
+    }
+}
+
+fn incomplete_lz4_frame(path: &Path) -> ArchiveError {
+    ArchiveError::Decompression {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "archive LZ4 frame did not end with a complete terminal marker",
+        ),
     }
 }
 
