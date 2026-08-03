@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::book::OrderBook;
 use crate::domain::{DomainError, LedgerId, Leverage, MarginMode, Market, Price, Quantity, Usdc};
-use crate::event::TimestampNs;
+use crate::event::{DurationNs, TimestampNs};
 use crate::risk::breakers::{BreakerError, BreakerState};
 
 const INITIAL_EQUITY: Decimal = Decimal::ONE_HUNDRED;
@@ -96,6 +96,100 @@ impl MarkCosts {
     #[must_use]
     pub const fn none() -> Self {
         Self::new(Usdc::zero(), Usdc::zero())
+    }
+}
+
+/// A finite, explicit upper bound for the age of an executable book source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BookFreshness {
+    max_age: DurationNs,
+}
+
+impl BookFreshness {
+    /// Creates a typed finite maximum source-book age.
+    #[must_use]
+    pub const fn new(max_age: DurationNs) -> Self {
+        Self { max_age }
+    }
+
+    /// Returns the maximum permitted age measured from source event time.
+    #[must_use]
+    pub const fn max_age(&self) -> DurationNs {
+        self.max_age
+    }
+}
+
+/// Source timestamps used to prove a book was available at a ledger transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BookSourceTimes {
+    event_time: TimestampNs,
+    received_at: TimestampNs,
+}
+
+impl BookSourceTimes {
+    /// Returns the authoritative exchange event time for this book.
+    #[must_use]
+    pub const fn event_time(&self) -> TimestampNs {
+        self.event_time
+    }
+
+    /// Returns the local receipt time for this book.
+    #[must_use]
+    pub const fn received_at(&self) -> TimestampNs {
+        self.received_at
+    }
+}
+
+/// Why a supplied book cannot supply executable valuation at the transition time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookStaleReason {
+    /// No source book was available for the mark.
+    Missing,
+    /// The source event itself occurred after the ledger transition.
+    FutureEventTime,
+    /// The book was not received until after the ledger transition.
+    FutureReceiptTime,
+    /// The source event age exceeded the explicit maximum.
+    TooOld,
+}
+
+/// Freshness evidence retained by immutable ledger state after every book mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookFreshnessStatus {
+    /// No book mark has occurred yet.
+    Unmarked,
+    /// The source event and receipt were available within the explicit maximum age.
+    Fresh {
+        /// Event and receipt timestamps for the executable source.
+        source: BookSourceTimes,
+        /// Explicit maximum source age used for this decision.
+        max_age: DurationNs,
+    },
+    /// The prior executable valuation was preserved because this source was unusable.
+    Stale {
+        /// The known source timestamps, absent only for a missing book.
+        source: Option<BookSourceTimes>,
+        /// Explicit maximum source age used for this decision.
+        max_age: DurationNs,
+        /// Deterministic reason this source cannot be used.
+        reason: BookStaleReason,
+    },
+}
+
+impl BookFreshnessStatus {
+    const fn is_fresh(self) -> bool {
+        matches!(self, Self::Fresh { .. })
+    }
+
+    fn is_fresh_at(self, at: TimestampNs) -> bool {
+        let Self::Fresh { source, max_age } = self else {
+            return false;
+        };
+        source.event_time <= at
+            && source.received_at <= at
+            && at
+                .checked_duration_since(source.event_time)
+                .is_ok_and(|age| age <= max_age)
     }
 }
 
@@ -295,7 +389,7 @@ pub struct LedgerState {
     breakers: BreakerState,
     last_executable_mark: Option<ExecutableMark>,
     fresh_book_market: Option<Market>,
-    executable_mark_stale: bool,
+    book_freshness: BookFreshnessStatus,
     liquidity_incomplete: bool,
 }
 
@@ -320,7 +414,7 @@ impl LedgerState {
             breakers: BreakerState::new(opened_at, cash)?,
             last_executable_mark: None,
             fresh_book_market: None,
-            executable_mark_stale: true,
+            book_freshness: BookFreshnessStatus::Unmarked,
             liquidity_incomplete: false,
         })
     }
@@ -436,7 +530,13 @@ impl LedgerState {
     /// Returns whether no fresh executable valuation is currently available.
     #[must_use]
     pub const fn executable_mark_stale(&self) -> bool {
-        self.executable_mark_stale
+        !self.book_freshness.is_fresh()
+    }
+
+    /// Returns source-time evidence for the current executable-mark status.
+    #[must_use]
+    pub const fn book_freshness(&self) -> BookFreshnessStatus {
+        self.book_freshness
     }
 
     /// Returns whether the current mark used the mandatory 200-bps depth fallback.
@@ -445,65 +545,69 @@ impl LedgerState {
         self.liquidity_incomplete
     }
 
-    /// Applies a fresh full-exit book valuation or preserves the last valuation on missing data.
+    /// Applies a source-time-fresh full-exit valuation or preserves the last valuation.
     ///
     /// A long walks bids and a short walks asks for the full remaining asset
     /// quantity. When visible depth is insufficient, the residual is priced at
     /// the mandatory 200-bps boundary from the best executable quote.
     ///
+    /// Future, missing, and too-old sources create a stale transition rather
+    /// than a valuation. Freshness is measured from source event time under the
+    /// caller-supplied typed bound, and a receipt after `at` is always rejected
+    /// to prevent replay look-ahead.
+    ///
     /// # Errors
     ///
-    /// Rejects backward time, market mismatch, arithmetic failure, and a mark
-    /// that cannot remain a nonnegative synthetic-equity state.
+    /// Rejects backward time, fresh-book market mismatch, arithmetic failure,
+    /// and a mark that cannot remain a nonnegative synthetic-equity state.
     pub fn mark_to_book(
         &self,
         at: TimestampNs,
         book: Option<&OrderBook>,
+        freshness: BookFreshness,
         costs: MarkCosts,
     ) -> Result<LedgerTransition, LedgerError> {
         let mut state = self.clone();
-        match book {
-            None => {
-                state.breakers = self.breakers.record_equity(at, self.equity)?;
-                state.executable_mark_stale = true;
-                Ok(Self::transition(
-                    at,
-                    LedgerTransitionKind::BookMarked {
-                        stale: true,
-                        liquidity_incomplete: self.liquidity_incomplete,
-                    },
-                    state,
-                ))
+        let status = book_freshness_status(at, book, freshness);
+        let Some(book) = book.filter(|_| status.is_fresh()) else {
+            state.breakers = self.breakers.record_equity(at, self.equity)?;
+            state.fresh_book_market = None;
+            state.book_freshness = status;
+            return Ok(Self::transition(
+                at,
+                LedgerTransitionKind::BookMarked {
+                    stale: true,
+                    liquidity_incomplete: self.liquidity_incomplete,
+                },
+                state,
+            ));
+        };
+
+        if let Some(position) = &self.position {
+            if position.market != *book.market() {
+                return Err(LedgerError::BookMarketMismatch);
             }
-            Some(book) => {
-                if let Some(position) = &self.position {
-                    if position.market != *book.market() {
-                        return Err(LedgerError::BookMarketMismatch);
-                    }
-                    let mark = executable_mark(position, book, costs)?;
-                    state.unrealized_pnl = marked_pnl(position, mark.exit_value, costs)?;
-                    state.equity =
-                        equity_from(state.cash, state.isolated_margin, state.unrealized_pnl)?;
-                    state.breakers = self.breakers.record_equity(at, state.equity)?;
-                    state.last_executable_mark = Some(mark);
-                    state.liquidity_incomplete = mark.liquidity_incomplete;
-                } else {
-                    state.breakers = self.breakers.record_equity(at, state.equity)?;
-                    state.last_executable_mark = None;
-                    state.liquidity_incomplete = false;
-                }
-                state.fresh_book_market = Some(book.market().clone());
-                state.executable_mark_stale = false;
-                Ok(Self::transition(
-                    at,
-                    LedgerTransitionKind::BookMarked {
-                        stale: false,
-                        liquidity_incomplete: state.liquidity_incomplete,
-                    },
-                    state,
-                ))
-            }
+            let mark = executable_mark(position, book, costs)?;
+            state.unrealized_pnl = marked_pnl(position, mark.exit_value, costs)?;
+            state.equity = equity_from(state.cash, state.isolated_margin, state.unrealized_pnl)?;
+            state.breakers = self.breakers.record_equity(at, state.equity)?;
+            state.last_executable_mark = Some(mark);
+            state.liquidity_incomplete = mark.liquidity_incomplete;
+        } else {
+            state.breakers = self.breakers.record_equity(at, state.equity)?;
+            state.last_executable_mark = None;
+            state.liquidity_incomplete = false;
         }
+        state.fresh_book_market = Some(book.market().clone());
+        state.book_freshness = status;
+        Ok(Self::transition(
+            at,
+            LedgerTransitionKind::BookMarked {
+                stale: false,
+                liquidity_incomplete: state.liquidity_incomplete,
+            },
+            state,
+        ))
     }
 
     /// Applies one complete isolated entry fill without mutating this state.
@@ -521,7 +625,9 @@ impl LedgerState {
         if self.position.is_some() {
             return Err(LedgerError::PositionAlreadyOpen);
         }
-        if self.executable_mark_stale || self.fresh_book_market.as_ref() != Some(&entry.market) {
+        if !self.book_freshness.is_fresh_at(at)
+            || self.fresh_book_market.as_ref() != Some(&entry.market)
+        {
             return Err(LedgerError::StaleExecutableMark);
         }
         if !self.breakers.allows_planned_loss(planned_loss, self.equity) {
@@ -675,6 +781,56 @@ impl LedgerState {
 
     fn transition(at: TimestampNs, kind: LedgerTransitionKind, state: Self) -> LedgerTransition {
         LedgerTransition { at, kind, state }
+    }
+}
+
+fn book_freshness_status(
+    at: TimestampNs,
+    book: Option<&OrderBook>,
+    freshness: BookFreshness,
+) -> BookFreshnessStatus {
+    let Some(book) = book else {
+        return BookFreshnessStatus::Stale {
+            source: None,
+            max_age: freshness.max_age,
+            reason: BookStaleReason::Missing,
+        };
+    };
+    let source = BookSourceTimes {
+        event_time: book.event_time(),
+        received_at: book.received_at(),
+    };
+    if source.event_time > at {
+        return BookFreshnessStatus::Stale {
+            source: Some(source),
+            max_age: freshness.max_age,
+            reason: BookStaleReason::FutureEventTime,
+        };
+    }
+    if source.received_at > at {
+        return BookFreshnessStatus::Stale {
+            source: Some(source),
+            max_age: freshness.max_age,
+            reason: BookStaleReason::FutureReceiptTime,
+        };
+    }
+    let Ok(age) = at.checked_duration_since(source.event_time) else {
+        return BookFreshnessStatus::Stale {
+            source: Some(source),
+            max_age: freshness.max_age,
+            reason: BookStaleReason::FutureEventTime,
+        };
+    };
+    if age > freshness.max_age {
+        return BookFreshnessStatus::Stale {
+            source: Some(source),
+            max_age: freshness.max_age,
+            reason: BookStaleReason::TooOld,
+        };
+    }
+    BookFreshnessStatus::Fresh {
+        source,
+        max_age: freshness.max_age,
     }
 }
 
