@@ -33,6 +33,18 @@ const FUNDING_WINDOW: usize = 30;
 const MAX_MARKETS: usize = 128;
 const POINT_EVENT_HISTORY: usize = 64;
 const TRADE_EVENT_HISTORY: usize = 128;
+/// Number of source identities retained after their active feature history is pruned.
+///
+/// Exact replays remain idempotent within this fixed-capacity horizon. Once it
+/// has filled, a replay that falls before an active source history fails with
+/// [`FeatureError::EventReplayOutsideHorizon`].
+pub const FINALIZED_EVENT_ID_HORIZON: usize = 4_096;
+/// Number of completed-candle identities retained after their active warmup history is pruned.
+///
+/// Exact replays remain idempotent within this fixed-capacity horizon. Once it
+/// has filled, a replay that predates an active candle history fails with
+/// [`FeatureError::CandleReplayOutsideHorizon`].
+pub const FINALIZED_CANDLE_ID_HORIZON: usize = 4_096;
 const MICRO_5_MINUTES_NS: i64 = 300_000_000_000;
 const MICRO_15_MINUTES_NS: i64 = 900_000_000_000;
 
@@ -460,6 +472,18 @@ pub enum FeatureError {
         /// Reused canonical event identity.
         event_id: EventId,
     },
+    /// A canonical normalized event identity changed receipt time.
+    #[error(
+        "normalized event identity {event_id:?} changed receipt time from {existing_received_at} to {received_at}"
+    )]
+    ConflictingEventReceiptTime {
+        /// Reused canonical event identity.
+        event_id: EventId,
+        /// Receipt time already bound to the identity.
+        existing_received_at: TimestampNs,
+        /// Receipt time supplied by the conflicting replay.
+        received_at: TimestampNs,
+    },
     /// A completed-candle identity was reused with a different immutable value.
     #[error("conflicting completed candle for market {market:?} at {open_time}")]
     ConflictingCandle {
@@ -482,6 +506,14 @@ pub enum FeatureError {
         /// Rejected event's authoritative time.
         event_time: TimestampNs,
     },
+    /// A source replay fell outside the bounded finalized-identity horizon.
+    #[error("event identity {event_id:?} is outside retained replay horizon {limit}")]
+    EventReplayOutsideHorizon {
+        /// Replayed canonical event identity.
+        event_id: EventId,
+        /// Number of finalized identities retained for idempotent replay.
+        limit: usize,
+    },
     /// A candle fell before the retained completed-bar horizon.
     #[error("candle for market {market:?} at {open_time} is outside retained history")]
     CandleOutsideRetention {
@@ -490,13 +522,27 @@ pub enum FeatureError {
         /// Rejected candle's interval open time.
         open_time: TimestampNs,
     },
+    /// A completed-candle replay fell outside the bounded finalized-identity horizon.
+    #[error(
+        "completed candle for market {market:?} at {open_time} is outside retained replay horizon {limit}"
+    )]
+    CandleReplayOutsideHorizon {
+        /// Candle market.
+        market: Market,
+        /// Candle interval open time.
+        open_time: TimestampNs,
+        /// Number of finalized candle identities retained for idempotent replay.
+        limit: usize,
+    },
     /// A completed candle contained invalid timestamp arithmetic.
     #[error(transparent)]
     Event(#[from] crate::event::EventError),
 }
 
-type EventKey = (TimestampNs, EventId);
+type EventKey = (TimestampNs, TimestampNs, EventId);
 type EventHistory = BTreeMap<EventKey, MarketEvent>;
+type CompletedCandleId = (Market, CandleInterval, TimestampNs);
+type CompletedCandleOrder = (TimestampNs, Market, CandleInterval);
 
 /// Bounded, source-specific point-in-time histories for one market.
 #[derive(Debug, Default)]
@@ -513,21 +559,32 @@ struct MarketEventHistory {
 impl MarketEventHistory {
     fn accepts(&self, event: &MarketEvent) -> bool {
         let source = self.source(event.kind());
-        let key = (event.event_time(), event.event_id().clone());
+        let key = (
+            event.event_time(),
+            event.received_at(),
+            event.event_id().clone(),
+        );
         source.len() < source_limit(event.kind())
             || source
                 .first_key_value()
                 .is_some_and(|(first, _)| key > *first)
     }
 
-    fn insert(&mut self, event: MarketEvent) -> Vec<EventId> {
+    fn insert(&mut self, event: MarketEvent) -> Vec<MarketEvent> {
         let is_trade = matches!(event.kind(), MarketEventKind::Trade(_));
         let mut pruned = Vec::new();
         let mut pruned_trade_time = None;
         {
             let limit = source_limit(event.kind());
             let source = self.source_mut(event.kind());
-            source.insert((event.event_time(), event.event_id().clone()), event);
+            source.insert(
+                (
+                    event.event_time(),
+                    event.received_at(),
+                    event.event_id().clone(),
+                ),
+                event,
+            );
             while source.len() > limit {
                 if let Some((_, discarded)) = source.pop_first() {
                     if is_trade {
@@ -538,7 +595,7 @@ impl MarketEventHistory {
                                 }),
                         );
                     }
-                    pruned.push(discarded.event_id().clone());
+                    pruned.push(discarded);
                 }
             }
         }
@@ -594,9 +651,17 @@ const fn source_limit(kind: &MarketEventKind) -> usize {
 }
 
 /// Deterministic per-market, per-sleeve common-feature state.
+///
+/// Active source and candle windows are bounded. Identities evicted from those
+/// windows remain idempotent only for [`FINALIZED_EVENT_ID_HORIZON`] or
+/// [`FINALIZED_CANDLE_ID_HORIZON`] canonical ordering positions, respectively.
 #[derive(Debug, Default)]
 pub struct CommonFeatureEngine {
     seen_events: BTreeMap<EventId, MarketEvent>,
+    finalized_events: BTreeMap<EventId, MarketEvent>,
+    finalized_event_order: BTreeMap<EventKey, EventId>,
+    finalized_candles: BTreeMap<CompletedCandleId, Candle>,
+    finalized_candle_order: BTreeMap<CompletedCandleOrder, CompletedCandleId>,
     markets: BTreeSet<Market>,
     events: BTreeMap<Market, MarketEventHistory>,
     candles: BTreeMap<(Market, CandleInterval), BTreeMap<TimestampNs, Candle>>,
@@ -612,8 +677,10 @@ impl CommonFeatureEngine {
 
     /// Records a normalized public input without reading wall-clock time.
     ///
-    /// Exact duplicates are idempotent. Conflicting reuse of a canonical event
-    /// identity fails closed, so replay order cannot choose a feature value.
+    /// Exact duplicates are idempotent while their identity is retained by an
+    /// active source history or [`FINALIZED_EVENT_ID_HORIZON`]. Conflicting
+    /// reuse of a canonical event identity fails closed, so replay order
+    /// cannot choose a feature value.
     ///
     /// # Errors
     ///
@@ -622,17 +689,20 @@ impl CommonFeatureEngine {
     /// source horizon instead of silently changing a bounded feature window.
     pub fn observe(&mut self, event: &MarketEvent) -> Result<(), FeatureError> {
         if let Some(existing) = self.seen_events.get(event.event_id()) {
-            return if existing == event {
-                Ok(())
-            } else {
-                Err(FeatureError::ConflictingEvent {
-                    event_id: event.event_id().clone(),
-                })
-            };
+            return event_duplicate_result(existing, event);
+        }
+        if let Some(existing) = self.finalized_events.get(event.event_id()) {
+            return event_duplicate_result(existing, event);
         }
         self.ensure_market_capacity(event.market())?;
         let history = self.events.entry(event.market().clone()).or_default();
         if !history.accepts(event) {
+            if self.finalized_events.len() == FINALIZED_EVENT_ID_HORIZON {
+                return Err(FeatureError::EventReplayOutsideHorizon {
+                    event_id: event.event_id().clone(),
+                    limit: FINALIZED_EVENT_ID_HORIZON,
+                });
+            }
             return Err(FeatureError::EventOutsideRetention {
                 market: event.market().clone(),
                 event_time: event.event_time(),
@@ -641,8 +711,9 @@ impl CommonFeatureEngine {
         let pruned = history.insert(event.clone());
         self.seen_events
             .insert(event.event_id().clone(), event.clone());
-        for event_id in pruned {
-            self.seen_events.remove(&event_id);
+        for event in pruned {
+            self.seen_events.remove(event.event_id());
+            self.record_finalized_event(event);
         }
         self.markets.insert(event.market().clone());
         Ok(())
@@ -652,12 +723,17 @@ impl CommonFeatureEngine {
     ///
     /// # Errors
     ///
-    /// Returns [`FeatureError::ConflictingCandle`] when a completed-candle
-    /// identity is replayed with a different value, and rejects candles older
-    /// than the explicit completed-bar horizon.
+    /// Exact duplicates are idempotent while their identity is retained by an
+    /// active warmup history or [`FINALIZED_CANDLE_ID_HORIZON`]. Returns
+    /// [`FeatureError::ConflictingCandle`] when a completed-candle identity is
+    /// replayed with a different immutable value.
     pub fn ingest_candle(&mut self, candle: Candle) -> Result<(), FeatureError> {
         let key = (candle.market().clone(), candle.candle().interval());
         let open_time = candle.candle().open_time();
+        let candle_id = (key.0.clone(), key.1, open_time);
+        if let Some(existing) = self.finalized_candles.get(&candle_id) {
+            return candle_duplicate_result(existing, &candle);
+        }
         self.ensure_market_capacity(candle.market())?;
         let mut pruned = Vec::new();
         {
@@ -677,6 +753,13 @@ impl CommonFeatureEngine {
                     .first_key_value()
                     .is_some_and(|(first, _)| open_time <= *first)
             {
+                if self.finalized_candles.len() == FINALIZED_CANDLE_ID_HORIZON {
+                    return Err(FeatureError::CandleReplayOutsideHorizon {
+                        market: candle.market().clone(),
+                        open_time,
+                        limit: FINALIZED_CANDLE_ID_HORIZON,
+                    });
+                }
                 return Err(FeatureError::CandleOutsideRetention {
                     market: candle.market().clone(),
                     open_time,
@@ -695,6 +778,7 @@ impl CommonFeatureEngine {
                 .entry(key.clone())
                 .and_modify(|current| *current = (*current).max(close_time))
                 .or_insert(close_time);
+            self.record_finalized_candle(discarded);
         }
         self.markets.insert(key.0.clone());
         Ok(())
@@ -993,6 +1077,73 @@ impl CommonFeatureEngine {
         }
         Ok(())
     }
+
+    fn record_finalized_event(&mut self, event: MarketEvent) {
+        let order_key = (
+            event.event_time(),
+            event.received_at(),
+            event.event_id().clone(),
+        );
+        self.finalized_event_order
+            .insert(order_key, event.event_id().clone());
+        self.finalized_events
+            .insert(event.event_id().clone(), event);
+        while self.finalized_events.len() > FINALIZED_EVENT_ID_HORIZON {
+            if let Some((_, event_id)) = self.finalized_event_order.pop_first() {
+                self.finalized_events.remove(&event_id);
+            }
+        }
+    }
+
+    fn record_finalized_candle(&mut self, candle: Candle) {
+        let candle_id = (
+            candle.market().clone(),
+            candle.candle().interval(),
+            candle.candle().open_time(),
+        );
+        let order_key = (
+            candle.candle().open_time(),
+            candle.market().clone(),
+            candle.candle().interval(),
+        );
+        self.finalized_candle_order
+            .insert(order_key, candle_id.clone());
+        self.finalized_candles.insert(candle_id, candle);
+        while self.finalized_candles.len() > FINALIZED_CANDLE_ID_HORIZON {
+            if let Some((_, candle_id)) = self.finalized_candle_order.pop_first() {
+                self.finalized_candles.remove(&candle_id);
+            }
+        }
+    }
+}
+
+fn event_duplicate_result(
+    existing: &MarketEvent,
+    incoming: &MarketEvent,
+) -> Result<(), FeatureError> {
+    if existing == incoming {
+        return Ok(());
+    }
+    if existing.received_at() != incoming.received_at() {
+        return Err(FeatureError::ConflictingEventReceiptTime {
+            event_id: incoming.event_id().clone(),
+            existing_received_at: existing.received_at(),
+            received_at: incoming.received_at(),
+        });
+    }
+    Err(FeatureError::ConflictingEvent {
+        event_id: incoming.event_id().clone(),
+    })
+}
+
+fn candle_duplicate_result(existing: &Candle, incoming: &Candle) -> Result<(), FeatureError> {
+    if existing == incoming {
+        return Ok(());
+    }
+    Err(FeatureError::ConflictingCandle {
+        market: incoming.market().clone(),
+        open_time: incoming.candle().open_time(),
+    })
 }
 
 fn available_events(events: &EventHistory, as_of_time: TimestampNs) -> Vec<&MarketEvent> {
@@ -1655,7 +1806,7 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
-    use super::{CommonFeatureEngine, FeatureInputKind, FeatureUnreadyReason};
+    use super::{CommonFeatureEngine, FeatureError, FeatureInputKind, FeatureUnreadyReason};
     use crate::candle::CandleAggregator;
     use crate::domain::{Market, Price, Quantity, Side, Usdc};
     use crate::event::{
@@ -1679,6 +1830,45 @@ mod tests {
 
     fn market(value: &str) -> Market {
         Market::new(value).expect("test market must be valid")
+    }
+
+    fn bbo_at(market: Market, received_at: i128, sequence: u64, bid: Decimal) -> MarketEvent {
+        bbo_at_time(market, 10, received_at, sequence, bid)
+    }
+
+    fn bbo_at_time(
+        market: Market,
+        event_time: i128,
+        received_at: i128,
+        sequence: u64,
+        bid: Decimal,
+    ) -> MarketEvent {
+        MarketEvent::bbo(
+            timestamp(event_time),
+            timestamp(received_at),
+            market,
+            Bbo::new(
+                sequence,
+                BookLevel::new(price(bid), quantity(dec!(1))),
+                BookLevel::new(price(bid + dec!(1)), quantity(dec!(1))),
+            )
+            .expect("test BBO must be valid"),
+        )
+        .expect("test BBO event must be valid")
+    }
+
+    fn book_at(market: Market, received_at: i128, sequence: u64, bid: Decimal) -> MarketEvent {
+        MarketEvent::book_snapshot(
+            timestamp(10),
+            timestamp(received_at),
+            market,
+            BookSnapshot::new(
+                sequence,
+                vec![BookLevel::new(price(bid), quantity(dec!(1)))],
+                vec![BookLevel::new(price(bid + dec!(1)), quantity(dec!(1)))],
+            ),
+        )
+        .expect("test book event must be valid")
     }
 
     #[derive(Clone, Copy)]
@@ -1858,6 +2048,175 @@ mod tests {
                 .ingest_candle(candle)
                 .expect("duplicate candle must be idempotent");
         }
+    }
+
+    #[test]
+    fn same_exchange_time_uses_receipt_time_before_identity_for_latest_bbo_and_book() {
+        let market = market("BTC");
+        let (early_bbo, late_bbo) = (1_u64..64)
+            .flat_map(|early_sequence| {
+                ((early_sequence + 1)..64).map(move |late_sequence| (early_sequence, late_sequence))
+            })
+            .find_map(|(early_sequence, late_sequence)| {
+                let early = bbo_at(market.clone(), 20, early_sequence, dec!(100));
+                let late = bbo_at(market.clone(), 30, late_sequence, dec!(200));
+                (early.event_id() > late.event_id()).then_some((early, late))
+            })
+            .expect("test BBO identities must include an order opposite to receipt time");
+        let (early_book, late_book) = (1_u64..64)
+            .flat_map(|early_sequence| {
+                ((early_sequence + 1)..64).map(move |late_sequence| (early_sequence, late_sequence))
+            })
+            .find_map(|(early_sequence, late_sequence)| {
+                let early = book_at(market.clone(), 20, early_sequence, dec!(100));
+                let late = book_at(market.clone(), 30, late_sequence, dec!(200));
+                (early.event_id() > late.event_id()).then_some((early, late))
+            })
+            .expect("test book identities must include an order opposite to receipt time");
+        assert!(early_bbo.event_id() > late_bbo.event_id());
+        assert!(early_book.event_id() > late_book.event_id());
+
+        let mut engine = CommonFeatureEngine::new();
+        for event in [&late_bbo, &early_bbo, &late_book, &early_book] {
+            engine.observe(event).expect("event must be accepted");
+        }
+
+        assert_eq!(
+            engine
+                .latest_bbo(&market, timestamp(30))
+                .expect("latest BBO must exist")
+                .event_id(),
+            late_bbo.event_id()
+        );
+        assert_eq!(
+            engine
+                .latest_book(&market, timestamp(30))
+                .expect("latest book must exist")
+                .event_id(),
+            late_book.event_id()
+        );
+    }
+
+    #[test]
+    fn source_pruning_preserves_exact_event_replays_within_the_finalized_horizon() {
+        let market = market("BTC");
+        let events = (1..=super::POINT_EVENT_HISTORY + 1)
+            .map(|sequence| bbo_at(market.clone(), 20, sequence as u64, dec!(100)))
+            .collect::<Vec<_>>();
+        let pruned = events
+            .iter()
+            .min_by_key(|event| event.event_id())
+            .expect("events must not be empty")
+            .clone();
+        let mut engine = CommonFeatureEngine::new();
+        for event in &events {
+            engine.observe(event).expect("event must be accepted");
+        }
+
+        assert_eq!(engine.observe(&pruned), Ok(()));
+    }
+
+    #[test]
+    fn source_pruning_keeps_changed_receipts_as_conflicts_within_the_finalized_horizon() {
+        let market = market("BTC");
+        let events = (1..=super::POINT_EVENT_HISTORY + 1)
+            .map(|sequence| bbo_at(market.clone(), 20, sequence as u64, dec!(100)))
+            .collect::<Vec<_>>();
+        let pruned = events
+            .iter()
+            .min_by_key(|event| event.event_id())
+            .expect("events must not be empty");
+        let changed_receipt = match pruned.kind() {
+            crate::event::MarketEventKind::Bbo(bbo) => {
+                bbo_at(market.clone(), 21, bbo.sequence(), dec!(100))
+            }
+            _ => panic!("test event must be a BBO"),
+        };
+        let mut engine = CommonFeatureEngine::new();
+        for event in &events {
+            engine.observe(event).expect("event must be accepted");
+        }
+
+        assert!(matches!(
+            engine.observe(&changed_receipt),
+            Err(FeatureError::ConflictingEventReceiptTime { .. })
+        ));
+    }
+
+    #[test]
+    fn replay_beyond_the_finalized_event_horizon_is_not_reported_as_source_input() {
+        let market = market("BTC");
+        let events = (1..=super::POINT_EVENT_HISTORY + super::FINALIZED_EVENT_ID_HORIZON + 1)
+            .map(|sequence| {
+                bbo_at_time(
+                    market.clone(),
+                    sequence as i128,
+                    sequence as i128,
+                    sequence as u64,
+                    dec!(100),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expired = events.first().expect("events must not be empty").clone();
+        let mut engine = CommonFeatureEngine::new();
+        for event in &events {
+            engine.observe(event).expect("event must be accepted");
+        }
+        assert_eq!(
+            engine.finalized_events.len(),
+            super::FINALIZED_EVENT_ID_HORIZON
+        );
+        assert_eq!(
+            engine.finalized_event_order.len(),
+            super::FINALIZED_EVENT_ID_HORIZON
+        );
+
+        let error = engine
+            .observe(&expired)
+            .expect_err("expired event identity must not be accepted");
+        assert!(matches!(
+            error,
+            FeatureError::EventReplayOutsideHorizon {
+                limit: super::FINALIZED_EVENT_ID_HORIZON,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pruned_completed_candle_replays_remain_idempotent_within_the_finalized_horizon() {
+        let market = market("BTC");
+        let mut source_engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        populate(
+            &mut source_engine,
+            &mut aggregator,
+            market.clone(),
+            0,
+            99,
+            dec!(100),
+            dec!(1),
+        );
+        let candles = aggregator
+            .complete_through(timestamp(99 * FIFTEEN_MINUTES_NS))
+            .expect("watermark must finalize all completed candles");
+        let pruned = candles
+            .iter()
+            .find(|candle| {
+                candle.market() == &market
+                    && candle.candle().interval() == crate::event::CandleInterval::FifteenMinutes
+                    && candle.candle().open_time() == timestamp(0)
+            })
+            .expect("first completed fifteen-minute candle must exist")
+            .clone();
+        let mut engine = CommonFeatureEngine::new();
+        for candle in candles {
+            engine
+                .ingest_candle(candle)
+                .expect("completed candle must be accepted");
+        }
+
+        assert_eq!(engine.ingest_candle(pruned), Ok(()));
     }
 
     #[test]
