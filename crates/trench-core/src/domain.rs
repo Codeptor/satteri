@@ -284,13 +284,13 @@ text_identifier!(
     "A checked normalized-event identifier."
 );
 
-/// Direction of a paper position or order intent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Aggressor direction of a market event or executable paper order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Side {
-    /// Long exposure.
-    Long,
-    /// Short exposure.
-    Short,
+    /// Buy from visible asks.
+    Buy,
+    /// Sell into visible bids.
+    Sell,
 }
 
 /// Decision cadence that owns a paper position.

@@ -9,6 +9,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+blake3.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true
 thiserror.workspace = true
@@ -16,4 +17,5 @@ toml.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 rust_decimal_macros.workspace = true
