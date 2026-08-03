@@ -34,6 +34,8 @@ pub struct Candle {
     last_event_id: EventId,
     first_event_time: TimestampNs,
     last_event_time: TimestampNs,
+    first_received_at: TimestampNs,
+    last_received_at: TimestampNs,
     source_available_at: TimestampNs,
     buy_notional: Decimal,
     sell_notional: Decimal,
@@ -74,6 +76,18 @@ impl Candle {
     #[must_use]
     pub const fn last_event_time(&self) -> TimestampNs {
         self.last_event_time
+    }
+
+    /// Returns the receipt time of the first canonical contributing trade.
+    #[must_use]
+    pub const fn first_received_at(&self) -> TimestampNs {
+        self.first_received_at
+    }
+
+    /// Returns the receipt time of the final canonical contributing trade.
+    #[must_use]
+    pub const fn last_received_at(&self) -> TimestampNs {
+        self.last_received_at
     }
 
     /// Returns the latest receipt time among this candle's contributing trades.
@@ -335,6 +349,8 @@ impl PendingCandle {
             last_event_id: self.last.event_id.clone(),
             first_event_time: self.first.event_time,
             last_event_time: self.last.event_time,
+            first_received_at: self.first.received_at,
+            last_received_at: self.last.received_at,
             source_available_at: self.source_available_at,
             buy_notional: self.buy_notional,
             sell_notional: self.sell_notional,

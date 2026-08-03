@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use blake3::Hasher;
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::candle::Candle;
@@ -119,6 +119,8 @@ pub struct InputEventSpan {
     last_event_id: EventId,
     first_event_time: TimestampNs,
     last_event_time: TimestampNs,
+    first_received_at: TimestampNs,
+    last_received_at: TimestampNs,
     available_at: TimestampNs,
     sampled_at: Option<TimestampNs>,
     aggregate_digest: Option<String>,
@@ -168,6 +170,8 @@ impl InputEventSpan {
             last_event_id: event.event_id().clone(),
             first_event_time: event.event_time(),
             last_event_time: event.event_time(),
+            first_received_at: event.received_at(),
+            last_received_at: event.received_at(),
             available_at: event.received_at(),
             sampled_at: None,
             aggregate_digest: None,
@@ -181,6 +185,8 @@ impl InputEventSpan {
             last_event_id: candle.last_event_id().clone(),
             first_event_time: candle.first_event_time(),
             last_event_time: candle.last_event_time(),
+            first_received_at: candle.first_received_at(),
+            last_received_at: candle.last_received_at(),
             available_at: candle.source_available_at(),
             sampled_at: None,
             aggregate_digest: None,
@@ -201,6 +207,8 @@ impl InputEventSpan {
             last_event_id: aggregate.last_event_id.clone(),
             first_event_time: aggregate.first_event_time,
             last_event_time: aggregate.last_event_time,
+            first_received_at: aggregate.first_received_at,
+            last_received_at: aggregate.last_received_at,
             available_at: aggregate.available_at,
             sampled_at: None,
             aggregate_digest: Some(aggregate.digest()),
@@ -269,11 +277,13 @@ impl InputEventRange {
         let first = spans.iter().min_by(|left, right| {
             left.first_event_time
                 .cmp(&right.first_event_time)
+                .then_with(|| left.first_received_at.cmp(&right.first_received_at))
                 .then_with(|| left.first_event_id.cmp(&right.first_event_id))
         })?;
         let last = spans.iter().max_by(|left, right| {
             left.last_event_time
                 .cmp(&right.last_event_time)
+                .then_with(|| left.last_received_at.cmp(&right.last_received_at))
                 .then_with(|| left.last_event_id.cmp(&right.last_event_id))
         })?;
         Some(Self {
@@ -309,9 +319,11 @@ fn input_digest(spans: &[InputEventSpan], universe_digest: Option<&str>) -> Stri
     for span in spans {
         hasher.update(&[span.kind.identity_tag()]);
         hasher.update(&span.first_event_time.value().to_be_bytes());
+        hasher.update(&span.first_received_at.value().to_be_bytes());
         hasher.update(span.first_event_id.as_str().as_bytes());
         hasher.update(&[0]);
         hasher.update(&span.last_event_time.value().to_be_bytes());
+        hasher.update(&span.last_received_at.value().to_be_bytes());
         hasher.update(span.last_event_id.as_str().as_bytes());
         hasher.update(&[0]);
         hasher.update(&span.available_at.value().to_be_bytes());
@@ -486,13 +498,43 @@ impl RegimeInputs {
 }
 
 /// One exact scalar input sampled at an explicit completed-bar boundary.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TimedFeatureValue {
     as_of_time_ns: i64,
     value: Decimal,
     source_event_id: String,
     source_event_time_ns: i64,
     source_received_at_ns: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TimedFeatureValueWire {
+    as_of_time_ns: i64,
+    value: Decimal,
+    source_event_id: String,
+    source_event_time_ns: i64,
+    source_received_at_ns: i64,
+}
+
+impl<'de> Deserialize<'de> for TimedFeatureValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = TimedFeatureValueWire::deserialize(deserializer)?;
+        let value = Self {
+            as_of_time_ns: wire.as_of_time_ns,
+            value: wire.value,
+            source_event_id: wire.source_event_id,
+            source_event_time_ns: wire.source_event_time_ns,
+            source_received_at_ns: wire.source_received_at_ns,
+        };
+        value
+            .verify()
+            .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        Ok(value)
+    }
 }
 
 impl TimedFeatureValue {
@@ -525,6 +567,23 @@ impl TimedFeatureValue {
     pub const fn source_received_at_ns(&self) -> i64 {
         self.source_received_at_ns
     }
+
+    fn verify(&self) -> Result<(), LongHorizonHistoryError> {
+        checked_history_timestamp(self.as_of_time_ns, "sample boundary")?;
+        checked_history_timestamp(self.source_event_time_ns, "sample event time")?;
+        checked_history_timestamp(self.source_received_at_ns, "sample receipt time")?;
+        EventId::new(self.source_event_id.clone()).map_err(|_| {
+            LongHorizonHistoryError::InvalidEventId {
+                field: "sample source event ID",
+            }
+        })?;
+        if self.source_event_time_ns > self.source_received_at_ns
+            || self.source_received_at_ns > self.as_of_time_ns
+        {
+            return Err(LongHorizonHistoryError::InvalidSampleProvenance);
+        }
+        Ok(())
+    }
 }
 
 /// Completeness of all bounded histories required by long-horizon rules.
@@ -549,11 +608,13 @@ impl LongHorizonFeatureCompleteness {
 /// Every value is constructed only from data available at `as_of_time_ns`.
 /// The API returns `None` when the retained state cannot reconstruct an exact
 /// complete horizon rather than filling a gap or substituting a newer input.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LongHorizonFeatureHistory {
     market: String,
     sleeve: String,
     as_of_time_ns: i64,
+    primary_candle_provenance: Vec<LongHorizonCandleProvenance>,
+    hourly_candle_provenance: Vec<LongHorizonCandleProvenance>,
     hourly_realized_volatility_20_history: Vec<TimedFeatureValue>,
     current_hourly_realized_volatility_20: Decimal,
     premium_history: Vec<TimedFeatureValue>,
@@ -561,6 +622,142 @@ pub struct LongHorizonFeatureHistory {
     funding_history: Vec<TimedFeatureValue>,
     completeness: LongHorizonFeatureCompleteness,
     input_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LongHorizonCandleProvenance {
+    market: String,
+    interval_tag: u8,
+    open_time_ns: i64,
+    first_event_id: String,
+    last_event_id: String,
+    first_event_time_ns: i64,
+    last_event_time_ns: i64,
+    first_received_at_ns: i64,
+    last_received_at_ns: i64,
+    source_available_at_ns: i64,
+}
+
+impl LongHorizonCandleProvenance {
+    fn from_candle(candle: &Candle) -> Self {
+        Self {
+            market: candle.market().as_str().to_owned(),
+            interval_tag: candle_interval_tag(candle.candle().interval()),
+            open_time_ns: candle.candle().open_time().value(),
+            first_event_id: candle.first_event_id().as_str().to_owned(),
+            last_event_id: candle.last_event_id().as_str().to_owned(),
+            first_event_time_ns: candle.first_event_time().value(),
+            last_event_time_ns: candle.last_event_time().value(),
+            first_received_at_ns: candle.first_received_at().value(),
+            last_received_at_ns: candle.last_received_at().value(),
+            source_available_at_ns: candle.source_available_at().value(),
+        }
+    }
+}
+
+/// A failed integrity check while restoring serialized long-horizon features.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum LongHorizonHistoryError {
+    /// The serialized market did not satisfy the checked domain identifier contract.
+    #[error("long-horizon history market is invalid")]
+    InvalidMarket,
+    /// The serialized sleeve was not one of the supported completed-bar cadences.
+    #[error("long-horizon history sleeve {sleeve:?} is invalid")]
+    InvalidSleeve {
+        /// Rejected serialized sleeve text.
+        sleeve: String,
+    },
+    /// A timestamp fell outside the supported nonnegative nanosecond range.
+    #[error("long-horizon history {field} timestamp is invalid")]
+    InvalidTimestamp {
+        /// Name of the invalid timestamp field.
+        field: &'static str,
+    },
+    /// A serialized normalized-event identifier was malformed.
+    #[error("long-horizon history {field} is invalid")]
+    InvalidEventId {
+        /// Name of the invalid identifier field.
+        field: &'static str,
+    },
+    /// One required long-horizon source family was marked incomplete.
+    #[error("long-horizon history completeness is not complete")]
+    Incomplete,
+    /// A bounded history does not contain its exact required number of entries.
+    #[error("long-horizon history {field} count {actual} does not equal required {expected}")]
+    Count {
+        /// Name of the bounded history.
+        field: &'static str,
+        /// Required number of entries.
+        expected: usize,
+        /// Serialized number of entries.
+        actual: usize,
+    },
+    /// A serialized scalar history skipped or reordered an explicit boundary.
+    #[error("long-horizon history {field} is not contiguous")]
+    NonContiguous {
+        /// Name of the non-contiguous source history.
+        field: &'static str,
+    },
+    /// A scalar source timestamp was not causally available at its sample boundary.
+    #[error("long-horizon history sample provenance is invalid")]
+    InvalidSampleProvenance,
+    /// A serialized candle span did not retain canonical source provenance.
+    #[error("long-horizon history {field} candle provenance is invalid")]
+    InvalidCandleProvenance {
+        /// Name of the invalid candle history.
+        field: &'static str,
+    },
+    /// Checked arithmetic for a declared long-horizon cadence overflowed.
+    #[error("long-horizon history time arithmetic failed")]
+    TimeArithmetic,
+    /// The digest recomputed from serialized inputs did not match the payload.
+    #[error("long-horizon history digest mismatch")]
+    DigestMismatch,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LongHorizonFeatureHistoryWire {
+    market: String,
+    sleeve: String,
+    as_of_time_ns: i64,
+    primary_candle_provenance: Vec<LongHorizonCandleProvenance>,
+    hourly_candle_provenance: Vec<LongHorizonCandleProvenance>,
+    hourly_realized_volatility_20_history: Vec<TimedFeatureValue>,
+    current_hourly_realized_volatility_20: Decimal,
+    premium_history: Vec<TimedFeatureValue>,
+    open_interest_change_4_history: Vec<TimedFeatureValue>,
+    funding_history: Vec<TimedFeatureValue>,
+    completeness: LongHorizonFeatureCompleteness,
+    input_digest: String,
+}
+
+impl<'de> Deserialize<'de> for LongHorizonFeatureHistory {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = LongHorizonFeatureHistoryWire::deserialize(deserializer)?;
+        let history = Self {
+            market: wire.market,
+            sleeve: wire.sleeve,
+            as_of_time_ns: wire.as_of_time_ns,
+            primary_candle_provenance: wire.primary_candle_provenance,
+            hourly_candle_provenance: wire.hourly_candle_provenance,
+            hourly_realized_volatility_20_history: wire.hourly_realized_volatility_20_history,
+            current_hourly_realized_volatility_20: wire.current_hourly_realized_volatility_20,
+            premium_history: wire.premium_history,
+            open_interest_change_4_history: wire.open_interest_change_4_history,
+            funding_history: wire.funding_history,
+            completeness: wire.completeness,
+            input_digest: wire.input_digest,
+        };
+        history
+            .verify()
+            .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        Ok(history)
+    }
 }
 
 impl LongHorizonFeatureHistory {
@@ -622,6 +819,89 @@ impl LongHorizonFeatureHistory {
     #[must_use]
     pub fn input_digest(&self) -> &str {
         &self.input_digest
+    }
+
+    /// Verifies the bounded counts, source provenance, temporal continuity, and digest.
+    ///
+    /// This is also enforced by [`Deserialize`], so serialized payloads cannot
+    /// reintroduce an incomplete or causally invalid model input.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed integrity error when any serialized invariant is invalid.
+    pub fn verify(&self) -> Result<(), LongHorizonHistoryError> {
+        let market =
+            Market::new(self.market.clone()).map_err(|_| LongHorizonHistoryError::InvalidMarket)?;
+        let sleeve = parse_history_sleeve(&self.sleeve)?;
+        let as_of_time = checked_history_timestamp(self.as_of_time_ns, "snapshot boundary")?;
+        if !self.completeness.is_complete() {
+            return Err(LongHorizonHistoryError::Incomplete);
+        }
+
+        let derivative_bars = derivative_history_bars(sleeve);
+        let primary_count = derivative_bars
+            .checked_add(4)
+            .ok_or(LongHorizonHistoryError::TimeArithmetic)?;
+        verify_candle_provenance_history(
+            &self.primary_candle_provenance,
+            &market,
+            sleeve,
+            as_of_time,
+            primary_count,
+            "primary",
+        )?;
+        verify_candle_provenance_history(
+            &self.hourly_candle_provenance,
+            &market,
+            CandleInterval::OneHour,
+            as_of_time,
+            MAX_HOURLY_CANDLE_HISTORY,
+            "hourly",
+        )?;
+
+        verify_timed_history(
+            &self.hourly_realized_volatility_20_history,
+            HOURLY_REALIZED_VOLATILITY_HISTORY,
+            CandleInterval::OneHour.duration().value(),
+            as_of_time
+                .value()
+                .checked_sub(CandleInterval::OneHour.duration().value())
+                .ok_or(LongHorizonHistoryError::TimeArithmetic)?,
+            "hourly realized volatility history",
+        )?;
+        for (field, values) in [
+            ("premium history", &self.premium_history),
+            (
+                "open-interest change history",
+                &self.open_interest_change_4_history,
+            ),
+            ("funding history", &self.funding_history),
+        ] {
+            verify_timed_history(
+                values,
+                derivative_bars,
+                sleeve.duration().value(),
+                as_of_time.value(),
+                field,
+            )?;
+        }
+
+        let expected_digest = long_horizon_input_digest(&LongHorizonDigestInputs {
+            market: &market,
+            sleeve,
+            as_of_time,
+            primary_candle_provenance: &self.primary_candle_provenance,
+            hourly_candle_provenance: &self.hourly_candle_provenance,
+            hourly_volatility: &self.hourly_realized_volatility_20_history,
+            current_hourly_volatility: self.current_hourly_realized_volatility_20,
+            premium: &self.premium_history,
+            open_interest_change: &self.open_interest_change_4_history,
+            funding: &self.funding_history,
+        });
+        if self.input_digest != expected_digest {
+            return Err(LongHorizonHistoryError::DigestMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -1427,12 +1707,21 @@ impl CommonFeatureEngine {
             return None;
         }
 
+        let primary_candle_provenance = primary_history
+            .iter()
+            .map(|candle| LongHorizonCandleProvenance::from_candle(candle))
+            .collect::<Vec<_>>();
+        let hourly_candle_provenance = hourly_history
+            .iter()
+            .map(|candle| LongHorizonCandleProvenance::from_candle(candle))
+            .collect::<Vec<_>>();
+
         let input_digest = long_horizon_input_digest(&LongHorizonDigestInputs {
             market,
             sleeve,
             as_of_time,
-            primary_history,
-            hourly_history,
+            primary_candle_provenance: &primary_candle_provenance,
+            hourly_candle_provenance: &hourly_candle_provenance,
             hourly_volatility: &hourly_realized_volatility_20_history,
             current_hourly_volatility: current_hourly_realized_volatility_20,
             premium: &premium_history,
@@ -1443,6 +1732,8 @@ impl CommonFeatureEngine {
             market: market.as_str().to_owned(),
             sleeve: sleeve_name(sleeve).to_owned(),
             as_of_time_ns: as_of_time.value(),
+            primary_candle_provenance,
+            hourly_candle_provenance,
             hourly_realized_volatility_20_history,
             current_hourly_realized_volatility_20,
             premium_history,
@@ -2371,12 +2662,170 @@ fn sampled_sources<'a>(
         .collect()
 }
 
+fn parse_history_sleeve(sleeve: &str) -> Result<CandleInterval, LongHorizonHistoryError> {
+    match sleeve {
+        "15m" => Ok(CandleInterval::FifteenMinutes),
+        "1h" => Ok(CandleInterval::OneHour),
+        _ => Err(LongHorizonHistoryError::InvalidSleeve {
+            sleeve: sleeve.to_owned(),
+        }),
+    }
+}
+
+fn checked_history_timestamp(
+    value: i64,
+    field: &'static str,
+) -> Result<TimestampNs, LongHorizonHistoryError> {
+    TimestampNs::new(i128::from(value))
+        .map_err(|_| LongHorizonHistoryError::InvalidTimestamp { field })
+}
+
+fn verify_timed_history(
+    values: &[TimedFeatureValue],
+    expected_count: usize,
+    interval_ns: i64,
+    final_boundary_ns: i64,
+    field: &'static str,
+) -> Result<(), LongHorizonHistoryError> {
+    if values.len() != expected_count {
+        return Err(LongHorizonHistoryError::Count {
+            field,
+            expected: expected_count,
+            actual: values.len(),
+        });
+    }
+    let offsets = i64::try_from(
+        values
+            .len()
+            .checked_sub(1)
+            .ok_or(LongHorizonHistoryError::TimeArithmetic)?,
+    )
+    .map_err(|_| LongHorizonHistoryError::TimeArithmetic)?;
+    let start_boundary = final_boundary_ns
+        .checked_sub(
+            interval_ns
+                .checked_mul(offsets)
+                .ok_or(LongHorizonHistoryError::TimeArithmetic)?,
+        )
+        .ok_or(LongHorizonHistoryError::TimeArithmetic)?;
+    for (index, value) in values.iter().enumerate() {
+        value.verify()?;
+        let offset = i64::try_from(index).map_err(|_| LongHorizonHistoryError::TimeArithmetic)?;
+        let expected_boundary = start_boundary
+            .checked_add(
+                interval_ns
+                    .checked_mul(offset)
+                    .ok_or(LongHorizonHistoryError::TimeArithmetic)?,
+            )
+            .ok_or(LongHorizonHistoryError::TimeArithmetic)?;
+        if value.as_of_time_ns != expected_boundary {
+            return Err(LongHorizonHistoryError::NonContiguous { field });
+        }
+    }
+    Ok(())
+}
+
+fn verify_candle_provenance_history(
+    provenance: &[LongHorizonCandleProvenance],
+    market: &Market,
+    interval: CandleInterval,
+    as_of_time: TimestampNs,
+    expected_count: usize,
+    field: &'static str,
+) -> Result<(), LongHorizonHistoryError> {
+    if provenance.len() != expected_count {
+        return Err(LongHorizonHistoryError::Count {
+            field,
+            expected: expected_count,
+            actual: provenance.len(),
+        });
+    }
+    let interval_ns = interval.duration().value();
+    let last_open = as_of_time
+        .value()
+        .checked_sub(interval_ns)
+        .ok_or(LongHorizonHistoryError::TimeArithmetic)?;
+    let offsets = i64::try_from(
+        provenance
+            .len()
+            .checked_sub(1)
+            .ok_or(LongHorizonHistoryError::TimeArithmetic)?,
+    )
+    .map_err(|_| LongHorizonHistoryError::TimeArithmetic)?;
+    let first_open = last_open
+        .checked_sub(
+            interval_ns
+                .checked_mul(offsets)
+                .ok_or(LongHorizonHistoryError::TimeArithmetic)?,
+        )
+        .ok_or(LongHorizonHistoryError::TimeArithmetic)?;
+
+    for (index, candle) in provenance.iter().enumerate() {
+        if Market::new(candle.market.clone()).as_ref() != Ok(market)
+            || candle.interval_tag != candle_interval_tag(interval)
+        {
+            return Err(LongHorizonHistoryError::InvalidCandleProvenance { field });
+        }
+        let offset = i64::try_from(index).map_err(|_| LongHorizonHistoryError::TimeArithmetic)?;
+        let expected_open = first_open
+            .checked_add(
+                interval_ns
+                    .checked_mul(offset)
+                    .ok_or(LongHorizonHistoryError::TimeArithmetic)?,
+            )
+            .ok_or(LongHorizonHistoryError::TimeArithmetic)?;
+        if candle.open_time_ns != expected_open {
+            return Err(LongHorizonHistoryError::NonContiguous { field });
+        }
+        for (timestamp, timestamp_field) in [
+            (candle.open_time_ns, "candle open time"),
+            (candle.first_event_time_ns, "candle first event time"),
+            (candle.last_event_time_ns, "candle last event time"),
+            (candle.first_received_at_ns, "candle first receipt time"),
+            (candle.last_received_at_ns, "candle last receipt time"),
+            (candle.source_available_at_ns, "candle availability time"),
+        ] {
+            checked_history_timestamp(timestamp, timestamp_field)?;
+        }
+        EventId::new(candle.first_event_id.clone()).map_err(|_| {
+            LongHorizonHistoryError::InvalidEventId {
+                field: "candle first event ID",
+            }
+        })?;
+        EventId::new(candle.last_event_id.clone()).map_err(|_| {
+            LongHorizonHistoryError::InvalidEventId {
+                field: "candle last event ID",
+            }
+        })?;
+        let first = (
+            candle.first_event_time_ns,
+            candle.first_received_at_ns,
+            candle.first_event_id.as_str(),
+        );
+        let last = (
+            candle.last_event_time_ns,
+            candle.last_received_at_ns,
+            candle.last_event_id.as_str(),
+        );
+        if candle.first_event_time_ns > candle.first_received_at_ns
+            || candle.last_event_time_ns > candle.last_received_at_ns
+            || first > last
+            || candle.source_available_at_ns < candle.first_received_at_ns
+            || candle.source_available_at_ns < candle.last_received_at_ns
+            || candle.source_available_at_ns > as_of_time.value()
+        {
+            return Err(LongHorizonHistoryError::InvalidCandleProvenance { field });
+        }
+    }
+    Ok(())
+}
+
 struct LongHorizonDigestInputs<'a> {
     market: &'a Market,
     sleeve: CandleInterval,
     as_of_time: TimestampNs,
-    primary_history: &'a [&'a Candle],
-    hourly_history: &'a [&'a Candle],
+    primary_candle_provenance: &'a [LongHorizonCandleProvenance],
+    hourly_candle_provenance: &'a [LongHorizonCandleProvenance],
     hourly_volatility: &'a [TimedFeatureValue],
     current_hourly_volatility: Decimal,
     premium: &'a [TimedFeatureValue],
@@ -2389,14 +2838,22 @@ fn long_horizon_input_digest(inputs: &LongHorizonDigestInputs<'_>) -> String {
     hasher.update(inputs.market.as_str().as_bytes());
     hasher.update(&[0, candle_interval_tag(inputs.sleeve)]);
     hasher.update(&inputs.as_of_time.value().to_be_bytes());
-    for candle in inputs.primary_history.iter().chain(inputs.hourly_history) {
-        hasher.update(candle.market().as_str().as_bytes());
-        hasher.update(&[candle_interval_tag(candle.candle().interval())]);
-        hasher.update(&candle.candle().open_time().value().to_be_bytes());
-        hasher.update(candle.first_event_id().as_str().as_bytes());
+    for candle in inputs
+        .primary_candle_provenance
+        .iter()
+        .chain(inputs.hourly_candle_provenance)
+    {
+        hasher.update(candle.market.as_bytes());
+        hasher.update(&[candle.interval_tag]);
+        hasher.update(&candle.open_time_ns.to_be_bytes());
+        hasher.update(candle.first_event_id.as_bytes());
         hasher.update(&[0]);
-        hasher.update(candle.last_event_id().as_str().as_bytes());
-        hasher.update(&candle.source_available_at().value().to_be_bytes());
+        hasher.update(candle.last_event_id.as_bytes());
+        hasher.update(&candle.first_event_time_ns.to_be_bytes());
+        hasher.update(&candle.last_event_time_ns.to_be_bytes());
+        hasher.update(&candle.first_received_at_ns.to_be_bytes());
+        hasher.update(&candle.last_received_at_ns.to_be_bytes());
+        hasher.update(&candle.source_available_at_ns.to_be_bytes());
     }
     hasher.update(inputs.current_hourly_volatility.to_string().as_bytes());
     for value in inputs
@@ -3282,6 +3739,30 @@ mod tests {
     }
 
     #[test]
+    fn input_range_boundaries_follow_event_time_receipt_and_identity() {
+        let market = market("BTC");
+        let (earlier, later) = (1_u64..64)
+            .flat_map(|early_sequence| {
+                ((early_sequence + 1)..64).map(move |late_sequence| (early_sequence, late_sequence))
+            })
+            .find_map(|(early_sequence, late_sequence)| {
+                let earlier = bbo_at_time(market.clone(), 10, 20, early_sequence, dec!(100));
+                let later = bbo_at_time(market.clone(), 10, 30, late_sequence, dec!(200));
+                (earlier.event_id() > later.event_id()).then_some((earlier, later))
+            })
+            .expect("test identities must oppose receipt ordering");
+
+        let range = super::InputEventRange::from_spans(vec![
+            super::InputEventSpan::event(FeatureInputKind::Bbo, &later),
+            super::InputEventSpan::event(FeatureInputKind::Bbo, &earlier),
+        ])
+        .expect("nonempty input range must build");
+
+        assert_eq!(range.first_event_id(), earlier.event_id());
+        assert_eq!(range.last_event_id(), later.event_id());
+    }
+
+    #[test]
     fn source_pruning_preserves_exact_event_replays_within_the_finalized_horizon() {
         let market = market("BTC");
         let events = (1..=super::POINT_EVENT_HISTORY + 1)
@@ -3941,6 +4422,72 @@ mod tests {
         let decoded: super::LongHorizonFeatureHistory =
             serde_json::from_str(&encoded).expect("history must deserialize");
         assert_eq!(decoded, history);
+    }
+
+    #[test]
+    fn long_horizon_history_json_rejects_forged_digest_and_sample_ordering() {
+        let market = market("BTC");
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        let decision = populate_long_history(
+            &mut engine,
+            &mut aggregator,
+            market.clone(),
+            ReceiptDelays::default(),
+        );
+        let history = engine
+            .long_horizon_history_at(
+                &market,
+                crate::event::CandleInterval::FifteenMinutes,
+                decision,
+            )
+            .expect("fully retained long-horizon history must be available");
+
+        let mut forged_digest = serde_json::to_value(&history).expect("history must serialize");
+        forged_digest["input_digest"] = serde_json::Value::String("forged".to_owned());
+        let digest_error =
+            match serde_json::from_value::<super::LongHorizonFeatureHistory>(forged_digest) {
+                Err(error) => error,
+                Ok(_) => panic!("a forged digest must not deserialize"),
+            };
+        assert!(
+            digest_error
+                .to_string()
+                .contains("long-horizon history digest mismatch")
+        );
+
+        let mut forged_ordering = serde_json::to_value(&history).expect("history must serialize");
+        let sample = forged_ordering["funding_history"]
+            .get_mut(1)
+            .expect("second funding sample must exist");
+        let as_of = sample["as_of_time_ns"]
+            .as_i64()
+            .expect("sample boundary must be a signed timestamp");
+        sample["as_of_time_ns"] = serde_json::Value::from(as_of + 1);
+        let ordering_error =
+            match serde_json::from_value::<super::LongHorizonFeatureHistory>(forged_ordering) {
+                Err(error) => error,
+                Ok(_) => panic!("a non-contiguous history must not deserialize"),
+            };
+        assert!(
+            ordering_error
+                .to_string()
+                .contains("long-horizon history funding history is not contiguous")
+        );
+
+        let mut forged_source = serde_json::to_value(&history).expect("history must serialize");
+        forged_source["premium_history"][0]["source_event_id"] =
+            serde_json::Value::String(" invalid-source ".to_owned());
+        let source_error =
+            match serde_json::from_value::<super::LongHorizonFeatureHistory>(forged_source) {
+                Err(error) => error,
+                Ok(_) => panic!("an invalid scalar provenance identity must not deserialize"),
+            };
+        assert!(
+            source_error
+                .to_string()
+                .contains("long-horizon history sample source event ID is invalid")
+        );
     }
 
     #[test]
