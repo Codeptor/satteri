@@ -1,6 +1,6 @@
 //! Deterministic completed candles derived from normalized public trades.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use rust_decimal::Decimal;
 use thiserror::Error;
@@ -166,7 +166,6 @@ struct BucketKey {
 pub struct CandleAggregator {
     seen: BTreeMap<EventId, TradePoint>,
     pending: BTreeMap<BucketKey, Vec<TradePoint>>,
-    finalized: BTreeSet<BucketKey>,
     watermark: Option<TimestampNs>,
 }
 
@@ -218,13 +217,19 @@ impl CandleAggregator {
                 open_time: bucket_open(point.event_time, interval)?,
             });
         }
-        if let Some(watermark) = self.watermark
-            && keys.iter().any(|key| self.finalized.contains(key))
-        {
-            return Err(CandleError::LateTrade {
-                event_time: point.event_time,
-                watermark,
-            });
+        if let Some(watermark) = self.watermark {
+            for key in &keys {
+                let close = key
+                    .open_time
+                    .checked_add(key.interval.duration())
+                    .map_err(CandleError::from)?;
+                if close <= watermark {
+                    return Err(CandleError::LateTrade {
+                        event_time: point.event_time,
+                        watermark,
+                    });
+                }
+            }
         }
 
         self.seen.insert(point.event_id.clone(), point.clone());
@@ -234,7 +239,10 @@ impl CandleAggregator {
         Ok(())
     }
 
-    /// Finalizes each buffered interval whose exchange-time close is at or before `watermark`.
+    /// Closes every interval whose exchange-time close is at or before `watermark`.
+    ///
+    /// Only nonempty intervals emit a candle, but elapsed empty intervals are
+    /// closed too: a later trade for either kind of interval is rejected.
     ///
     /// The caller owns this explicit watermark. This makes replays deterministic:
     /// any ordering of a complete batch can be ingested before advancing it.
@@ -269,7 +277,6 @@ impl CandleAggregator {
                 reason: "selected pending bucket must remain present",
             })?;
             let candle = aggregate(key.clone(), trades)?;
-            self.finalized.insert(key);
             candles.push(candle);
         }
         self.watermark = Some(watermark);
@@ -364,7 +371,7 @@ mod tests {
     use crate::domain::{Market, Price, Quantity, Side};
     use crate::event::{MarketEvent, TimestampNs, Trade};
 
-    use super::CandleAggregator;
+    use super::{CandleAggregator, CandleError};
 
     fn timestamp(value: i128) -> TimestampNs {
         TimestampNs::new(value).expect("test timestamp must be valid")
@@ -442,6 +449,30 @@ mod tests {
             second
                 .complete_through(close)
                 .expect("watermark must be valid")
+        );
+    }
+
+    #[test]
+    fn rejects_a_late_trade_for_an_empty_interval_closed_by_the_watermark() {
+        let mut aggregator = CandleAggregator::new();
+        aggregator
+            .ingest(&trade(1, 1, dec!(100)))
+            .expect("initial trade must be accepted");
+        aggregator
+            .complete_through(timestamp(1_800_000_000_000))
+            .expect("watermark must finalize elapsed intervals");
+
+        let late_trade = trade(900_000_000_001, 2, dec!(101));
+        assert!(matches!(
+            aggregator.ingest(&late_trade),
+            Err(CandleError::LateTrade { .. })
+        ));
+        assert!(
+            aggregator
+                .complete_through(timestamp(1_800_000_000_000))
+                .expect("unchanged watermark must be valid")
+                .is_empty(),
+            "a rejected late trade must not produce a retroactive candle"
         );
     }
 

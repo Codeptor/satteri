@@ -30,13 +30,123 @@ const FUNDING_WINDOW: usize = 30;
 const MICRO_5_MINUTES_NS: i64 = 300_000_000_000;
 const MICRO_15_MINUTES_NS: i64 = 900_000_000_000;
 
-/// Exact input event boundaries represented by an immutable feature snapshot.
+/// A dependency family included in an immutable feature-input range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FeatureInputKind {
+    /// One completed fifteen-minute candle represented by its contributing-trade span.
+    FifteenMinuteCandle,
+    /// One completed hourly candle represented by its contributing-trade span.
+    HourlyCandle,
+    /// One peer-market candle used only by a cross-sectional return rank.
+    CrossSectionCandle,
+    /// One point-in-time asset-context observation.
+    AssetContext,
+    /// One funding observation.
+    Funding,
+    /// The current best-bid/best-offer observation.
+    Bbo,
+    /// The current order-book snapshot.
+    Book,
+    /// One public trade used by the microstructure windows.
+    MicrostructureTrade,
+}
+
+impl FeatureInputKind {
+    const fn identity_tag(self) -> u8 {
+        match self {
+            Self::FifteenMinuteCandle => 0,
+            Self::HourlyCandle => 1,
+            Self::CrossSectionCandle => 2,
+            Self::AssetContext => 3,
+            Self::Funding => 4,
+            Self::Bbo => 5,
+            Self::Book => 6,
+            Self::MicrostructureTrade => 7,
+        }
+    }
+}
+
+/// Exact immutable event span for one feature dependency.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InputEventSpan {
+    kind: FeatureInputKind,
+    first_event_id: EventId,
+    last_event_id: EventId,
+    first_event_time: TimestampNs,
+    last_event_time: TimestampNs,
+}
+
+impl InputEventSpan {
+    /// Returns the dependency family represented by this span.
+    #[must_use]
+    pub const fn kind(&self) -> FeatureInputKind {
+        self.kind
+    }
+
+    /// Returns the first canonical identity in this dependency span.
+    #[must_use]
+    pub const fn first_event_id(&self) -> &EventId {
+        &self.first_event_id
+    }
+
+    /// Returns the final canonical identity in this dependency span.
+    #[must_use]
+    pub const fn last_event_id(&self) -> &EventId {
+        &self.last_event_id
+    }
+
+    /// Returns the earliest authoritative event time in this dependency span.
+    #[must_use]
+    pub const fn first_event_time(&self) -> TimestampNs {
+        self.first_event_time
+    }
+
+    /// Returns the latest authoritative event time in this dependency span.
+    #[must_use]
+    pub const fn last_event_time(&self) -> TimestampNs {
+        self.last_event_time
+    }
+
+    fn event(kind: FeatureInputKind, event: &MarketEvent) -> Self {
+        Self {
+            kind,
+            first_event_id: event.event_id().clone(),
+            last_event_id: event.event_id().clone(),
+            first_event_time: event.event_time(),
+            last_event_time: event.event_time(),
+        }
+    }
+
+    fn candle(kind: FeatureInputKind, candle: &Candle) -> Self {
+        Self {
+            kind,
+            first_event_id: candle.first_event_id().clone(),
+            last_event_id: candle.last_event_id().clone(),
+            first_event_time: candle.first_event_time(),
+            last_event_time: candle.last_event_time(),
+        }
+    }
+
+    fn with_kind(&self, kind: FeatureInputKind) -> Self {
+        Self {
+            kind,
+            first_event_id: self.first_event_id.clone(),
+            last_event_id: self.last_event_id.clone(),
+            first_event_time: self.first_event_time,
+            last_event_time: self.last_event_time,
+        }
+    }
+}
+
+/// Exact input event boundaries and spans represented by an immutable feature snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputEventRange {
     first_event_id: EventId,
     last_event_id: EventId,
     first_event_time: TimestampNs,
     last_event_time: TimestampNs,
+    spans: Vec<InputEventSpan>,
+    digest: String,
 }
 
 impl InputEventRange {
@@ -63,6 +173,61 @@ impl InputEventRange {
     pub const fn last_event_time(&self) -> TimestampNs {
         self.last_event_time
     }
+
+    /// Returns every exact dependency span in deterministic canonical order.
+    #[must_use]
+    pub fn spans(&self) -> &[InputEventSpan] {
+        &self.spans
+    }
+
+    /// Returns the stable BLAKE3 digest of every exact dependency span.
+    #[must_use]
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    fn from_spans(mut spans: Vec<InputEventSpan>) -> Option<Self> {
+        spans.sort();
+        spans.dedup();
+        let first = spans.iter().min_by(|left, right| {
+            left.first_event_time
+                .cmp(&right.first_event_time)
+                .then_with(|| left.first_event_id.cmp(&right.first_event_id))
+        })?;
+        let last = spans.iter().max_by(|left, right| {
+            left.last_event_time
+                .cmp(&right.last_event_time)
+                .then_with(|| left.last_event_id.cmp(&right.last_event_id))
+        })?;
+        Some(Self {
+            first_event_id: first.first_event_id.clone(),
+            last_event_id: last.last_event_id.clone(),
+            first_event_time: first.first_event_time,
+            last_event_time: last.last_event_time,
+            digest: input_digest(&spans),
+            spans,
+        })
+    }
+
+    fn with_additional_spans(&self, additional: &[InputEventSpan]) -> Option<Self> {
+        let mut spans = self.spans.clone();
+        spans.extend_from_slice(additional);
+        Self::from_spans(spans)
+    }
+}
+
+fn input_digest(spans: &[InputEventSpan]) -> String {
+    let mut hasher = Hasher::new_derive_key("trench.feature-input-range.v1");
+    for span in spans {
+        hasher.update(&[span.kind.identity_tag()]);
+        hasher.update(&span.first_event_time.value().to_be_bytes());
+        hasher.update(span.first_event_id.as_str().as_bytes());
+        hasher.update(&[0]);
+        hasher.update(&span.last_event_time.value().to_be_bytes());
+        hasher.update(span.last_event_id.as_str().as_bytes());
+        hasher.update(&[0]);
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 /// Completeness of the point-in-time source families needed for common features.
@@ -73,6 +238,7 @@ pub struct FeatureCompleteness {
     funding: bool,
     microstructure: bool,
     regime: bool,
+    calculations: bool,
     cross_section: bool,
 }
 
@@ -107,6 +273,12 @@ impl FeatureCompleteness {
         self.regime
     }
 
+    /// Returns whether every declared feature calculation completed without arithmetic failure.
+    #[must_use]
+    pub const fn calculations(self) -> bool {
+        self.calculations
+    }
+
     /// Returns whether a contemporaneous multi-market cross-section is available.
     #[must_use]
     pub const fn cross_section(self) -> bool {
@@ -121,8 +293,39 @@ impl FeatureCompleteness {
             && self.funding
             && self.microstructure
             && self.regime
+            && self.calculations
             && self.cross_section
     }
+
+    const fn primary_inputs_ready(self) -> bool {
+        self.candles
+            && self.context
+            && self.funding
+            && self.microstructure
+            && self.regime
+            && self.calculations
+    }
+}
+
+/// Machine-readable reason a snapshot cannot be used as strategy or model input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeatureUnreadyReason {
+    /// The completed-bar history is absent, discontinuous, or not warm.
+    CandleHistory,
+    /// The point-in-time asset-context window is incomplete.
+    ContextHistory,
+    /// The point-in-time funding window is incomplete.
+    FundingHistory,
+    /// BBO, order-book, or aggressive-trade inputs are incomplete.
+    Microstructure,
+    /// The preceding completed hourly regime inputs are incomplete.
+    HourlyRegime,
+    /// A declared feature calculation could not be represented from complete inputs.
+    CalculationFailed,
+    /// A contemporaneous multi-market cross-section is unavailable.
+    CrossSection,
+    /// Exact immutable provenance could not be derived for every dependency.
+    InputProvenance,
 }
 
 /// Completed one-hour inputs used by either decision sleeve's regime evaluation.
@@ -175,6 +378,7 @@ pub struct FeatureSnapshot {
     as_of_time: TimestampNs,
     input_range: Option<InputEventRange>,
     completeness: FeatureCompleteness,
+    unready_reason: Option<FeatureUnreadyReason>,
     schema_hash: String,
     values: BTreeMap<String, Decimal>,
     regime: Option<RegimeInputs>,
@@ -211,10 +415,16 @@ impl FeatureSnapshot {
         self.completeness
     }
 
+    /// Returns the deterministic reason this snapshot is not strategy-ready.
+    #[must_use]
+    pub const fn unready_reason(&self) -> Option<FeatureUnreadyReason> {
+        self.unready_reason
+    }
+
     /// Returns whether the snapshot is complete enough for strategy or model input.
     #[must_use]
     pub const fn is_ready(&self) -> bool {
-        self.completeness.is_ready()
+        self.completeness.is_ready() && self.unready_reason.is_none()
     }
 
     /// Returns the stable BLAKE3 hash of the declared feature schema.
@@ -344,13 +554,7 @@ impl CommonFeatureEngine {
 
         let complete = bases
             .iter()
-            .filter(|base| {
-                base.completeness.candles
-                    && base.completeness.context
-                    && base.completeness.funding
-                    && base.completeness.microstructure
-                    && base.completeness.regime
-            })
+            .filter(|base| base.completeness.primary_inputs_ready())
             .map(|base| base.market.clone())
             .collect::<Vec<_>>();
         if complete.len() >= 2 {
@@ -359,19 +563,26 @@ impl CommonFeatureEngine {
 
         bases
             .into_iter()
-            .map(|base| FeatureSnapshot {
-                market: base.market,
-                sleeve,
-                as_of_time,
-                input_range: base.input_range,
-                completeness: base.completeness,
-                schema_hash: schema_hash(),
-                values: if base.completeness.is_ready() {
-                    base.values
-                } else {
-                    BTreeMap::new()
-                },
-                regime: base.regime,
+            .map(|base| {
+                let unready_reason = base.unready_reason.or_else(|| {
+                    (!base.completeness.cross_section).then_some(FeatureUnreadyReason::CrossSection)
+                });
+                let is_ready = base.completeness.is_ready() && unready_reason.is_none();
+                FeatureSnapshot {
+                    market: base.market,
+                    sleeve,
+                    as_of_time,
+                    input_range: base.input_range,
+                    completeness: base.completeness,
+                    unready_reason,
+                    schema_hash: schema_hash(),
+                    values: if is_ready {
+                        base.values
+                    } else {
+                        BTreeMap::new()
+                    },
+                    regime: base.regime,
+                }
             })
             .collect()
     }
@@ -396,63 +607,121 @@ impl CommonFeatureEngine {
         as_of_time: TimestampNs,
     ) -> BaseSnapshot {
         let history = self.candle_history(&market, sleeve, as_of_time);
-        let candles = contiguous_tail(&history, MAX_BAR_LOOKBACK, sleeve).is_some();
-        let context_history = self.context_history(&market, as_of_time);
-        let funding_history = self.funding_history(&market, as_of_time);
+        let feature_history = contiguous_tail(&history, MAX_BAR_LOOKBACK, sleeve);
+        let context_events = self.context_events(&market, as_of_time);
+        let context_events = trailing_window(&context_events, CONTEXT_WINDOW);
+        let context_history = context_events
+            .map(|events| {
+                events
+                    .iter()
+                    .filter_map(|event| match event.kind() {
+                        MarketEventKind::AssetContext(context) => Some(context),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let funding_events = self.funding_events(&market, as_of_time);
+        let funding_events = trailing_window(&funding_events, FUNDING_WINDOW);
+        let funding_history = funding_events
+            .map(|events| {
+                events
+                    .iter()
+                    .filter_map(|event| match event.kind() {
+                        MarketEventKind::Funding(funding) => Some(funding),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let latest_context = context_history.last().copied();
         let latest_funding = funding_history.last().copied();
-        let bbo = self.latest_bbo(&market, as_of_time);
-        let book = self.latest_book(&market, as_of_time);
-        let regime = self.hourly_regime(&market, as_of_time);
+        let bbo_event = self.latest_bbo(&market, as_of_time);
+        let bbo = bbo_event.and_then(|event| match event.kind() {
+            MarketEventKind::Bbo(bbo) => Some(bbo),
+            _ => None,
+        });
+        let book_event = self.latest_book(&market, as_of_time);
+        let book = book_event.and_then(|event| match event.kind() {
+            MarketEventKind::BookSnapshot(book) => Some(book),
+            _ => None,
+        });
+        let hourly_history = self.candle_history(&market, CandleInterval::OneHour, as_of_time);
+        let hourly_history = contiguous_tail(&hourly_history, 32, CandleInterval::OneHour);
+        let regime = hourly_history.and_then(hourly_regime);
+        let trades = self.trade_events(&market, as_of_time);
         let microstructure = bbo.is_some()
             && book.is_some()
-            && trade_imbalance(
-                self.trade_events(&market, as_of_time),
-                as_of_time,
-                MICRO_5_MINUTES_NS,
-            )
-            .is_some()
-            && trade_imbalance(
-                self.trade_events(&market, as_of_time),
-                as_of_time,
-                MICRO_15_MINUTES_NS,
-            )
-            .is_some();
-        let completeness = FeatureCompleteness {
-            candles,
-            context: context_history.len() >= CONTEXT_WINDOW && latest_context.is_some(),
-            funding: funding_history.len() >= FUNDING_WINDOW && latest_funding.is_some(),
+            && trade_imbalance(&trades, as_of_time, MICRO_5_MINUTES_NS).is_some()
+            && trade_imbalance(&trades, as_of_time, MICRO_15_MINUTES_NS).is_some();
+        let mut completeness = FeatureCompleteness {
+            candles: feature_history.is_some(),
+            context: context_events.is_some() && latest_context.is_some(),
+            funding: funding_events.is_some() && latest_funding.is_some(),
             microstructure,
             regime: regime.is_some(),
+            calculations: false,
             cross_section: false,
         };
         let mut values = BTreeMap::new();
-        if candles
-            && completeness.context
-            && completeness.funding
-            && microstructure
-            && completeness.regime
-        {
-            let inputs = SnapshotInputs {
-                history: &history,
-                latest_context,
-                contexts: &context_history,
-                latest_funding,
-                fundings: &funding_history,
-                bbo,
-                book,
-                trades: self.trade_events(&market, as_of_time),
-                as_of_time,
-            };
-            values = build_values(&inputs).unwrap_or_default();
-            if values.is_empty() {
-                return BaseSnapshot::unready(market, completeness, input_range(&history), regime);
+        let mut source_range = None;
+        let mut unready_reason = incomplete_source_reason(completeness);
+        if unready_reason.is_none() {
+            if let (
+                Some(feature_history),
+                Some(hourly_history),
+                Some(context_events),
+                Some(funding_events),
+                Some(bbo_event),
+                Some(book_event),
+            ) = (
+                feature_history,
+                hourly_history,
+                context_events,
+                funding_events,
+                bbo_event,
+                book_event,
+            ) {
+                let range = input_range(
+                    feature_history,
+                    hourly_history,
+                    context_events,
+                    funding_events,
+                    bbo_event,
+                    book_event,
+                    &trades,
+                );
+                if let Some(range) = range {
+                    source_range = Some(range);
+                    let inputs = SnapshotInputs {
+                        history: feature_history,
+                        latest_context,
+                        contexts: &context_history,
+                        latest_funding,
+                        fundings: &funding_history,
+                        bbo,
+                        book,
+                        trades: &trades,
+                        as_of_time,
+                    };
+                    if let Some(built_values) = build_values(&inputs) {
+                        completeness.calculations = true;
+                        values = built_values;
+                    } else {
+                        unready_reason = Some(FeatureUnreadyReason::CalculationFailed);
+                    }
+                } else {
+                    unready_reason = Some(FeatureUnreadyReason::InputProvenance);
+                }
+            } else {
+                unready_reason = Some(FeatureUnreadyReason::InputProvenance);
             }
         }
         BaseSnapshot {
             market,
-            input_range: input_range(&history),
+            input_range: source_range,
             completeness,
+            unready_reason,
             values,
             regime,
         }
@@ -475,45 +744,37 @@ impl CommonFeatureEngine {
             .unwrap_or_default()
     }
 
-    fn context_history(&self, market: &Market, as_of_time: TimestampNs) -> Vec<&AssetContext> {
+    fn context_events(&self, market: &Market, as_of_time: TimestampNs) -> Vec<&MarketEvent> {
         self.events_before(market, as_of_time)
-            .filter_map(|event| match event.kind() {
-                MarketEventKind::AssetContext(context) => Some(context),
-                _ => None,
-            })
+            .filter(|event| matches!(event.kind(), MarketEventKind::AssetContext(_)))
             .collect()
     }
 
-    fn funding_history(&self, market: &Market, as_of_time: TimestampNs) -> Vec<&Funding> {
+    fn funding_events(&self, market: &Market, as_of_time: TimestampNs) -> Vec<&MarketEvent> {
         self.events_before(market, as_of_time)
-            .filter_map(|event| match event.kind() {
-                MarketEventKind::Funding(funding) => Some(funding),
-                _ => None,
-            })
+            .filter(|event| matches!(event.kind(), MarketEventKind::Funding(_)))
             .collect()
     }
 
-    fn latest_bbo(&self, market: &Market, as_of_time: TimestampNs) -> Option<&Bbo> {
+    fn latest_bbo(&self, market: &Market, as_of_time: TimestampNs) -> Option<&MarketEvent> {
         self.events_before(market, as_of_time)
             .rev()
-            .find_map(|event| match event.kind() {
-                MarketEventKind::Bbo(bbo) => Some(bbo),
-                _ => None,
-            })
+            .find(|event| matches!(event.kind(), MarketEventKind::Bbo(_)))
     }
 
-    fn latest_book(&self, market: &Market, as_of_time: TimestampNs) -> Option<&BookSnapshot> {
+    fn latest_book(&self, market: &Market, as_of_time: TimestampNs) -> Option<&MarketEvent> {
         self.events_before(market, as_of_time)
             .rev()
-            .find_map(|event| match event.kind() {
-                MarketEventKind::BookSnapshot(book) => Some(book),
-                _ => None,
-            })
+            .find(|event| matches!(event.kind(), MarketEventKind::BookSnapshot(_)))
     }
 
     fn trade_events(&self, market: &Market, as_of_time: TimestampNs) -> Vec<&MarketEvent> {
+        let microstructure_start = as_of_time.value().saturating_sub(MICRO_15_MINUTES_NS);
         self.events_before(market, as_of_time)
-            .filter(|event| matches!(event.kind(), MarketEventKind::Trade(_)))
+            .filter(|event| {
+                event.event_time().value() > microstructure_start
+                    && matches!(event.kind(), MarketEventKind::Trade(_))
+            })
             .collect()
     }
 
@@ -528,18 +789,6 @@ impl CommonFeatureEngine {
             .flat_map(|events| events.values())
             .filter(move |event| event.event_time() <= as_of_time)
     }
-
-    fn hourly_regime(&self, market: &Market, as_of_time: TimestampNs) -> Option<RegimeInputs> {
-        let history = self.candle_history(market, CandleInterval::OneHour, as_of_time);
-        let history = contiguous_tail(&history, 32, CandleInterval::OneHour)?;
-        Some(RegimeInputs {
-            ema_8: ema(&closes(history), 8)?,
-            ema_32: ema(&closes(history), 32)?,
-            atr_14: atr(history, 14)?,
-            adx_14: adx(history, 14)?,
-            realized_volatility_20: realized_volatility(history, 20)?,
-        })
-    }
 }
 
 #[derive(Debug)]
@@ -547,25 +796,45 @@ struct BaseSnapshot {
     market: Market,
     input_range: Option<InputEventRange>,
     completeness: FeatureCompleteness,
+    unready_reason: Option<FeatureUnreadyReason>,
     values: BTreeMap<String, Decimal>,
     regime: Option<RegimeInputs>,
 }
 
-impl BaseSnapshot {
-    fn unready(
-        market: Market,
-        completeness: FeatureCompleteness,
-        input_range: Option<InputEventRange>,
-        regime: Option<RegimeInputs>,
-    ) -> Self {
-        Self {
-            market,
-            input_range,
-            completeness,
-            values: BTreeMap::new(),
-            regime,
-        }
+fn trailing_window<T>(values: &[T], count: usize) -> Option<&[T]> {
+    values
+        .len()
+        .checked_sub(count)
+        .and_then(|start| values.get(start..))
+}
+
+fn hourly_regime(history: &[&Candle]) -> Option<RegimeInputs> {
+    Some(RegimeInputs {
+        ema_8: ema(&closes(history), 8)?,
+        ema_32: ema(&closes(history), 32)?,
+        atr_14: atr(history, 14)?,
+        adx_14: adx(history, 14)?,
+        realized_volatility_20: realized_volatility(history, 20)?,
+    })
+}
+
+fn incomplete_source_reason(completeness: FeatureCompleteness) -> Option<FeatureUnreadyReason> {
+    if !completeness.candles {
+        return Some(FeatureUnreadyReason::CandleHistory);
     }
+    if !completeness.context {
+        return Some(FeatureUnreadyReason::ContextHistory);
+    }
+    if !completeness.funding {
+        return Some(FeatureUnreadyReason::FundingHistory);
+    }
+    if !completeness.microstructure {
+        return Some(FeatureUnreadyReason::Microstructure);
+    }
+    if !completeness.regime {
+        return Some(FeatureUnreadyReason::HourlyRegime);
+    }
+    None
 }
 
 fn add_cross_sectional_ranks(bases: &mut [BaseSnapshot], complete: &[Market]) {
@@ -594,6 +863,39 @@ fn add_cross_sectional_ranks(bases: &mut [BaseSnapshot], complete: &[Market]) {
             }
         }
     }
+
+    let peer_candle_spans = complete
+        .iter()
+        .filter_map(|market| {
+            let range = bases
+                .iter()
+                .find(|base| base.market == *market)?
+                .input_range
+                .as_ref()?;
+            Some((
+                market.clone(),
+                range
+                    .spans()
+                    .iter()
+                    .filter(|span| span.kind() == FeatureInputKind::FifteenMinuteCandle)
+                    .map(|span| span.with_kind(FeatureInputKind::CrossSectionCandle))
+                    .collect::<Vec<_>>(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    for base in bases
+        .iter_mut()
+        .filter(|base| complete.contains(&base.market))
+    {
+        let additional = peer_candle_spans
+            .iter()
+            .filter(|(market, _)| *market != base.market)
+            .flat_map(|(_, spans)| spans.iter().cloned())
+            .collect::<Vec<_>>();
+        if let Some(range) = &base.input_range {
+            base.input_range = range.with_additional_spans(&additional);
+        }
+    }
 }
 
 struct SnapshotInputs<'a> {
@@ -604,7 +906,7 @@ struct SnapshotInputs<'a> {
     fundings: &'a [&'a Funding],
     bbo: Option<&'a Bbo>,
     book: Option<&'a BookSnapshot>,
-    trades: Vec<&'a MarketEvent>,
+    trades: &'a [&'a MarketEvent],
     as_of_time: TimestampNs,
 }
 
@@ -693,28 +995,57 @@ fn build_values(inputs: &SnapshotInputs<'_>) -> Option<BTreeMap<String, Decimal>
     }
     values.insert(
         "trade_imbalance_5m".to_owned(),
-        trade_imbalance(inputs.trades.clone(), inputs.as_of_time, MICRO_5_MINUTES_NS)?,
+        trade_imbalance(inputs.trades, inputs.as_of_time, MICRO_5_MINUTES_NS)?,
     );
     values.insert(
         "trade_imbalance_15m".to_owned(),
-        trade_imbalance(
-            inputs.trades.clone(),
-            inputs.as_of_time,
-            MICRO_15_MINUTES_NS,
-        )?,
+        trade_imbalance(inputs.trades, inputs.as_of_time, MICRO_15_MINUTES_NS)?,
     );
     Some(values)
 }
 
-fn input_range(history: &[&Candle]) -> Option<InputEventRange> {
-    let first = history.first()?;
-    let last = history.last()?;
-    Some(InputEventRange {
-        first_event_id: first.first_event_id().clone(),
-        last_event_id: last.last_event_id().clone(),
-        first_event_time: first.first_event_time(),
-        last_event_time: last.last_event_time(),
-    })
+fn input_range(
+    feature_history: &[&Candle],
+    hourly_history: &[&Candle],
+    context_events: &[&MarketEvent],
+    funding_events: &[&MarketEvent],
+    bbo_event: &MarketEvent,
+    book_event: &MarketEvent,
+    trades: &[&MarketEvent],
+) -> Option<InputEventRange> {
+    let spans = feature_history
+        .iter()
+        .map(|candle| InputEventSpan::candle(FeatureInputKind::FifteenMinuteCandle, candle))
+        .chain(
+            hourly_history
+                .iter()
+                .map(|candle| InputEventSpan::candle(FeatureInputKind::HourlyCandle, candle)),
+        )
+        .chain(
+            context_events
+                .iter()
+                .map(|event| InputEventSpan::event(FeatureInputKind::AssetContext, event)),
+        )
+        .chain(
+            funding_events
+                .iter()
+                .map(|event| InputEventSpan::event(FeatureInputKind::Funding, event)),
+        )
+        .chain(std::iter::once(InputEventSpan::event(
+            FeatureInputKind::Bbo,
+            bbo_event,
+        )))
+        .chain(std::iter::once(InputEventSpan::event(
+            FeatureInputKind::Book,
+            book_event,
+        )))
+        .chain(
+            trades
+                .iter()
+                .map(|event| InputEventSpan::event(FeatureInputKind::MicrostructureTrade, event)),
+        )
+        .collect::<Vec<_>>();
+    InputEventRange::from_spans(spans)
 }
 
 fn contiguous_tail<'a>(
@@ -1053,14 +1384,14 @@ fn depth(book: &BookSnapshot, bbo: &Bbo, bps: u32) -> Option<Decimal> {
 }
 
 fn trade_imbalance(
-    events: Vec<&MarketEvent>,
+    events: &[&MarketEvent],
     as_of_time: TimestampNs,
     window_ns: i64,
 ) -> Option<Decimal> {
     let start = as_of_time.value().checked_sub(window_ns)?;
     let (buy, sell) =
         events
-            .into_iter()
+            .iter()
             .try_fold((Decimal::ZERO, Decimal::ZERO), |(buy, sell), event| {
                 if event.event_time().value() <= start {
                     return Some((buy, sell));
@@ -1091,7 +1422,7 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
-    use super::CommonFeatureEngine;
+    use super::{CommonFeatureEngine, FeatureInputKind, FeatureUnreadyReason};
     use crate::candle::CandleAggregator;
     use crate::domain::{Market, Price, Quantity, Side, Usdc};
     use crate::event::{
@@ -1117,6 +1448,14 @@ mod tests {
         Market::new(value).expect("test market must be valid")
     }
 
+    #[derive(Clone, Copy)]
+    struct PopulateRange {
+        start: u64,
+        count: u64,
+        offset: Decimal,
+        step: Decimal,
+    }
+
     fn populate(
         engine: &mut CommonFeatureEngine,
         aggregator: &mut CandleAggregator,
@@ -1126,10 +1465,31 @@ mod tests {
         offset: Decimal,
         step: Decimal,
     ) {
-        for index in start..start + count {
+        populate_with_open_interest(
+            engine,
+            aggregator,
+            market,
+            PopulateRange {
+                start,
+                count,
+                offset,
+                step,
+            },
+            None,
+        );
+    }
+
+    fn populate_with_open_interest(
+        engine: &mut CommonFeatureEngine,
+        aggregator: &mut CandleAggregator,
+        market: Market,
+        range: PopulateRange,
+        zero_open_interest_at: Option<u64>,
+    ) {
+        for index in range.start..range.start + range.count {
             let open = i128::from(index) * FIFTEEN_MINUTES_NS;
             let close = open + FIFTEEN_MINUTES_NS;
-            let value = offset + Decimal::from(index) * step;
+            let value = range.offset + Decimal::from(index) * range.step;
             let bid = price(value - dec!(0.5));
             let ask = price(value + dec!(0.5));
             let trade = MarketEvent::trade(
@@ -1156,7 +1516,11 @@ mod tests {
                     price(value),
                     price(value - dec!(0.25)),
                     Some(price(value)),
-                    quantity(Decimal::from(index + 1)),
+                    quantity(if zero_open_interest_at == Some(index) {
+                        Decimal::ZERO
+                    } else {
+                        Decimal::from(index + 1)
+                    }),
                     Usdc::new(Decimal::from(1_000_000_u64 + index))
                         .expect("test USDC must be valid"),
                     FundingRate::new(Decimal::from(index) / dec!(10000)),
@@ -1430,5 +1794,120 @@ mod tests {
             assert_eq!(snapshot.values()["adx_14"], Decimal::ZERO);
             assert_eq!(snapshot.values()["realized_volatility_64"], Decimal::ZERO);
         }
+    }
+
+    #[test]
+    fn calculation_failure_is_explicitly_unready_and_exposes_no_strategy_values() {
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        populate_with_open_interest(
+            &mut engine,
+            &mut aggregator,
+            market("BTC"),
+            PopulateRange {
+                start: 0,
+                count: 128,
+                offset: dec!(100),
+                step: dec!(1),
+            },
+            Some(111),
+        );
+        populate(
+            &mut engine,
+            &mut aggregator,
+            market("ETH"),
+            0,
+            128,
+            dec!(200),
+            dec!(1),
+        );
+        let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
+        complete(&mut engine, &mut aggregator, decision);
+
+        let snapshot = engine
+            .snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision)
+            .into_iter()
+            .find(|snapshot| snapshot.market() == &market("BTC"))
+            .expect("BTC snapshot must exist");
+        assert!(!snapshot.completeness().calculations());
+        assert_eq!(
+            snapshot.unready_reason(),
+            Some(FeatureUnreadyReason::CalculationFailed)
+        );
+        assert!(snapshot.input_range().is_some());
+        assert!(!snapshot.is_ready());
+        assert!(snapshot.values().is_empty());
+    }
+
+    #[test]
+    fn provenance_covers_every_feature_dependency_and_ignores_future_events() {
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        populate(
+            &mut engine,
+            &mut aggregator,
+            market("BTC"),
+            0,
+            128,
+            dec!(100),
+            dec!(1),
+        );
+        populate(
+            &mut engine,
+            &mut aggregator,
+            market("ETH"),
+            0,
+            128,
+            dec!(200),
+            dec!(1),
+        );
+        let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
+        complete(&mut engine, &mut aggregator, decision);
+
+        let before = engine
+            .snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision)
+            .into_iter()
+            .find(|snapshot| snapshot.market() == &market("BTC"))
+            .expect("BTC snapshot must exist");
+        let range = before
+            .input_range()
+            .expect("ready snapshot must retain provenance");
+        let count = |kind| {
+            range
+                .spans()
+                .iter()
+                .filter(|span| span.kind() == kind)
+                .count()
+        };
+        assert_eq!(count(FeatureInputKind::FifteenMinuteCandle), 97);
+        assert_eq!(count(FeatureInputKind::HourlyCandle), 32);
+        assert_eq!(count(FeatureInputKind::CrossSectionCandle), 97);
+        assert_eq!(count(FeatureInputKind::AssetContext), 30);
+        assert_eq!(count(FeatureInputKind::Funding), 30);
+        assert_eq!(count(FeatureInputKind::Bbo), 1);
+        assert_eq!(count(FeatureInputKind::Book), 1);
+        assert_eq!(count(FeatureInputKind::MicrostructureTrade), 1);
+        assert!(!range.digest().is_empty());
+
+        populate(
+            &mut engine,
+            &mut aggregator,
+            market("BTC"),
+            128,
+            1,
+            dec!(100),
+            dec!(1),
+        );
+        complete(
+            &mut engine,
+            &mut aggregator,
+            timestamp(129 * FIFTEEN_MINUTES_NS),
+        );
+        let after = engine
+            .snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision)
+            .into_iter()
+            .find(|snapshot| snapshot.market() == &market("BTC"))
+            .expect("BTC snapshot must still exist");
+        assert_eq!(after.input_range(), before.input_range());
     }
 }
