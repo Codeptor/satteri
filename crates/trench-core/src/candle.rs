@@ -24,6 +24,12 @@ pub const MAX_PENDING_MARKETS: usize = 128;
 /// provisioned independently per market so a deep market cannot consume the
 /// entire universe's deduplication budget before the watermark advances.
 pub const MAX_PENDING_TRADES_PER_MARKET: usize = 16_384;
+/// Maximum unresolved market-time spans retained as explicit unavailable data.
+///
+/// This bound keeps a pathological stream of unreconciled interruptions from
+/// consuming unbounded memory. Callers must persist and start a new replay
+/// epoch before the limit is exhausted.
+pub const MAX_UNAVAILABLE_GAP_SPANS: usize = 4_096;
 
 /// One immutable completed candle with its exact normalized-trade input range.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +45,65 @@ pub struct Candle {
     source_available_at: TimestampNs,
     buy_notional: Decimal,
     sell_notional: Decimal,
+}
+
+/// An explicit market-time span for which no trustworthy trade evidence exists.
+///
+/// The optional start is absent only when the stream had not yet accepted a
+/// predecessor event. In that case every earlier candle is conservatively
+/// unavailable until `end`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CandleGap {
+    market: Market,
+    start: Option<TimestampNs>,
+    end: TimestampNs,
+}
+
+impl CandleGap {
+    /// Creates one half-open unavailable span ending at a known recovery point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CandleError::InvalidGap`] when a known predecessor does not
+    /// precede the recovery point.
+    pub fn new(
+        market: Market,
+        start: Option<TimestampNs>,
+        end: TimestampNs,
+    ) -> Result<Self, CandleError> {
+        if start.is_some_and(|start| start >= end) {
+            return Err(CandleError::InvalidGap { market, start, end });
+        }
+        Ok(Self { market, start, end })
+    }
+
+    /// Returns the affected market.
+    #[must_use]
+    pub const fn market(&self) -> &Market {
+        &self.market
+    }
+
+    /// Returns the authoritative event-time predecessor, when one exists.
+    #[must_use]
+    pub const fn start(&self) -> Option<TimestampNs> {
+        self.start
+    }
+
+    /// Returns the fresh recovery-point event time.
+    #[must_use]
+    pub const fn end(&self) -> TimestampNs {
+        self.end
+    }
+
+    fn overlaps(&self, key: &BucketKey) -> bool {
+        if self.market != key.market {
+            return false;
+        }
+        let Ok(close) = key.open_time.checked_add(key.interval.duration()) else {
+            return true;
+        };
+        key.open_time < self.end && self.start.is_none_or(|start| close > start)
+    }
 }
 
 impl Candle {
@@ -199,6 +264,36 @@ pub enum CandleError {
     /// Derived candle validation or timestamp arithmetic failed.
     #[error(transparent)]
     Event(#[from] EventError),
+    /// An unavailable span did not contain a nonempty forward interval.
+    #[error("unavailable candle span for market {market:?} has invalid bounds {start:?} to {end}")]
+    InvalidGap {
+        /// Affected market.
+        market: Market,
+        /// Last known event time, if the stream had one.
+        start: Option<TimestampNs>,
+        /// Fresh recovery event time.
+        end: TimestampNs,
+    },
+    /// An unavailable span would revise candles already finalized by the caller.
+    #[error("unavailable candle span begins before finalized watermark {watermark}")]
+    GapBeforeWatermark {
+        /// Finalization watermark already committed by the caller.
+        watermark: TimestampNs,
+    },
+    /// The bounded unavailable-span journal has reached its exact capacity.
+    #[error("unavailable candle span capacity {limit} reached")]
+    UnavailableGapCapacity {
+        /// Maximum retained unresolved spans.
+        limit: usize,
+    },
+    /// A new trade tried to revise an explicitly unavailable historical span.
+    #[error("trade at {event_time} falls within an unavailable candle span for market {market:?}")]
+    TradeWithinUnavailableGap {
+        /// Trade market.
+        market: Market,
+        /// Trade authoritative event time.
+        event_time: TimestampNs,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -364,7 +459,7 @@ impl PendingCandle {
 /// finalized identities remain idempotent for
 /// [`FINALIZED_TRADE_ID_HORIZON`] canonical ordering positions; a replay after
 /// that finite horizon fails closed instead of being accepted as a new late trade.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct CandleAggregator {
     seen: BTreeMap<EventId, TradePoint>,
     pending_counts: BTreeMap<Market, usize>,
@@ -372,6 +467,7 @@ pub struct CandleAggregator {
     finalized_order: BTreeMap<(TimestampNs, TimestampNs, EventId), EventId>,
     pending: BTreeMap<BucketKey, PendingCandle>,
     hourly_trade_ids: BTreeMap<BucketKey, BTreeSet<EventId>>,
+    unavailable_gaps: Vec<CandleGap>,
     watermark: Option<TimestampNs>,
 }
 
@@ -380,6 +476,43 @@ impl CandleAggregator {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Records an explicitly unavailable market-data span without inventing
+    /// trades, candles, or a readiness state.
+    ///
+    /// Any completed candle overlapping the span is suppressed. The caller
+    /// must mark the span before advancing the finalization watermark across
+    /// its predecessor; late correction would otherwise rewrite immutable
+    /// output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CandleError`] when the span is invalid, would revise finalized
+    /// output, or exceeds the fixed journal capacity.
+    pub fn mark_gap_unavailable(&mut self, gap: CandleGap) -> Result<(), CandleError> {
+        if let Some(watermark) = self.watermark
+            && gap.start().is_none_or(|start| start < watermark)
+        {
+            return Err(CandleError::GapBeforeWatermark { watermark });
+        }
+        if self.unavailable_gaps.contains(&gap) {
+            return Ok(());
+        }
+        if self.unavailable_gaps.len() == MAX_UNAVAILABLE_GAP_SPANS {
+            return Err(CandleError::UnavailableGapCapacity {
+                limit: MAX_UNAVAILABLE_GAP_SPANS,
+            });
+        }
+        self.unavailable_gaps.push(gap);
+        self.unavailable_gaps.sort();
+        Ok(())
+    }
+
+    /// Returns retained explicit unavailable spans in canonical order.
+    #[must_use]
+    pub fn unavailable_gaps(&self) -> &[CandleGap] {
+        &self.unavailable_gaps
     }
 
     /// Buffers one canonical trade for both 15-minute and one-hour intervals.
@@ -412,6 +545,16 @@ impl CandleAggregator {
         }
         if let Some(existing) = self.finalized.get(&point.event_id) {
             return duplicate_result(existing, &point);
+        }
+        if self.unavailable_gaps.iter().any(|gap| {
+            gap.market() == &point.market
+                && gap.start().is_none_or(|start| point.event_time > start)
+                && point.event_time < gap.end()
+        }) {
+            return Err(CandleError::TradeWithinUnavailableGap {
+                market: point.market,
+                event_time: point.event_time,
+            });
         }
 
         let pending_for_market = self
@@ -524,6 +667,7 @@ impl CandleAggregator {
             .collect::<Vec<_>>();
         let candles = complete
             .iter()
+            .filter(|key| !self.unavailable_gaps.iter().any(|gap| gap.overlaps(key)))
             .map(|key| {
                 let pending = self.pending.get(key).ok_or(CandleError::Invariant {
                     reason: "selected pending bucket must remain present",
@@ -610,7 +754,7 @@ mod tests {
     use crate::domain::{Market, Price, Quantity, Side};
     use crate::event::{CandleInterval, EventError, MarketEvent, TimestampNs, Trade};
 
-    use super::{CandleAggregator, CandleError};
+    use super::{CandleAggregator, CandleError, CandleGap};
 
     fn timestamp(value: i128) -> TimestampNs {
         TimestampNs::new(value).expect("test timestamp must be valid")
@@ -698,6 +842,58 @@ mod tests {
                 .complete_through(close)
                 .expect("watermark must be valid")
         );
+    }
+
+    #[test]
+    fn unavailable_gap_suppresses_overlapping_candles_without_inventing_trades() {
+        let mut aggregator = CandleAggregator::new();
+        aggregator
+            .ingest(&trade(1, 1, dec!(100)))
+            .expect("initial trade must be accepted");
+        let gap = CandleGap::new(
+            Market::new("BTC").expect("test market must be valid"),
+            Some(timestamp(1)),
+            timestamp(899_999_999_999),
+        )
+        .expect("forward gap must be valid");
+
+        aggregator
+            .mark_gap_unavailable(gap.clone())
+            .expect("unavailable gap must be retained");
+        assert_eq!(aggregator.unavailable_gaps(), [gap]);
+        assert!(
+            aggregator
+                .complete_through(timestamp(900_000_000_000))
+                .expect("watermark must be valid")
+                .is_empty(),
+            "the aggregator must not emit a partial candle across an unavailable span"
+        );
+        assert!(matches!(
+            aggregator.ingest(&trade(2, 2, dec!(101))),
+            Err(CandleError::TradeWithinUnavailableGap { .. })
+        ));
+    }
+
+    #[test]
+    fn unavailable_gap_cannot_revise_a_finalized_candle() {
+        let mut aggregator = CandleAggregator::new();
+        aggregator
+            .ingest(&trade(1, 1, dec!(100)))
+            .expect("initial trade must be accepted");
+        aggregator
+            .complete_through(timestamp(900_000_000_000))
+            .expect("first candle must finalize");
+        let gap = CandleGap::new(
+            Market::new("BTC").expect("test market must be valid"),
+            Some(timestamp(1)),
+            timestamp(900_000_000_001),
+        )
+        .expect("forward gap must be valid");
+
+        assert!(matches!(
+            aggregator.mark_gap_unavailable(gap),
+            Err(CandleError::GapBeforeWatermark { .. })
+        ));
     }
 
     #[test]
