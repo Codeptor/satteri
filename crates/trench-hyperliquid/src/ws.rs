@@ -4,7 +4,6 @@
 //! its configuration constrained to the documented public connection budgets.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
@@ -1609,7 +1608,7 @@ fn parse_plain_decimal(value: &str) -> Result<Decimal, DecodeError> {
     if !is_plain_decimal(value) {
         return Err(DecodeError::InvalidDecimal);
     }
-    Decimal::from_str(value).map_err(|_| DecodeError::InvalidDecimal)
+    Decimal::from_str_exact(value).map_err(|_| DecodeError::InvalidDecimal)
 }
 
 fn is_plain_decimal(value: &str) -> bool {
@@ -1903,6 +1902,31 @@ mod tests {
                 "plain exchange quantity `{value}` must be accepted"
             );
         }
+    }
+
+    #[test]
+    fn wire_decimals_reject_overprecision_instead_of_rounding() {
+        let overprecision = "0.12345678901234567890123456789";
+        assert_eq!(
+            super::decode_price(overprecision),
+            Err(DecodeError::InvalidDecimal),
+            "over-precision prices must not silently normalize"
+        );
+        assert_eq!(
+            super::decode_quantity(overprecision),
+            Err(DecodeError::InvalidDecimal),
+            "over-precision quantities must not silently normalize"
+        );
+
+        let representable = "0.1234567890123456789012345678";
+        assert!(
+            super::decode_price(representable).is_ok(),
+            "a high but exactly representable price must remain valid"
+        );
+        assert!(
+            super::decode_quantity(representable).is_ok(),
+            "a high but exactly representable quantity must remain valid"
+        );
     }
 
     #[test]
