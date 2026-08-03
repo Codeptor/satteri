@@ -14,5 +14,5 @@ pub use normalize::{
 };
 pub use ws::{
     GapClosed, GapEvent, GapExhausted, GapOpened, GapReason, RejectedUpdate, RejectionReason,
-    WsClient, WsConfig, WsError, WsLimits, WsOutput, WsStream,
+    TradeIdentityLimit, WsClient, WsConfig, WsError, WsLimits, WsOutput, WsStream, WsTerminal,
 };

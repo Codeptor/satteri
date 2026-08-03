@@ -48,12 +48,14 @@ fn websocket_limits_stay_below_public_connection_and_subscription_budgets() {
         WsLimits::new(
             Duration::from_secs(5),
             Duration::from_secs(45),
+            Duration::from_secs(15),
             Duration::from_secs(60),
             Duration::from_secs(3),
             Duration::from_secs(30),
             5,
             64 * 1024,
             32,
+            1_000,
         ),
         Err(WsError::InvalidConfig {
             field: "heartbeat_interval",
@@ -64,16 +66,36 @@ fn websocket_limits_stay_below_public_connection_and_subscription_budgets() {
         WsLimits::new(
             Duration::from_secs(5),
             Duration::from_secs(45),
+            Duration::from_secs(15),
             Duration::from_secs(25),
             Duration::from_secs(3),
             Duration::from_secs(30),
             5,
             64 * 1024,
             32,
+            1_000,
         ),
         Err(WsError::InvalidConfig {
             field: "reconnect_min_delay",
             requirement: "must be at least 4 seconds",
+        })
+    );
+    assert_eq!(
+        WsLimits::new(
+            Duration::from_secs(5),
+            Duration::from_secs(45),
+            Duration::from_secs(15),
+            Duration::from_secs(25),
+            Duration::from_secs(4),
+            Duration::from_secs(30),
+            5,
+            64 * 1024,
+            32,
+            0,
+        ),
+        Err(WsError::InvalidConfig {
+            field: "max_trade_identities",
+            requirement: "must be between 1 and 1000000",
         })
     );
 }

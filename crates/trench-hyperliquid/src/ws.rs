@@ -32,18 +32,22 @@ const OFFICIAL_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 const WEBSOCKET_WRITE_BUFFER_BYTES: usize = 8 * 1024;
 const WEBSOCKET_MAX_WRITE_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_L2_LEVELS_PER_SIDE: usize = 20;
+const DEFAULT_MAX_TRADE_IDENTITIES: usize = 100_000;
+const MAX_TRADE_IDENTITIES: usize = 1_000_000;
 
 /// Validated, finite limits for one public market-data WebSocket connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WsLimits {
     connect_timeout: Duration,
     read_timeout: Duration,
+    snapshot_recovery_timeout: Duration,
     heartbeat_interval: Duration,
     reconnect_min_delay: Duration,
     reconnect_max_delay: Duration,
     max_reconnect_attempts: u32,
     max_inbound_message_bytes: usize,
     output_channel_capacity: usize,
+    max_trade_identities: usize,
 }
 
 impl WsLimits {
@@ -65,18 +69,32 @@ impl WsLimits {
     pub fn new(
         connect_timeout: Duration,
         read_timeout: Duration,
+        snapshot_recovery_timeout: Duration,
         heartbeat_interval: Duration,
         reconnect_min_delay: Duration,
         reconnect_max_delay: Duration,
         max_reconnect_attempts: u32,
         max_inbound_message_bytes: usize,
         output_channel_capacity: usize,
+        max_trade_identities: usize,
     ) -> Result<Self, WsError> {
         if connect_timeout.is_zero() {
             return Err(invalid_config("connect_timeout", "must be nonzero"));
         }
         if read_timeout.is_zero() {
             return Err(invalid_config("read_timeout", "must be nonzero"));
+        }
+        if snapshot_recovery_timeout.is_zero() {
+            return Err(invalid_config(
+                "snapshot_recovery_timeout",
+                "must be nonzero",
+            ));
+        }
+        if snapshot_recovery_timeout > read_timeout {
+            return Err(invalid_config(
+                "snapshot_recovery_timeout",
+                "must not exceed read_timeout",
+            ));
         }
         if heartbeat_interval.is_zero() {
             return Err(invalid_config("heartbeat_interval", "must be nonzero"));
@@ -123,16 +141,24 @@ impl WsLimits {
                 "must be between 1 and 4096",
             ));
         }
+        if !(1..=MAX_TRADE_IDENTITIES).contains(&max_trade_identities) {
+            return Err(invalid_config(
+                "max_trade_identities",
+                "must be between 1 and 1000000",
+            ));
+        }
 
         Ok(Self {
             connect_timeout,
             read_timeout,
+            snapshot_recovery_timeout,
             heartbeat_interval,
             reconnect_min_delay,
             reconnect_max_delay,
             max_reconnect_attempts,
             max_inbound_message_bytes,
             output_channel_capacity,
+            max_trade_identities,
         })
     }
 
@@ -146,6 +172,12 @@ impl WsLimits {
     #[must_use]
     pub const fn read_timeout(self) -> Duration {
         self.read_timeout
+    }
+
+    /// Returns the finite deadline for recovering every selected L2 snapshot.
+    #[must_use]
+    pub const fn snapshot_recovery_timeout(self) -> Duration {
+        self.snapshot_recovery_timeout
     }
 
     /// Returns the interval between official JSON heartbeat messages.
@@ -184,17 +216,25 @@ impl WsLimits {
         self.output_channel_capacity
     }
 
+    /// Returns the exact trade-identity capacity of this stream epoch.
+    #[must_use]
+    pub const fn max_trade_identities(self) -> usize {
+        self.max_trade_identities
+    }
+
     #[cfg(test)]
     fn fast_for_test() -> Self {
         Self {
             connect_timeout: Duration::from_millis(100),
             read_timeout: Duration::from_millis(200),
+            snapshot_recovery_timeout: Duration::from_millis(100),
             heartbeat_interval: Duration::from_millis(20),
             reconnect_min_delay: Duration::from_millis(5),
             reconnect_max_delay: Duration::from_millis(20),
             max_reconnect_attempts: 2,
             max_inbound_message_bytes: 4 * 1024,
             output_channel_capacity: 8,
+            max_trade_identities: 8_192,
         }
     }
 
@@ -205,6 +245,14 @@ impl WsLimits {
             ..Self::fast_for_test()
         }
     }
+
+    #[cfg(test)]
+    fn fast_with_trade_identity_limit_for_test(max_trade_identities: usize) -> Self {
+        Self {
+            max_trade_identities,
+            ..Self::fast_for_test()
+        }
+    }
 }
 
 impl Default for WsLimits {
@@ -212,12 +260,14 @@ impl Default for WsLimits {
         Self {
             connect_timeout: Duration::from_secs(5),
             read_timeout: Duration::from_secs(45),
+            snapshot_recovery_timeout: Duration::from_secs(15),
             heartbeat_interval: Duration::from_secs(25),
             reconnect_min_delay: MIN_RECONNECT_DELAY,
             reconnect_max_delay: Duration::from_secs(30),
             max_reconnect_attempts: 20,
             max_inbound_message_bytes: 64 * 1024,
             output_channel_capacity: 128,
+            max_trade_identities: DEFAULT_MAX_TRADE_IDENTITIES,
         }
     }
 }
@@ -348,10 +398,11 @@ impl WsClient {
 ///
 /// Dropping the stream or calling [`WsStream::cancel`] stops the single
 /// associated connection task. The receiver is bounded by [`WsLimits`]. Trade
-/// identities are retained exactly for the lifetime of this stream and never
-/// evicted, so memory grows with distinct accepted trades. A replacement
-/// stream needs durable downstream identity retention when continuity across
-/// stream lifetimes is required.
+/// identities are retained exactly until [`WsLimits::max_trade_identities`] is
+/// reached. The stream then emits [`WsTerminal::TradeIdentityLimit`] and
+/// stops before a new identity could be emitted without durable retention. A
+/// supervising durable journal must persist identities and start a fresh
+/// stream epoch after that terminal record.
 pub struct WsStream {
     receiver: mpsc::Receiver<WsOutput>,
     cancellation: CancellationToken,
@@ -391,6 +442,29 @@ pub enum WsOutput {
     Gap(GapEvent),
     /// A rejected wire update retained for observability without its raw body.
     Rejected(RejectedUpdate),
+    /// A non-recoverable bounded-stream condition that ends this epoch.
+    Terminal(WsTerminal),
+}
+
+/// A typed, non-recoverable reason that ends one bounded stream epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WsTerminal {
+    /// Recording another exact trade identity would exceed the configured cap.
+    TradeIdentityLimit(TradeIdentityLimit),
+}
+
+/// Evidence that exact trade-identity retention reached its configured bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TradeIdentityLimit {
+    max_identities: usize,
+}
+
+impl TradeIdentityLimit {
+    /// Returns the exact identity capacity reached by the terminated epoch.
+    #[must_use]
+    pub const fn max_identities(&self) -> usize {
+        self.max_identities
+    }
 }
 
 /// One append-only interruption record, kept separate from market facts.
@@ -419,6 +493,8 @@ pub enum GapReason {
     TransportError,
     /// The configured finite read deadline elapsed.
     ReadTimeout,
+    /// Not every selected market supplied a fresh full L2 snapshot in time.
+    SnapshotRecoveryTimeout,
 }
 
 /// Evidence retained when continuity first becomes unknown for one market.
@@ -621,6 +697,8 @@ pub enum RejectionReason {
     NonTextFrame,
     /// The server sent a frame larger than the configured hard byte limit.
     MessageTooLarge,
+    /// Exact trade-identity retention reached its configured stream bound.
+    TradeIdentityLimit,
 }
 
 #[derive(Debug, Clone)]
@@ -656,7 +734,10 @@ async fn run_client(
     let mut retry = 0_u32;
     let mut backoff = ReconnectBackoff::new(random());
     let mut state = StreamState::new(config.markets().to_vec());
-    let mut decoder = Decoder::new(config.markets().iter().cloned());
+    let mut decoder = Decoder::with_trade_identity_limit(
+        config.markets().iter().cloned(),
+        config.limits.max_trade_identities(),
+    );
     loop {
         if cancellation.is_cancelled() {
             return;
@@ -676,7 +757,13 @@ async fn run_client(
             Ok(Ok((socket, _))) => socket,
             Ok(Err(error)) => {
                 tracing::warn!(error = %error, "public WebSocket connection failed");
-                if !emit_gaps(&mut state, GapReason::TransportError, &output).await
+                if !emit_gaps(
+                    &mut state,
+                    GapReason::TransportError,
+                    &output,
+                    &cancellation,
+                )
+                .await
                     || !schedule_reconnect(
                         &config,
                         &cancellation,
@@ -693,7 +780,13 @@ async fn run_client(
             }
             Err(_) => {
                 tracing::warn!("public WebSocket connection timed out");
-                if !emit_gaps(&mut state, GapReason::TransportError, &output).await
+                if !emit_gaps(
+                    &mut state,
+                    GapReason::TransportError,
+                    &output,
+                    &cancellation,
+                )
+                .await
                     || !schedule_reconnect(
                         &config,
                         &cancellation,
@@ -724,17 +817,23 @@ async fn run_client(
             backoff = ReconnectBackoff::new(random());
         }
         match connection.end {
-            ConnectionEnd::Cancelled | ConnectionEnd::OutputClosed => return,
+            ConnectionEnd::Cancelled
+            | ConnectionEnd::OutputClosed
+            | ConnectionEnd::TradeIdentityLimit => return,
             end @ (ConnectionEnd::Closed
             | ConnectionEnd::ReadTimeout
+            | ConnectionEnd::SnapshotRecoveryTimeout
             | ConnectionEnd::TransportError) => {
                 let reason = match end {
                     ConnectionEnd::Closed => GapReason::TransportClosed,
                     ConnectionEnd::ReadTimeout => GapReason::ReadTimeout,
+                    ConnectionEnd::SnapshotRecoveryTimeout => GapReason::SnapshotRecoveryTimeout,
                     ConnectionEnd::TransportError => GapReason::TransportError,
-                    ConnectionEnd::Cancelled | ConnectionEnd::OutputClosed => return,
+                    ConnectionEnd::Cancelled
+                    | ConnectionEnd::OutputClosed
+                    | ConnectionEnd::TradeIdentityLimit => return,
                 };
-                if !emit_gaps(&mut state, reason, &output).await
+                if !emit_gaps(&mut state, reason, &output, &cancellation).await
                     || !schedule_reconnect(
                         &config,
                         &cancellation,
@@ -756,9 +855,10 @@ async fn emit_gaps(
     state: &mut StreamState,
     reason: GapReason,
     output: &mpsc::Sender<WsOutput>,
+    cancellation: &CancellationToken,
 ) -> bool {
     for gap in state.open_gaps(reason) {
-        if output.send(WsOutput::Gap(gap)).await.is_err() {
+        if !send_output(output, cancellation, WsOutput::Gap(gap)).await {
             return false;
         }
     }
@@ -768,9 +868,10 @@ async fn emit_gaps(
 async fn emit_reconnect_exhausted_gaps(
     state: &StreamState,
     output: &mpsc::Sender<WsOutput>,
+    cancellation: &CancellationToken,
 ) -> bool {
     for gap in state.reconnect_exhausted() {
-        if output.send(WsOutput::Gap(gap)).await.is_err() {
+        if !send_output(output, cancellation, WsOutput::Gap(gap)).await {
             return false;
         }
     }
@@ -789,7 +890,7 @@ async fn schedule_reconnect(
         ReconnectOutcome::Ready => true,
         ReconnectOutcome::Cancelled => false,
         ReconnectOutcome::Exhausted => {
-            let _ = emit_reconnect_exhausted_gaps(state, output).await;
+            let _ = emit_reconnect_exhausted_gaps(state, output, cancellation).await;
             false
         }
     }
@@ -865,8 +966,13 @@ async fn run_connection(
 
     decoder.begin_connection();
     let mut healthy = false;
+    let recovery_required = state.has_pending_gaps();
+    let mut recovered_markets = BTreeSet::new();
     let mut heartbeat_due = Box::pin(tokio::time::sleep(config.limits.heartbeat_interval()));
     let mut read_deadline = Box::pin(tokio::time::sleep(config.limits.read_timeout()));
+    let mut snapshot_recovery_deadline = Box::pin(tokio::time::sleep(
+        config.limits.snapshot_recovery_timeout(),
+    ));
     loop {
         tokio::select! {
             _ = cancellation.cancelled() => {
@@ -894,6 +1000,10 @@ async fn run_connection(
                 tracing::warn!("public WebSocket read deadline elapsed");
                 return ConnectionOutcome { end: ConnectionEnd::ReadTimeout, healthy };
             }
+            _ = &mut snapshot_recovery_deadline, if recovery_required && !healthy => {
+                tracing::warn!("public WebSocket snapshot recovery deadline elapsed");
+                return ConnectionOutcome { end: ConnectionEnd::SnapshotRecoveryTimeout, healthy };
+            }
             frame = source.next() => {
                 read_deadline.as_mut().reset(Instant::now() + config.limits.read_timeout());
                 let Some(frame) = frame else {
@@ -913,9 +1023,13 @@ async fn run_connection(
                     config,
                     output,
                     state,
+                    cancellation,
                 ).await {
                     FrameOutcome::Continue => {}
-                    FrameOutcome::FreshL2 => healthy = true,
+                    FrameOutcome::FreshL2(market) => {
+                        recovered_markets.insert(market);
+                        healthy = recovered_markets.len() == config.markets().len();
+                    }
                     FrameOutcome::Closed => {
                         return ConnectionOutcome { end: ConnectionEnd::Closed, healthy };
                     }
@@ -924,6 +1038,12 @@ async fn run_connection(
                     }
                     FrameOutcome::OutputClosed => {
                         return ConnectionOutcome { end: ConnectionEnd::OutputClosed, healthy };
+                    }
+                    FrameOutcome::Terminal => {
+                        return ConnectionOutcome {
+                            end: ConnectionEnd::TradeIdentityLimit,
+                            healthy,
+                        };
                     }
                 }
             }
@@ -938,6 +1058,7 @@ async fn handle_frame(
     config: &WsConfig,
     output: &mpsc::Sender<WsOutput>,
     state: &mut StreamState,
+    cancellation: &CancellationToken,
 ) -> FrameOutcome {
     let received_at = match now_timestamp() {
         Some(timestamp) => timestamp,
@@ -946,8 +1067,13 @@ async fn handle_frame(
     match frame {
         Message::Text(frame) => {
             if frame.len() > config.limits.max_inbound_message_bytes() {
-                return if emit_rejection(output, received_at, RejectionReason::MessageTooLarge)
-                    .await
+                return if emit_rejection(
+                    output,
+                    cancellation,
+                    received_at,
+                    RejectionReason::MessageTooLarge,
+                )
+                .await
                 {
                     FrameOutcome::Continue
                 } else {
@@ -956,25 +1082,26 @@ async fn handle_frame(
             }
             match decoder.decode(&frame, received_at) {
                 Ok(DecodedFrame::MarketEvents(events)) => {
-                    let received_fresh_l2 = events.iter().any(|event| {
+                    let recovered_market = events.iter().find_map(|event| {
                         matches!(
                             event.kind(),
                             trench_core::event::MarketEventKind::BookSnapshot(_)
                         )
+                        .then(|| event.market().clone())
                     });
                     for event in events {
                         let gap = state.record_event(&event);
-                        if output.send(WsOutput::MarketEvent(event)).await.is_err() {
+                        if !send_output(output, cancellation, WsOutput::MarketEvent(event)).await {
                             return FrameOutcome::OutputClosed;
                         }
                         if let Some(gap) = gap
-                            && output.send(WsOutput::Gap(gap)).await.is_err()
+                            && !send_output(output, cancellation, WsOutput::Gap(gap)).await
                         {
                             return FrameOutcome::OutputClosed;
                         }
                     }
-                    if received_fresh_l2 {
-                        FrameOutcome::FreshL2
+                    if let Some(market) = recovered_market {
+                        FrameOutcome::FreshL2(market)
                     } else {
                         FrameOutcome::Continue
                     }
@@ -984,9 +1111,24 @@ async fn handle_frame(
                     FrameOutcome::Continue
                 }
                 Ok(DecodedFrame::Pong) => FrameOutcome::Continue,
+                Err(DecodeError::TradeIdentityLimit { max_identities }) => {
+                    if send_output(
+                        output,
+                        cancellation,
+                        WsOutput::Terminal(WsTerminal::TradeIdentityLimit(TradeIdentityLimit {
+                            max_identities,
+                        })),
+                    )
+                    .await
+                    {
+                        FrameOutcome::Terminal
+                    } else {
+                        FrameOutcome::OutputClosed
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(reason = ?error, "public WebSocket update rejected");
-                    if emit_rejection(output, received_at, error.into()).await {
+                    if emit_rejection(output, cancellation, received_at, error.into()).await {
                         FrameOutcome::Continue
                     } else {
                         FrameOutcome::OutputClosed
@@ -1015,7 +1157,14 @@ async fn handle_frame(
         Message::Pong(_) => FrameOutcome::Continue,
         Message::Close(_) => FrameOutcome::Closed,
         Message::Binary(_) | Message::Frame(_) => {
-            if emit_rejection(output, received_at, RejectionReason::NonTextFrame).await {
+            if emit_rejection(
+                output,
+                cancellation,
+                received_at,
+                RejectionReason::NonTextFrame,
+            )
+            .await
+            {
                 FrameOutcome::Continue
             } else {
                 FrameOutcome::OutputClosed
@@ -1026,16 +1175,33 @@ async fn handle_frame(
 
 async fn emit_rejection(
     output: &mpsc::Sender<WsOutput>,
+    cancellation: &CancellationToken,
     received_at: TimestampNs,
     reason: RejectionReason,
 ) -> bool {
-    output
-        .send(WsOutput::Rejected(RejectedUpdate {
+    send_output(
+        output,
+        cancellation,
+        WsOutput::Rejected(RejectedUpdate {
             received_at,
             reason,
-        }))
-        .await
-        .is_ok()
+        }),
+    )
+    .await
+}
+
+async fn send_output(
+    output: &mpsc::Sender<WsOutput>,
+    cancellation: &CancellationToken,
+    item: WsOutput,
+) -> bool {
+    if cancellation.is_cancelled() {
+        return false;
+    }
+    tokio::select! {
+        _ = cancellation.cancelled() => false,
+        result = output.send(item) => result.is_ok(),
+    }
 }
 
 fn now_timestamp() -> Option<TimestampNs> {
@@ -1049,7 +1215,9 @@ enum ConnectionEnd {
     Cancelled,
     Closed,
     ReadTimeout,
+    SnapshotRecoveryTimeout,
     TransportError,
+    TradeIdentityLimit,
     OutputClosed,
 }
 
@@ -1067,12 +1235,13 @@ impl ConnectionOutcome {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 enum FrameOutcome {
     Continue,
-    FreshL2,
+    FreshL2(Market),
     Closed,
     TransportError,
+    Terminal,
     OutputClosed,
 }
 
@@ -1137,6 +1306,10 @@ impl StreamState {
         for pending in self.pending_gaps.values_mut() {
             pending.reconnect_attempt = pending.reconnect_attempt.saturating_add(1);
         }
+    }
+
+    fn has_pending_gaps(&self) -> bool {
+        !self.pending_gaps.is_empty()
     }
 
     fn reconnect_exhausted(&self) -> Vec<GapEvent> {
@@ -1231,6 +1404,7 @@ impl From<DecodeError> for RejectionReason {
             DecodeError::InvalidBbo => Self::InvalidBbo,
             DecodeError::InvalidBook => Self::InvalidBook,
             DecodeError::NonMonotonicBook => Self::NonMonotonicBook,
+            DecodeError::TradeIdentityLimit { .. } => Self::TradeIdentityLimit,
         }
     }
 }
@@ -1313,17 +1487,27 @@ impl SubscriptionAck {
 
 struct Decoder {
     markets: BTreeSet<Market>,
-    /// Exact identities retained for this stream's full lifetime so reconnect
+    /// Exact identities retained for this bounded stream epoch so reconnect
     /// replays cannot become duplicate market facts.
     trades: BTreeSet<TradeIdentity>,
+    max_trade_identities: usize,
     last_book_times: BTreeMap<Market, TimestampNs>,
 }
 
 impl Decoder {
+    #[cfg(test)]
     fn new(markets: impl IntoIterator<Item = Market>) -> Self {
+        Self::with_trade_identity_limit(markets, DEFAULT_MAX_TRADE_IDENTITIES)
+    }
+
+    fn with_trade_identity_limit(
+        markets: impl IntoIterator<Item = Market>,
+        max_trade_identities: usize,
+    ) -> Self {
         Self {
             markets: markets.into_iter().collect(),
             trades: BTreeSet::new(),
+            max_trade_identities,
             last_book_times: BTreeMap::new(),
         }
     }
@@ -1394,7 +1578,8 @@ impl Decoder {
     ) -> Result<DecodedFrame, DecodeError> {
         let trades: Vec<RawWsTrade> =
             serde_json::from_value(data).map_err(|_| DecodeError::Malformed)?;
-        let mut events = Vec::with_capacity(trades.len());
+        let mut staged_identities = BTreeSet::new();
+        let mut staged = Vec::with_capacity(trades.len());
         for raw in trades {
             let market = parse_selected_market(&raw.coin, &self.markets)?;
             let event_time = timestamp_from_millis(raw.time)?;
@@ -1403,9 +1588,6 @@ impl Decoder {
                 market: market.clone(),
                 trade_id: raw.tid,
             };
-            if self.trades.contains(&identity) {
-                continue;
-            }
             let side = match raw.side.as_str() {
                 "B" => Side::Buy,
                 "A" => Side::Sell,
@@ -1417,9 +1599,19 @@ impl Decoder {
                 .map_err(|_| DecodeError::InvalidDecimal)?;
             let event = MarketEvent::trade(event_time, received_at, market, trade)
                 .map_err(|_| DecodeError::InvalidTimestamp)?;
-            self.trades.insert(identity);
-            events.push(event);
+            if self.trades.contains(&identity) || !staged_identities.insert(identity.clone()) {
+                continue;
+            }
+            staged.push((identity, event));
         }
+        if self.trades.len().saturating_add(staged.len()) > self.max_trade_identities {
+            return Err(DecodeError::TradeIdentityLimit {
+                max_identities: self.max_trade_identities,
+            });
+        }
+        self.trades
+            .extend(staged.iter().map(|(identity, _)| identity.clone()));
+        let events = staged.into_iter().map(|(_, event)| event).collect();
         Ok(DecodedFrame::MarketEvents(events))
     }
 
@@ -1474,6 +1666,7 @@ enum DecodeError {
     InvalidBbo,
     InvalidBook,
     NonMonotonicBook,
+    TradeIdentityLimit { max_identities: usize },
 }
 
 #[derive(Deserialize)]
@@ -1732,6 +1925,119 @@ mod tests {
             panic!("duplicate trade frame must remain a market frame");
         };
         assert!(duplicates.is_empty());
+    }
+
+    #[test]
+    fn decoder_suppresses_duplicate_identities_within_one_valid_trade_batch() {
+        let received_at = TimestampNs::new(1_700_000_000_002_000_000)
+            .expect("receipt timestamp fits nanoseconds");
+        let mut decoder = Decoder::new([market("BTC")]);
+        let frame = json!({
+            "channel": "trades",
+            "data": [
+                {
+                    "coin": "BTC", "side": "B", "px": "1", "sz": "1",
+                    "time": 1_700_000_000_000_i64, "tid": 41
+                },
+                {
+                    "coin": "BTC", "side": "A", "px": "2", "sz": "2",
+                    "time": 1_700_000_000_000_i64, "tid": 41
+                }
+            ]
+        })
+        .to_string();
+
+        let DecodedFrame::MarketEvents(events) = decoder
+            .decode(&frame, received_at)
+            .expect("a valid batch with duplicate identities must decode")
+        else {
+            panic!("trade frame must produce market events");
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(decoder.trades.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_trade_batch_does_not_commit_earlier_staged_identities() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback WebSocket server");
+        let endpoint = format!(
+            "ws://{}",
+            listener
+                .local_addr()
+                .expect("loopback address is available")
+        );
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept client");
+            let mut socket = accept_async(socket)
+                .await
+                .expect("accept WebSocket handshake");
+            for _ in 0..3 {
+                let Some(Ok(Message::Text(_))) = socket.next().await else {
+                    panic!("client must subscribe before trade data arrives");
+                };
+            }
+            socket
+                .send(Message::Text(
+                    json!({
+                        "channel": "trades",
+                        "data": [
+                            {
+                                "coin": "BTC", "side": "B", "px": "1", "sz": "1",
+                                "time": 1_700_000_000_000_i64, "tid": 41
+                            },
+                            {
+                                "coin": "BTC", "side": "A", "px": "bad", "sz": "1",
+                                "time": 1_700_000_000_001_i64, "tid": 42
+                            }
+                        ]
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .expect("send malformed trade batch");
+            socket
+                .send(Message::Text(
+                    json!({
+                        "channel": "trades",
+                        "data": [{
+                            "coin": "BTC", "side": "B", "px": "1", "sz": "1",
+                            "time": 1_700_000_000_000_i64, "tid": 41
+                        }]
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .expect("replay the formerly staged trade");
+        });
+
+        let config = WsConfig::with_limits(vec![market("BTC")], WsLimits::fast_for_test())
+            .expect("test configuration is valid");
+        let mut stream = WsClient::new_for_test(config, endpoint).start();
+        let rejected = timeout(Duration::from_secs(1), stream.recv())
+            .await
+            .expect("malformed batch rejection before timeout")
+            .expect("stream remains open");
+        assert!(matches!(
+            rejected,
+            WsOutput::Rejected(ref update) if update.reason() == super::RejectionReason::InvalidDecimal
+        ));
+        let replay = timeout(Duration::from_secs(1), stream.recv())
+            .await
+            .expect("replayed valid trade before timeout")
+            .expect("stream remains open");
+        let WsOutput::MarketEvent(event) = replay else {
+            panic!("the staged identity must not survive a rejected batch");
+        };
+        let MarketEventKind::Trade(trade) = event.kind() else {
+            panic!("replayed trade must remain a trade event");
+        };
+        assert_eq!(trade.trade_id(), 41);
+        stream.cancel();
+        server.await.expect("server task must complete");
     }
 
     #[test]
@@ -2101,6 +2407,65 @@ mod tests {
     }
 
     #[test]
+    fn decoder_stops_an_exact_trade_identity_epoch_before_overflow() {
+        let received_at =
+            TimestampNs::new(i128::from(i64::MAX)).expect("maximum receipt timestamp is valid");
+        let mut decoder = Decoder::with_trade_identity_limit([market("BTC")], 2);
+        let at_capacity = json!({
+            "channel": "trades",
+            "data": [
+                {
+                    "coin": "BTC", "side": "B", "px": "1", "sz": "1",
+                    "time": 1_700_000_000_000_i64, "tid": 1
+                },
+                {
+                    "coin": "BTC", "side": "A", "px": "2", "sz": "1",
+                    "time": 1_700_000_000_001_i64, "tid": 2
+                }
+            ]
+        })
+        .to_string();
+        let DecodedFrame::MarketEvents(events) = decoder
+            .decode(&at_capacity, received_at)
+            .expect("the exact identity cap must remain usable")
+        else {
+            panic!("trade frame must produce market events");
+        };
+        assert_eq!(events.len(), 2);
+        assert_eq!(decoder.trades.len(), 2);
+
+        let overflow = json!({
+            "channel": "trades",
+            "data": [{
+                "coin": "BTC", "side": "B", "px": "3", "sz": "1",
+                "time": 1_700_000_000_002_i64, "tid": 3
+            }]
+        })
+        .to_string();
+        assert_eq!(
+            decoder.decode(&overflow, received_at),
+            Err(DecodeError::TradeIdentityLimit { max_identities: 2 })
+        );
+        assert_eq!(decoder.trades.len(), 2);
+
+        let replay = json!({
+            "channel": "trades",
+            "data": [{
+                "coin": "BTC", "side": "B", "px": "1", "sz": "1",
+                "time": 1_700_000_000_000_i64, "tid": 1
+            }]
+        })
+        .to_string();
+        let DecodedFrame::MarketEvents(events) = decoder
+            .decode(&replay, received_at)
+            .expect("already-recorded identities remain valid")
+        else {
+            panic!("trade frame must remain a market frame");
+        };
+        assert!(events.is_empty());
+    }
+
+    #[test]
     fn repeated_reconnect_failures_preserve_the_original_pending_gap_generation() {
         let mut state = super::StreamState::new(vec![market("BTC")]);
         let first = state.open_gaps(GapReason::TransportClosed);
@@ -2464,7 +2829,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_fresh_l2_snapshot_renews_the_reconnect_budget() {
+    async fn all_selected_l2_snapshots_renew_the_reconnect_budget() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind loopback WebSocket server");
@@ -2480,34 +2845,43 @@ mod tests {
                 let mut socket = accept_async(socket)
                     .await
                     .expect("accept WebSocket handshake");
-                for kind in ["l2Book", "trades", "bbo"] {
+                for (coin, kind) in [
+                    ("BTC", "l2Book"),
+                    ("BTC", "trades"),
+                    ("BTC", "bbo"),
+                    ("ETH", "l2Book"),
+                    ("ETH", "trades"),
+                    ("ETH", "bbo"),
+                ] {
                     let Some(Ok(Message::Text(subscription))) = socket.next().await else {
                         panic!("client must send every intended subscription");
                     };
                     assert_eq!(
                         serde_json::from_str::<serde_json::Value>(&subscription)
                             .expect("subscription must be JSON"),
-                        json!({"method":"subscribe","subscription":{"type":kind,"coin":"BTC"}})
+                        json!({"method":"subscribe","subscription":{"type":kind,"coin":coin}})
                     );
                 }
                 if connection == 1 {
-                    socket
-                        .send(Message::Text(
-                            json!({
-                                "channel": "l2Book",
-                                "data": {
-                                    "coin": "BTC", "time": 1_700_000_000_000_i64,
-                                    "levels": [
-                                        [{"px": "1", "sz": "1", "n": 1}],
-                                        [{"px": "2", "sz": "1", "n": 1}]
-                                    ]
-                                }
-                            })
-                            .to_string()
-                            .into(),
-                        ))
-                        .await
-                        .expect("send healthy fresh L2");
+                    for coin in ["BTC", "ETH"] {
+                        socket
+                            .send(Message::Text(
+                                json!({
+                                    "channel": "l2Book",
+                                    "data": {
+                                        "coin": coin, "time": 1_700_000_000_000_i64,
+                                        "levels": [
+                                            [{"px": "1", "sz": "1", "n": 1}],
+                                            [{"px": "2", "sz": "1", "n": 1}]
+                                        ]
+                                    }
+                                })
+                                .to_string()
+                                .into(),
+                            ))
+                            .await
+                            .expect("send healthy fresh L2");
+                    }
                 }
                 socket
                     .send(Message::Close(None))
@@ -2518,39 +2892,190 @@ mod tests {
                 timeout(Duration::from_millis(100), listener.accept())
                     .await
                     .is_err(),
-                "a healthy L2 must renew exactly one full reconnect budget"
+                "all selected healthy L2 snapshots must renew exactly one full reconnect budget"
             );
         });
 
-        let config = WsConfig::with_limits(vec![market("BTC")], WsLimits::fast_for_test())
-            .expect("test configuration is valid");
+        let config = WsConfig::with_limits(
+            vec![market("BTC"), market("ETH")],
+            WsLimits::fast_with_output_capacity_for_test(16),
+        )
+        .expect("test configuration is valid");
         let mut stream = WsClient::new_for_test(config, endpoint).start();
         let mut fresh_l2s = 0;
         let mut recovered_gaps = 0;
-        let terminal = loop {
-            let output = timeout(Duration::from_secs(1), stream.recv())
-                .await
-                .expect("expected output before timeout")
-                .expect("terminal record must precede stream closure");
+        let mut exhausted = Vec::new();
+        while let Some(output) = timeout(Duration::from_secs(1), stream.recv())
+            .await
+            .expect("expected output before timeout")
+        {
             match output {
                 WsOutput::MarketEvent(_) => fresh_l2s += 1,
                 WsOutput::Gap(GapEvent::Closed(_)) => recovered_gaps += 1,
-                WsOutput::Gap(GapEvent::ReconnectExhausted(exhausted)) => break exhausted,
+                WsOutput::Gap(GapEvent::ReconnectExhausted(gap)) => exhausted.push(gap),
                 WsOutput::Gap(GapEvent::Opened(_)) | WsOutput::Rejected(_) => {}
+                WsOutput::Terminal(_) => panic!("identity cap must not end this recovery test"),
             }
-        };
-        assert_eq!(fresh_l2s, 1);
-        assert_eq!(recovered_gaps, 1);
-        assert_eq!(terminal.reconnect_attempts(), 2);
-        assert!(
-            timeout(Duration::from_secs(1), stream.recv())
-                .await
-                .expect("stream must terminate after exhaustion")
-                .is_none()
-        );
+        }
+        assert_eq!(fresh_l2s, 2);
+        assert_eq!(recovered_gaps, 2);
+        assert_eq!(exhausted.len(), 2);
+        assert!(exhausted.iter().all(|gap| gap.reconnect_attempts() == 2));
         server
             .await
             .expect("server must observe the renewed reconnect budget");
+    }
+
+    #[tokio::test]
+    async fn incomplete_multi_market_recovery_cannot_be_kept_alive_by_acks_pongs_or_trades() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback WebSocket server");
+        let endpoint = format!(
+            "ws://{}",
+            listener
+                .local_addr()
+                .expect("loopback address is available")
+        );
+        let server = tokio::spawn(async move {
+            for connection in 0..3 {
+                let (socket, _) = listener.accept().await.expect("accept reconnect");
+                let mut socket = accept_async(socket)
+                    .await
+                    .expect("accept WebSocket handshake");
+                for expected in [
+                    ("BTC", "l2Book"),
+                    ("BTC", "trades"),
+                    ("BTC", "bbo"),
+                    ("ETH", "l2Book"),
+                    ("ETH", "trades"),
+                    ("ETH", "bbo"),
+                ] {
+                    let Some(Ok(Message::Text(subscription))) = socket.next().await else {
+                        panic!(
+                            "client must subscribe to every selected market feed on connection {connection} for {expected:?}"
+                        );
+                    };
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(&subscription)
+                            .expect("subscription must be JSON"),
+                        json!({
+                            "method": "subscribe",
+                            "subscription": {"type": expected.1, "coin": expected.0}
+                        })
+                    );
+                    socket
+                        .send(Message::Text(
+                            json!({
+                                "channel": "subscriptionResponse",
+                                "data": {
+                                    "method": "subscribe",
+                                    "subscription": {"type": expected.1, "coin": expected.0}
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .expect("acknowledge subscription");
+                }
+                let books: &[&str] = if connection == 0 {
+                    &["BTC", "ETH"]
+                } else {
+                    &["BTC"]
+                };
+                for coin in books {
+                    socket
+                        .send(Message::Text(
+                            json!({
+                                "channel": "l2Book",
+                                "data": {
+                                    "coin": coin,
+                                    "time": 1_700_000_000_000_i64 + i64::from(connection),
+                                    "levels": [
+                                        [{"px": "1", "sz": "1", "n": 1}],
+                                        [{"px": "2", "sz": "1", "n": 1}]
+                                    ]
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .expect("send fresh L2 snapshot");
+                }
+                if connection == 0 {
+                    socket
+                        .send(Message::Close(None))
+                        .await
+                        .expect("open recovery gaps");
+                    continue;
+                }
+                for _ in 0..20 {
+                    if socket
+                        .send(Message::Text(r#"{"channel":"pong"}"#.into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    if socket
+                        .send(Message::Text(
+                            json!({
+                                "channel": "trades",
+                                "data": [{
+                                    "coin": "BTC", "side": "B", "px": "1", "sz": "1",
+                                    "time": 1_700_000_000_010_i64, "tid": 99
+                                }]
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+            assert!(
+                timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "BTC-only recovery must exhaust retries instead of opening a fourth connection"
+            );
+        });
+
+        let limits = WsLimits::fast_with_output_capacity_for_test(16);
+        let config = WsConfig::with_limits(vec![market("BTC"), market("ETH")], limits)
+            .expect("test configuration is valid");
+        let mut stream = WsClient::new_for_test(config, endpoint).start();
+        server
+            .await
+            .expect("server must not observe a reconnect after the recovery budget exhausts");
+
+        let mut closed_markets = Vec::new();
+        let mut exhausted_markets = Vec::new();
+        while let Some(output) = timeout(Duration::from_secs(1), stream.recv())
+            .await
+            .expect("typed output before timeout")
+        {
+            match output {
+                WsOutput::Gap(GapEvent::Closed(closed)) => {
+                    closed_markets.push(closed.market().clone());
+                }
+                WsOutput::Gap(GapEvent::ReconnectExhausted(exhausted)) => {
+                    exhausted_markets.push(exhausted.market().clone());
+                }
+                WsOutput::MarketEvent(_)
+                | WsOutput::Gap(GapEvent::Opened(_))
+                | WsOutput::Rejected(_) => {}
+                WsOutput::Terminal(_) => panic!("identity cap must not end this recovery test"),
+            }
+        }
+        assert_eq!(closed_markets, vec![market("BTC"), market("BTC")]);
+        assert_eq!(exhausted_markets, vec![market("BTC"), market("ETH")]);
     }
 
     #[tokio::test]
@@ -2608,6 +3133,146 @@ mod tests {
         let _ = timeout(Duration::from_secs(1), server)
             .await
             .expect("server must not be backpressured by local output");
+    }
+
+    #[tokio::test]
+    async fn shutdown_completes_while_a_full_output_channel_blocks_an_enqueue() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback WebSocket server");
+        let endpoint = format!(
+            "ws://{}",
+            listener
+                .local_addr()
+                .expect("loopback address is available")
+        );
+        let (second_frame_sent, second_frame_observed) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut second_frame_sent = Some(second_frame_sent);
+            let (socket, _) = listener.accept().await.expect("accept client");
+            let mut socket = accept_async(socket)
+                .await
+                .expect("accept WebSocket handshake");
+            for _ in 0..3 {
+                let Some(Ok(Message::Text(_))) = socket.next().await else {
+                    panic!("client must subscribe before market data arrives");
+                };
+            }
+            for time in [1_700_000_000_000_i64, 1_700_000_000_001_i64] {
+                socket
+                    .send(Message::Text(
+                        json!({
+                            "channel": "trades",
+                            "data": [{
+                                "coin": "BTC", "side": "B", "px": "1", "sz": "1",
+                                "time": time, "tid": time
+                            }]
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .expect("send public trade frame");
+                if time == 1_700_000_000_001_i64
+                    && let Some(sender) = second_frame_sent.take()
+                {
+                    let _ = sender.send(());
+                }
+            }
+        });
+
+        let limits = WsLimits::fast_with_output_capacity_for_test(1);
+        let config = WsConfig::with_limits(vec![market("BTC")], limits)
+            .expect("test configuration is valid");
+        let stream = WsClient::new_for_test(config, endpoint).start();
+        second_frame_observed
+            .await
+            .expect("server must send the second frame");
+        timeout(Duration::from_secs(1), async {
+            while stream.receiver.len() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first event must fill the bounded receiver");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            timeout(Duration::from_millis(100), stream.shutdown())
+                .await
+                .is_ok(),
+            "shutdown must cancel an output enqueue without draining the receiver"
+        );
+        server.await.expect("server task must complete");
+    }
+
+    #[tokio::test]
+    async fn trade_identity_limit_emits_a_terminal_record_before_overflow() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback WebSocket server");
+        let endpoint = format!(
+            "ws://{}",
+            listener
+                .local_addr()
+                .expect("loopback address is available")
+        );
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept client");
+            let mut socket = accept_async(socket)
+                .await
+                .expect("accept WebSocket handshake");
+            for _ in 0..3 {
+                let Some(Ok(Message::Text(_))) = socket.next().await else {
+                    panic!("client must subscribe before trade data arrives");
+                };
+            }
+            for (time, trade_id) in [
+                (1_700_000_000_000_i64, 1_u64),
+                (1_700_000_000_001_i64, 2_u64),
+            ] {
+                socket
+                    .send(Message::Text(
+                        json!({
+                            "channel": "trades",
+                            "data": [{
+                                "coin": "BTC", "side": "B", "px": "1", "sz": "1",
+                                "time": time, "tid": trade_id
+                            }]
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .expect("send public trade frame");
+            }
+        });
+
+        let limits = WsLimits::fast_with_trade_identity_limit_for_test(1);
+        let config = WsConfig::with_limits(vec![market("BTC")], limits)
+            .expect("test configuration is valid");
+        let mut stream = WsClient::new_for_test(config, endpoint).start();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), stream.recv())
+                .await
+                .expect("first trade before timeout"),
+            Some(WsOutput::MarketEvent(_))
+        ));
+        let terminal = timeout(Duration::from_secs(1), stream.recv())
+            .await
+            .expect("identity terminal record before timeout")
+            .expect("terminal record must precede stream closure");
+        assert!(matches!(
+            terminal,
+            WsOutput::Terminal(super::WsTerminal::TradeIdentityLimit(limit))
+                if limit.max_identities() == 1
+        ));
+        assert!(
+            timeout(Duration::from_secs(1), stream.recv())
+                .await
+                .expect("stream must stop at its exact identity cap")
+                .is_none()
+        );
+        server.await.expect("server task must complete");
     }
 
     #[tokio::test]
