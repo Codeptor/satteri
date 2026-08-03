@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 blake3.workspace = true
+libm.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true
 thiserror.workspace = true

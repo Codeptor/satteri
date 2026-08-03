@@ -2580,6 +2580,7 @@ name = "trench-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "libm",
  "proptest",
  "rust_decimal",
  "rust_decimal_macros",
