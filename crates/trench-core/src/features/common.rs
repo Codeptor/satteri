@@ -1311,7 +1311,7 @@ fn build_values(inputs: &SnapshotInputs<'_>) -> Option<BTreeMap<String, Decimal>
     values.insert("ema_8_32_ratio".to_owned(), ema_8.checked_div(ema_32)?);
     values.insert(
         "ema_8_slope_4".to_owned(),
-        ema(&close_values[..close_values.len().checked_sub(4)?], 8)?.checked_sub(ema_8)?,
+        ema_8.checked_sub(ema(&close_values[..close_values.len().checked_sub(4)?], 8)?)?,
     );
     values.insert("rsi_14".to_owned(), rsi(&close_values, 14)?);
     values.insert("atr_14".to_owned(), atr(history, 14)?);
@@ -1337,6 +1337,7 @@ fn build_values(inputs: &SnapshotInputs<'_>) -> Option<BTreeMap<String, Decimal>
                 .iter()
                 .rev()
                 .take(20)
+                .rev()
                 .map(|candle| candle.candle().volume().value())
                 .collect::<Vec<_>>(),
         )?,
@@ -1877,6 +1878,7 @@ mod tests {
         count: u64,
         offset: Decimal,
         step: Decimal,
+        volume_spike: Option<(u64, Decimal)>,
     }
 
     #[derive(Clone, Copy, Default)]
@@ -1903,6 +1905,7 @@ mod tests {
                 count,
                 offset,
                 step,
+                volume_spike: None,
             },
             None,
         );
@@ -1949,11 +1952,15 @@ mod tests {
             } else {
                 close
             };
+            let volume = range
+                .volume_spike
+                .filter(|(spike_at, _)| *spike_at == index)
+                .map_or(dec!(1), |(_, volume)| volume);
             let trade = MarketEvent::trade(
                 timestamp(close - 1),
                 timestamp(trade_received_at),
                 market.clone(),
-                Trade::new(index + 1, Side::Buy, price(value), quantity(dec!(1)))
+                Trade::new(index + 1, Side::Buy, price(value), quantity(volume))
                     .expect("test trade must be valid"),
             )
             .expect("test trade event must be valid");
@@ -2287,6 +2294,7 @@ mod tests {
                     count: 128,
                     offset,
                     step: dec!(1),
+                    volume_spike: None,
                 },
                 None,
                 receipt_delays,
@@ -2322,6 +2330,7 @@ mod tests {
                 count: 128,
                 offset: dec!(100),
                 step: dec!(1),
+                volume_spike: None,
             },
             None,
             ReceiptDelays {
@@ -2394,6 +2403,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn rising_ema_has_a_positive_four_bar_slope() {
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        for (market, offset) in [(market("BTC"), dec!(100)), (market("ETH"), dec!(200))] {
+            populate(
+                &mut engine,
+                &mut aggregator,
+                market,
+                0,
+                128,
+                offset,
+                dec!(1),
+            );
+        }
+        let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
+        complete(&mut engine, &mut aggregator, decision);
+
+        for snapshot in engine.snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision)
+        {
+            assert!(
+                snapshot.values()["ema_8_slope_4"] > Decimal::ZERO,
+                "rising EMA must have a positive slope"
+            );
+        }
+    }
+
+    #[test]
+    fn current_volume_spike_has_a_positive_robust_z_score() {
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        for (market, offset, volume_spike) in [
+            (market("BTC"), dec!(100), Some((127, dec!(100)))),
+            (market("ETH"), dec!(200), None),
+        ] {
+            populate_with_open_interest(
+                &mut engine,
+                &mut aggregator,
+                market,
+                PopulateRange {
+                    start: 0,
+                    count: 128,
+                    offset,
+                    step: dec!(1),
+                    volume_spike,
+                },
+                None,
+            );
+        }
+        let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
+        complete(&mut engine, &mut aggregator, decision);
+
+        let snapshot = engine
+            .snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision)
+            .into_iter()
+            .find(|snapshot| snapshot.market() == &market("BTC"))
+            .expect("BTC snapshot must exist");
+        assert_eq!(snapshot.values()["volume_robust_z_20"], Decimal::ONE);
     }
 
     #[test]
@@ -2540,6 +2609,7 @@ mod tests {
                 count: 128,
                 offset: dec!(100),
                 step: dec!(1),
+                volume_spike: None,
             },
             Some(111),
         );
