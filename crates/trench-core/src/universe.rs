@@ -11,6 +11,7 @@ use crate::event::TimestampNs;
 
 /// Maximum markets that may be tradeable in one frozen universe snapshot.
 pub const MAX_TRADEABLE_MARKETS: usize = 20;
+const HOUR_NS: i64 = 3_600_000_000_000;
 
 /// Invalid immutable tradeable-universe input.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -29,6 +30,12 @@ pub enum UniverseError {
     /// Serialized membership did not match its deterministic content digest.
     #[error("tradeable universe digest does not match its serialized membership")]
     DigestMismatch,
+    /// A universe must freeze at a completed UTC hour.
+    #[error("tradeable universe boundary {as_of_time} is not a completed UTC hour")]
+    NotCompletedHour {
+        /// Rejected immutable snapshot boundary.
+        as_of_time: TimestampNs,
+    },
 }
 
 /// Immutable, serializable membership at one explicit UTC decision boundary.
@@ -53,6 +60,9 @@ impl TradeableUniverse {
         as_of_time: TimestampNs,
         markets: impl IntoIterator<Item = Market>,
     ) -> Result<Self, UniverseError> {
+        if as_of_time.value() % HOUR_NS != 0 {
+            return Err(UniverseError::NotCompletedHour { as_of_time });
+        }
         let markets = markets.into_iter().collect::<BTreeSet<_>>();
         if markets.is_empty() {
             return Err(UniverseError::Empty);
@@ -86,6 +96,18 @@ impl TradeableUniverse {
     #[must_use]
     pub fn contains(&self, market: &Market) -> bool {
         self.markets.contains(market)
+    }
+
+    /// Returns whether this is the sole valid completed-hour membership for a decision time.
+    ///
+    /// A Task 8 selector freezes exactly once per completed UTC hour. A 15-minute
+    /// decision uses that snapshot through the next hourly refresh, never a
+    /// future membership and never a snapshot older than the immediately
+    /// preceding completed hour.
+    #[must_use]
+    pub const fn is_current_for(&self, decision_time: TimestampNs) -> bool {
+        let delta = decision_time.value() - self.as_of_time.value();
+        delta >= 0 && delta < HOUR_NS
     }
 
     /// Returns a stable content digest used in feature provenance and snapshot hashes.
@@ -162,7 +184,7 @@ mod tests {
     #[test]
     fn round_trip_preserves_checked_membership_and_digest() {
         let universe = TradeableUniverse::new(
-            TimestampNs::new(900_000_000_000).expect("timestamp must be valid"),
+            TimestampNs::new(3_600_000_000_000).expect("timestamp must be valid"),
             [
                 Market::new("ETH").expect("market must be valid"),
                 Market::new("BTC").expect("market must be valid"),
@@ -174,5 +196,48 @@ mod tests {
         let decoded: TradeableUniverse =
             serde_json::from_str(&encoded).expect("universe must deserialize");
         assert_eq!(decoded, universe);
+    }
+
+    #[test]
+    fn completed_hour_membership_is_current_for_each_following_fifteen_minute_decision() {
+        let hour = TimestampNs::new(3_600_000_000_000).expect("timestamp must be valid");
+        let universe =
+            TradeableUniverse::new(hour, [Market::new("BTC").expect("market must be valid")])
+                .expect("membership must be valid");
+
+        for offset in [
+            0_i128,
+            900_000_000_000,
+            1_800_000_000_000,
+            2_700_000_000_000,
+        ] {
+            assert!(
+                universe.is_current_for(
+                    TimestampNs::new(i128::from(hour.value()) + offset)
+                        .expect("decision timestamp must be valid")
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn completed_hour_membership_rejects_future_and_stale_decisions() {
+        let hour = TimestampNs::new(3_600_000_000_000).expect("timestamp must be valid");
+        let universe =
+            TradeableUniverse::new(hour, [Market::new("BTC").expect("market must be valid")])
+                .expect("membership must be valid");
+
+        assert!(
+            !universe.is_current_for(
+                TimestampNs::new(i128::from(hour.value()) - 900_000_000_000)
+                    .expect("decision timestamp must be valid")
+            )
+        );
+        assert!(
+            !universe.is_current_for(
+                TimestampNs::new(i128::from(hour.value()) + 3_600_000_000_000)
+                    .expect("decision timestamp must be valid")
+            )
+        );
     }
 }

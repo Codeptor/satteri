@@ -1046,7 +1046,7 @@ impl CommonFeatureEngine {
             .collect::<Vec<_>>();
 
         let complete = universe
-            .filter(|universe| universe.as_of_time() == as_of_time)
+            .filter(|universe| universe.is_current_for(as_of_time))
             .and_then(|universe| {
                 let members = universe.markets().iter().cloned().collect::<Vec<_>>();
                 (members.len() >= 2
@@ -2795,7 +2795,9 @@ mod tests {
         decision: TimestampNs,
         markets: impl IntoIterator<Item = Market>,
     ) -> TradeableUniverse {
-        TradeableUniverse::new(decision, markets).expect("test universe must be valid")
+        let completed_hour =
+            timestamp(i128::from(decision.value() / 3_600_000_000_000) * 3_600_000_000_000);
+        TradeableUniverse::new(completed_hour, markets).expect("test universe must be valid")
     }
 
     fn frozen_snapshots(
@@ -3268,6 +3270,43 @@ mod tests {
             );
             assert!(!snapshot.snapshot_hash().is_empty());
         }
+    }
+
+    #[test]
+    fn latest_completed_hour_universe_remains_current_at_the_fifteen_minute_boundary() {
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        let markets = [market("BTC"), market("ETH")];
+        for (market, offset) in [
+            (markets[0].clone(), dec!(100)),
+            (markets[1].clone(), dec!(200)),
+        ] {
+            populate(
+                &mut engine,
+                &mut aggregator,
+                market,
+                0,
+                129,
+                offset,
+                dec!(1),
+            );
+        }
+        let hour = timestamp(128 * FIFTEEN_MINUTES_NS);
+        let decision = timestamp(129 * FIFTEEN_MINUTES_NS);
+        complete(&mut engine, &mut aggregator, decision);
+        let universe = tradeable_universe(hour, markets);
+
+        let snapshots = engine.snapshots_at_with_universe(
+            crate::event::CandleInterval::FifteenMinutes,
+            decision,
+            Some(&universe),
+        );
+
+        assert!(
+            snapshots
+                .iter()
+                .all(|snapshot| snapshot.completeness().cross_section())
+        );
     }
 
     #[test]
