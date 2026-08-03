@@ -390,6 +390,50 @@ mod archive {
             ));
         }
 
+        #[cfg(unix)]
+        #[test]
+        fn reader_rejects_a_fifo_without_blocking() {
+            use std::sync::mpsc;
+            use std::time::Duration;
+
+            use rustix::fs::{CWD, Mode, mkfifoat};
+
+            let root = TempDir::new().expect("create archive root");
+            let relative_path = PathBuf::from("market_data/20230916/9/l2Book/SOL.lz4");
+            let destination = root.path().join(&relative_path);
+            fs::create_dir_all(
+                destination
+                    .parent()
+                    .expect("fixture archive path has a parent"),
+            )
+            .expect("create fixture archive directories");
+            mkfifoat(CWD, &destination, Mode::RUSR | Mode::WUSR)
+                .expect("create hostile FIFO archive source");
+            let source =
+                ArchiveSource::new(l2_span(), relative_path, 0, ArchiveDigest::of_bytes(b""));
+            let manifest = ArchiveManifest::new(
+                AS_OF_MS,
+                [ArchiveRequirement::required(l2_span())],
+                [source],
+            )
+            .expect("FIFO manifest remains structurally valid");
+
+            let (send, receive) = mpsc::channel();
+            let root_path = root.path().to_path_buf();
+            std::thread::spawn(move || {
+                let _ = send.send(ArchiveReader::open(root_path, manifest));
+            });
+
+            let result = receive
+                .recv_timeout(Duration::from_secs(1))
+                .expect("opening a FIFO must never block the archive reader");
+            let error = result.expect_err("FIFO archive source must be rejected");
+            assert!(matches!(
+                error,
+                trench_hyperliquid::ArchiveError::SourceNotFile { .. }
+            ));
+        }
+
         #[test]
         fn reader_rejects_conflicting_duplicate_event_identities() {
             let root = TempDir::new().expect("create archive root");

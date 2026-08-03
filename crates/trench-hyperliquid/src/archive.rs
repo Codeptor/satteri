@@ -8,6 +8,7 @@ use std::path::{Component, Path, PathBuf};
 
 use blake3::Hasher;
 use lz4_flex::frame::FrameDecoder;
+use rustix::fs::{FileType, Mode, OFlags, fstat, open, openat};
 use serde_json::Value;
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -324,13 +325,27 @@ impl ArchiveReader {
             path: source_root.as_ref().to_path_buf(),
             source,
         })?;
-        let metadata = fs::metadata(&root).map_err(|source| ArchiveError::Root {
+        let root_fd = open(
+            &root,
+            OFlags::RDONLY
+                | OFlags::DIRECTORY
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|source| ArchiveError::Root {
             path: root.clone(),
-            source,
+            source: source.into(),
         })?;
-        if !metadata.is_dir() {
+        let metadata = fstat(&root_fd).map_err(|source| ArchiveError::Root {
+            path: root.clone(),
+            source: source.into(),
+        })?;
+        if !FileType::from_raw_mode(metadata.st_mode).is_dir() {
             return Err(ArchiveError::RootNotDirectory { path: root });
         }
+        let root_fd = File::from(root_fd);
 
         let supplied = manifest
             .sources
@@ -348,7 +363,7 @@ impl ArchiveReader {
         let sources = manifest
             .sources
             .iter()
-            .map(|source| resolve_source(&root, source))
+            .map(|source| resolve_source(&root, &root_fd, source))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self { manifest, sources })
     }
@@ -595,7 +610,11 @@ struct ResolvedSource {
     span: ArchiveSpan,
 }
 
-fn resolve_source(root: &Path, source: &ArchiveSource) -> Result<ResolvedSource, ArchiveError> {
+fn resolve_source(
+    root: &Path,
+    root_fd: &File,
+    source: &ArchiveSource,
+) -> Result<ResolvedSource, ArchiveError> {
     validate_relative_path(&source.relative_path)?;
     let expected = source.span.official_relative_path()?;
     if source.relative_path != expected {
@@ -605,77 +624,98 @@ fn resolve_source(root: &Path, source: &ArchiveSource) -> Result<ResolvedSource,
         });
     }
 
-    let mut path = root.to_path_buf();
-    for component in source.relative_path.components() {
+    let path = root.join(&source.relative_path);
+    let mut directory = root_fd
+        .try_clone()
+        .map_err(|source| ArchiveError::SourceIo {
+            path: root.to_path_buf(),
+            source,
+        })?;
+    let mut components = source.relative_path.components().peekable();
+    let file = loop {
+        let Some(component) = components.next() else {
+            return Err(ArchiveError::UnsafePath {
+                path: source.relative_path.clone(),
+            });
+        };
         let Component::Normal(component) = component else {
             return Err(ArchiveError::UnsafePath {
                 path: source.relative_path.clone(),
             });
         };
-        path.push(component);
-        let metadata = fs::symlink_metadata(&path).map_err(|source| ArchiveError::SourceIo {
-            path: path.clone(),
-            source,
-        })?;
-        if metadata.file_type().is_symlink() {
-            return Err(ArchiveError::Symlink { path });
+        let flags = if components.peek().is_some() {
+            OFlags::RDONLY
+                | OFlags::DIRECTORY
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC
+        } else {
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC
+        };
+        let opened = openat(&directory, component, flags, Mode::empty())
+            .map_err(|source| secure_open_error(&path, source))?;
+        if components.peek().is_none() {
+            break File::from(opened);
         }
-    }
-    let canonical = fs::canonicalize(&path).map_err(|source| ArchiveError::SourceIo {
+        directory = File::from(opened);
+    };
+    let metadata = fstat(&file).map_err(|source| ArchiveError::SourceIo {
         path: path.clone(),
-        source,
+        source: source.into(),
     })?;
-    if !canonical.starts_with(root) {
-        return Err(ArchiveError::SourceOutsideRoot {
-            path: canonical,
-            root: root.to_path_buf(),
-        });
+    if !FileType::from_raw_mode(metadata.st_mode).is_file() {
+        return Err(ArchiveError::SourceNotFile { path });
     }
-    let mut file = File::open(&canonical).map_err(|source| ArchiveError::SourceIo {
-        path: canonical.clone(),
-        source,
-    })?;
-    let metadata = file.metadata().map_err(|source| ArchiveError::SourceIo {
-        path: canonical.clone(),
-        source,
-    })?;
-    if !metadata.is_file() {
-        return Err(ArchiveError::SourceNotFile { path: canonical });
-    }
-    if metadata.len() > MAX_COMPRESSED_SOURCE_BYTES {
+    let file_bytes = u64::try_from(metadata.st_size)
+        .map_err(|_| ArchiveError::SourceNotFile { path: path.clone() })?;
+    if file_bytes > MAX_COMPRESSED_SOURCE_BYTES {
         return Err(ArchiveError::CompressedSourceTooLarge {
-            path: canonical,
-            bytes: metadata.len(),
+            path,
+            bytes: file_bytes,
             max_bytes: MAX_COMPRESSED_SOURCE_BYTES,
         });
     }
-    if metadata.len() != source.compressed_bytes {
+    if file_bytes != source.compressed_bytes {
         return Err(ArchiveError::CompressedLengthMismatch {
-            path: canonical,
+            path,
             expected: source.compressed_bytes,
-            actual: metadata.len(),
+            actual: file_bytes,
         });
     }
-    let actual = digest_file(&mut file, &canonical)?;
+    let mut file = file;
+    let actual = digest_file(&mut file, &path)?;
     if actual != source.compressed_digest {
         return Err(ArchiveError::CompressedDigestMismatch {
-            path: canonical,
+            path,
             expected: source.compressed_digest,
             actual,
         });
     }
     file.seek(SeekFrom::Start(0))
         .map_err(|source| ArchiveError::SourceIo {
-            path: canonical.clone(),
+            path: path.clone(),
             source,
         })?;
     Ok(ResolvedSource {
         compressed_bytes: source.compressed_bytes,
         compressed_digest: source.compressed_digest,
         file,
-        path: canonical,
+        path,
         span: source.span.clone(),
     })
+}
+
+fn secure_open_error(path: &Path, source: rustix::io::Errno) -> ArchiveError {
+    if source == rustix::io::Errno::LOOP {
+        return ArchiveError::Symlink {
+            path: path.to_path_buf(),
+        };
+    }
+    let source = std::io::Error::from(source);
+    ArchiveError::SourceIo {
+        path: path.to_path_buf(),
+        source,
+    }
 }
 
 fn validate_relative_path(path: &Path) -> Result<(), ArchiveError> {

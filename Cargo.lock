@@ -2599,6 +2599,7 @@ dependencies = [
  "rand 0.9.5",
  "reqwest",
  "rust_decimal",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
