@@ -9,7 +9,9 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+blake3.workspace = true
 futures-util.workspace = true
+lz4_flex = "0.11.5"
 rand.workspace = true
 reqwest.workspace = true
 rust_decimal.workspace = true
@@ -21,6 +23,7 @@ tokio-tungstenite.workspace = true
 tokio-util.workspace = true
 trench-core = { path = "../trench-core" }
 tracing.workspace = true
+time.workspace = true
 url.workspace = true
 
 [dev-dependencies]

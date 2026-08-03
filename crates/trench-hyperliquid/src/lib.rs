@@ -1,9 +1,14 @@
 //! Read-only public Hyperliquid market-data adapters.
 
+mod archive;
 mod info;
 mod normalize;
 mod ws;
 
+pub use archive::{
+    ArchiveBatch, ArchiveDataKind, ArchiveDigest, ArchiveError, ArchiveManifest, ArchiveReader,
+    ArchiveRequirement, ArchiveSource, ArchiveSpan,
+};
 pub use info::{
     CandleInterval, INFO_RESPONSE_MAX_BYTES, InfoClient, InfoError, L2BookPrecision, L2Mantissa,
     TimeRange,

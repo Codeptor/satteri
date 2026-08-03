@@ -1645,9 +1645,9 @@ impl Decoder {
         data: Value,
         received_at: TimestampNs,
     ) -> Result<DecodedFrame, DecodeError> {
-        let book: RawWsBook = serde_json::from_value(data).map_err(|_| DecodeError::Malformed)?;
-        let market = parse_selected_market(&book.coin, &self.markets)?;
-        let event_time = timestamp_from_millis(book.time)?;
+        let event = normalize_l2_book_wire(data, &self.markets, received_at)?;
+        let market = event.market().clone();
+        let event_time = event.event_time();
         if self
             .last_book_times
             .get(&market)
@@ -1655,21 +1655,6 @@ impl Decoder {
         {
             return Err(DecodeError::NonMonotonicBook);
         }
-        let sequence = u64::try_from(book.time).map_err(|_| DecodeError::InvalidTimestamp)?;
-        let [bids, asks] = book.levels;
-        if bids.len() > MAX_L2_LEVELS_PER_SIDE || asks.len() > MAX_L2_LEVELS_PER_SIDE {
-            return Err(DecodeError::InvalidBook);
-        }
-        let bids = decode_book_levels(bids)?;
-        let asks = decode_book_levels(asks)?;
-        validate_l2_book(&bids, &asks)?;
-        let event = MarketEvent::book_snapshot(
-            event_time,
-            received_at,
-            market.clone(),
-            BookSnapshot::new(sequence, bids, asks),
-        )
-        .map_err(|_| DecodeError::InvalidTimestamp)?;
         self.last_book_times.insert(market.clone(), event_time);
         Ok(DecodedFrame::MarketEvents(vec![event]))
     }
@@ -1723,16 +1708,7 @@ impl Decoder {
         data: Value,
         received_at: TimestampNs,
     ) -> Result<DecodedFrame, DecodeError> {
-        let bbo: RawWsBbo = serde_json::from_value(data).map_err(|_| DecodeError::Malformed)?;
-        let market = parse_selected_market(&bbo.coin, &self.markets)?;
-        let event_time = timestamp_from_millis(bbo.time)?;
-        let sequence = u64::try_from(bbo.time).map_err(|_| DecodeError::InvalidTimestamp)?;
-        let [raw_bid, raw_ask] = bbo.bbo;
-        let bid = decode_book_level(raw_bid.ok_or(DecodeError::MissingLiquidity)?)?;
-        let ask = decode_book_level(raw_ask.ok_or(DecodeError::MissingLiquidity)?)?;
-        let payload = Bbo::new(sequence, bid, ask).map_err(|_| DecodeError::InvalidBbo)?;
-        let event = MarketEvent::bbo(event_time, received_at, market, payload)
-            .map_err(|_| DecodeError::InvalidTimestamp)?;
+        let event = normalize_bbo_wire(data, &self.markets, received_at)?;
         Ok(DecodedFrame::MarketEvents(vec![event]))
     }
 
@@ -1757,7 +1733,7 @@ impl Decoder {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DecodeError {
+pub(crate) enum DecodeError {
     Malformed,
     UnsupportedChannel,
     ForeignMarket,
@@ -1823,6 +1799,84 @@ struct RawSubscription {
     coin: String,
 }
 
+pub(crate) fn normalize_l2_book_wire(
+    data: Value,
+    markets: &BTreeSet<Market>,
+    received_at: TimestampNs,
+) -> Result<MarketEvent, DecodeError> {
+    let book: RawWsBook = serde_json::from_value(data).map_err(|_| DecodeError::Malformed)?;
+    let market = parse_selected_market(&book.coin, markets)?;
+    normalize_l2_book(book, market, received_at)
+}
+
+pub(crate) fn normalize_l2_book_wire_for_market(
+    data: Value,
+    expected_market: &Market,
+    received_at: TimestampNs,
+) -> Result<MarketEvent, DecodeError> {
+    let book: RawWsBook = serde_json::from_value(data).map_err(|_| DecodeError::Malformed)?;
+    let market = parse_expected_market(&book.coin, expected_market)?;
+    normalize_l2_book(book, market, received_at)
+}
+
+fn normalize_l2_book(
+    book: RawWsBook,
+    market: Market,
+    received_at: TimestampNs,
+) -> Result<MarketEvent, DecodeError> {
+    let event_time = timestamp_from_millis(book.time)?;
+    let sequence = u64::try_from(book.time).map_err(|_| DecodeError::InvalidTimestamp)?;
+    let [bids, asks] = book.levels;
+    if bids.len() > MAX_L2_LEVELS_PER_SIDE || asks.len() > MAX_L2_LEVELS_PER_SIDE {
+        return Err(DecodeError::InvalidBook);
+    }
+    let bids = decode_book_levels(bids)?;
+    let asks = decode_book_levels(asks)?;
+    validate_l2_book(&bids, &asks)?;
+    MarketEvent::book_snapshot(
+        event_time,
+        received_at,
+        market,
+        BookSnapshot::new(sequence, bids, asks),
+    )
+    .map_err(|_| DecodeError::InvalidTimestamp)
+}
+
+pub(crate) fn normalize_bbo_wire(
+    data: Value,
+    markets: &BTreeSet<Market>,
+    received_at: TimestampNs,
+) -> Result<MarketEvent, DecodeError> {
+    let bbo: RawWsBbo = serde_json::from_value(data).map_err(|_| DecodeError::Malformed)?;
+    let market = parse_selected_market(&bbo.coin, markets)?;
+    normalize_bbo(bbo, market, received_at)
+}
+
+pub(crate) fn normalize_bbo_wire_for_market(
+    data: Value,
+    expected_market: &Market,
+    received_at: TimestampNs,
+) -> Result<MarketEvent, DecodeError> {
+    let bbo: RawWsBbo = serde_json::from_value(data).map_err(|_| DecodeError::Malformed)?;
+    let market = parse_expected_market(&bbo.coin, expected_market)?;
+    normalize_bbo(bbo, market, received_at)
+}
+
+fn normalize_bbo(
+    bbo: RawWsBbo,
+    market: Market,
+    received_at: TimestampNs,
+) -> Result<MarketEvent, DecodeError> {
+    let event_time = timestamp_from_millis(bbo.time)?;
+    let sequence = u64::try_from(bbo.time).map_err(|_| DecodeError::InvalidTimestamp)?;
+    let [raw_bid, raw_ask] = bbo.bbo;
+    let bid = decode_book_level(raw_bid.ok_or(DecodeError::MissingLiquidity)?)?;
+    let ask = decode_book_level(raw_ask.ok_or(DecodeError::MissingLiquidity)?)?;
+    let payload = Bbo::new(sequence, bid, ask).map_err(|_| DecodeError::InvalidBbo)?;
+    MarketEvent::bbo(event_time, received_at, market, payload)
+        .map_err(|_| DecodeError::InvalidTimestamp)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct TradeIdentity {
     block_time: TimestampNs,
@@ -1836,6 +1890,17 @@ fn parse_selected_market(value: &str, markets: &BTreeSet<Market>) -> Result<Mark
     }
     let market = Market::new(value).map_err(|_| DecodeError::ForeignMarket)?;
     if !markets.contains(&market) {
+        return Err(DecodeError::ForeignMarket);
+    }
+    Ok(market)
+}
+
+fn parse_expected_market(value: &str, expected_market: &Market) -> Result<Market, DecodeError> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err(DecodeError::NonNativeMarket);
+    }
+    let market = Market::new(value).map_err(|_| DecodeError::ForeignMarket)?;
+    if &market != expected_market {
         return Err(DecodeError::ForeignMarket);
     }
     Ok(market)
