@@ -1,4 +1,5 @@
 /target/
+/.worktrees/
 /data/
 /state/
 *.sqlite
