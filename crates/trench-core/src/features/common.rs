@@ -16,7 +16,7 @@ use crate::event::{
 use crate::universe::TradeableUniverse;
 
 const FEATURE_SCHEMA: &str = concat!(
-    "trench.common-features.v3\n",
+    "trench.common-features.v4\n",
     "warmup.bars=97;context_observations=30:canonical-boundary;funding_observations=30\n",
     "rule_history=derivatives:30d;hourly_realized_volatility_20:90d\n",
     "returns=1,2,4,8,16,32,96\n",
@@ -435,6 +435,11 @@ impl FeatureCompleteness {
 pub enum FeatureUnreadyReason {
     /// A source dependency was evicted beyond the explicit retained horizon.
     HistoryPruned,
+    /// A historical BBO or L2 source that may be causal was evicted.
+    ///
+    /// The engine refuses to recompute that decision with an absent or newer
+    /// point source rather than silently changing its microstructure inputs.
+    PointSourceHistoryPruned,
     /// The completed-bar history is absent, discontinuous, or not warm.
     CandleHistory,
     /// The point-in-time asset-context window is incomplete.
@@ -588,6 +593,7 @@ impl TimedFeatureValue {
 
 /// Completeness of all bounded histories required by long-horizon rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LongHorizonFeatureCompleteness {
     primary_candles: bool,
     derivative_context: bool,
@@ -613,6 +619,7 @@ pub struct LongHorizonFeatureHistory {
     market: String,
     sleeve: String,
     as_of_time_ns: i64,
+    hourly_as_of_time_ns: i64,
     primary_candle_provenance: Vec<LongHorizonCandleProvenance>,
     hourly_candle_provenance: Vec<LongHorizonCandleProvenance>,
     hourly_realized_volatility_20_history: Vec<TimedFeatureValue>,
@@ -674,6 +681,9 @@ pub enum LongHorizonHistoryError {
         /// Name of the invalid timestamp field.
         field: &'static str,
     },
+    /// The explicit latest completed hourly boundary was invalid for this decision.
+    #[error("long-horizon history hourly as-of boundary is invalid")]
+    InvalidHourlyAsOf,
     /// A serialized normalized-event identifier was malformed.
     #[error("long-horizon history {field} is invalid")]
     InvalidEventId {
@@ -722,6 +732,7 @@ struct LongHorizonFeatureHistoryWire {
     market: String,
     sleeve: String,
     as_of_time_ns: i64,
+    hourly_as_of_time_ns: i64,
     primary_candle_provenance: Vec<LongHorizonCandleProvenance>,
     hourly_candle_provenance: Vec<LongHorizonCandleProvenance>,
     hourly_realized_volatility_20_history: Vec<TimedFeatureValue>,
@@ -743,6 +754,7 @@ impl<'de> Deserialize<'de> for LongHorizonFeatureHistory {
             market: wire.market,
             sleeve: wire.sleeve,
             as_of_time_ns: wire.as_of_time_ns,
+            hourly_as_of_time_ns: wire.hourly_as_of_time_ns,
             primary_candle_provenance: wire.primary_candle_provenance,
             hourly_candle_provenance: wire.hourly_candle_provenance,
             hourly_realized_volatility_20_history: wire.hourly_realized_volatility_20_history,
@@ -777,6 +789,12 @@ impl LongHorizonFeatureHistory {
     #[must_use]
     pub const fn as_of_time_ns(&self) -> i64 {
         self.as_of_time_ns
+    }
+
+    /// Returns the latest completed one-hour boundary included in the history.
+    #[must_use]
+    pub const fn hourly_as_of_time_ns(&self) -> i64 {
+        self.hourly_as_of_time_ns
     }
 
     /// Returns the preceding 90-day hourly RV(20) distribution in chronological order.
@@ -834,6 +852,16 @@ impl LongHorizonFeatureHistory {
             Market::new(self.market.clone()).map_err(|_| LongHorizonHistoryError::InvalidMarket)?;
         let sleeve = parse_history_sleeve(&self.sleeve)?;
         let as_of_time = checked_history_timestamp(self.as_of_time_ns, "snapshot boundary")?;
+        let hourly_as_of_time =
+            checked_history_timestamp(self.hourly_as_of_time_ns, "hourly snapshot boundary")?;
+        let hour_ns = CandleInterval::OneHour.duration().value();
+        let expected_hourly_as_of = as_of_time.value() - as_of_time.value() % hour_ns;
+        if hourly_as_of_time.value() > as_of_time.value()
+            || hourly_as_of_time.value() % hour_ns != 0
+            || hourly_as_of_time.value() != expected_hourly_as_of
+        {
+            return Err(LongHorizonHistoryError::InvalidHourlyAsOf);
+        }
         if !self.completeness.is_complete() {
             return Err(LongHorizonHistoryError::Incomplete);
         }
@@ -854,7 +882,7 @@ impl LongHorizonFeatureHistory {
             &self.hourly_candle_provenance,
             &market,
             CandleInterval::OneHour,
-            as_of_time,
+            hourly_as_of_time,
             MAX_HOURLY_CANDLE_HISTORY,
             "hourly",
         )?;
@@ -863,7 +891,7 @@ impl LongHorizonFeatureHistory {
             &self.hourly_realized_volatility_20_history,
             HOURLY_REALIZED_VOLATILITY_HISTORY,
             CandleInterval::OneHour.duration().value(),
-            as_of_time
+            hourly_as_of_time
                 .value()
                 .checked_sub(CandleInterval::OneHour.duration().value())
                 .ok_or(LongHorizonHistoryError::TimeArithmetic)?,
@@ -890,6 +918,7 @@ impl LongHorizonFeatureHistory {
             market: &market,
             sleeve,
             as_of_time,
+            hourly_as_of_time,
             primary_candle_provenance: &self.primary_candle_provenance,
             hourly_candle_provenance: &self.hourly_candle_provenance,
             hourly_volatility: &self.hourly_realized_volatility_20_history,
@@ -1089,6 +1118,19 @@ type CompletedCandleOrder = (TimestampNs, Market, CandleInterval);
 type BoundarySourceSamples = BTreeMap<(Market, CandleInterval), BTreeMap<TimestampNs, MarketEvent>>;
 type TradeAggregateKey = (TimestampNs, TimestampNs);
 
+/// Bounded, preflighted mutation for one sleeve's trade aggregate.
+///
+/// An observation stages exactly two of these, so all semantic failures occur
+/// before either sleeve's aggregate or any source state is changed.
+#[derive(Debug)]
+struct TradeAggregatePlan {
+    key: (Market, CandleInterval),
+    aggregate_key: TradeAggregateKey,
+    side: crate::domain::Side,
+    notional: Decimal,
+    next_notional: Decimal,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AggressiveTradeAggregate {
     first_event_id: EventId,
@@ -1103,24 +1145,12 @@ struct AggressiveTradeAggregate {
 }
 
 impl AggressiveTradeAggregate {
-    fn from_trade(event: &MarketEvent) -> Result<Self, FeatureError> {
-        let MarketEventKind::Trade(trade) = event.kind() else {
-            return Err(FeatureError::Arithmetic {
-                operation: "trade aggregate input kind",
-            });
-        };
-        let notional = trade
-            .price()
-            .value()
-            .checked_mul(trade.quantity().value())
-            .ok_or(FeatureError::Arithmetic {
-                operation: "trade aggregate notional",
-            })?;
-        let (buy_notional, sell_notional) = match trade.side() {
+    fn from_trade(event: &MarketEvent, side: crate::domain::Side, notional: Decimal) -> Self {
+        let (buy_notional, sell_notional) = match side {
             crate::domain::Side::Buy => (notional, Decimal::ZERO),
             crate::domain::Side::Sell => (Decimal::ZERO, notional),
         };
-        Ok(Self {
+        Self {
             first_event_id: event.event_id().clone(),
             last_event_id: event.event_id().clone(),
             first_event_time: event.event_time(),
@@ -1130,22 +1160,15 @@ impl AggressiveTradeAggregate {
             available_at: event.received_at(),
             buy_notional,
             sell_notional,
-        })
+        }
     }
 
-    fn add_trade(&mut self, event: &MarketEvent) -> Result<(), FeatureError> {
-        let MarketEventKind::Trade(trade) = event.kind() else {
-            return Err(FeatureError::Arithmetic {
-                operation: "trade aggregate input kind",
-            });
-        };
-        let notional = trade
-            .price()
-            .value()
-            .checked_mul(trade.quantity().value())
-            .ok_or(FeatureError::Arithmetic {
-                operation: "trade aggregate notional",
-            })?;
+    fn add_trade(
+        &mut self,
+        event: &MarketEvent,
+        side: crate::domain::Side,
+        next_notional: Decimal,
+    ) {
         let candidate_key = (event.event_time(), event.received_at(), event.event_id());
         let first_key = (
             self.first_event_time,
@@ -1168,25 +1191,14 @@ impl AggressiveTradeAggregate {
             self.last_received_at = event.received_at();
         }
         self.available_at = self.available_at.max(event.received_at());
-        match trade.side() {
+        match side {
             crate::domain::Side::Buy => {
-                self.buy_notional =
-                    self.buy_notional
-                        .checked_add(notional)
-                        .ok_or(FeatureError::Arithmetic {
-                            operation: "trade aggregate buy notional",
-                        })?;
+                self.buy_notional = next_notional;
             }
             crate::domain::Side::Sell => {
-                self.sell_notional =
-                    self.sell_notional
-                        .checked_add(notional)
-                        .ok_or(FeatureError::Arithmetic {
-                            operation: "trade aggregate sell notional",
-                        })?;
+                self.sell_notional = next_notional;
             }
         }
-        Ok(())
     }
 
     fn digest(&self) -> String {
@@ -1343,7 +1355,7 @@ const fn sleeve_name(interval: CandleInterval) -> &'static str {
 /// Active source and candle windows are bounded. Identities evicted from those
 /// windows remain idempotent only for [`FINALIZED_EVENT_ID_HORIZON`] or
 /// [`FINALIZED_CANDLE_ID_HORIZON`] canonical ordering positions, respectively.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct CommonFeatureEngine {
     seen_events: BTreeMap<EventId, MarketEvent>,
     finalized_events: BTreeMap<EventId, MarketEvent>,
@@ -1352,6 +1364,8 @@ pub struct CommonFeatureEngine {
     finalized_candle_order: BTreeMap<CompletedCandleOrder, CompletedCandleId>,
     markets: BTreeSet<Market>,
     events: BTreeMap<Market, MarketEventHistory>,
+    pruned_bbo_available_from: BTreeMap<Market, TimestampNs>,
+    pruned_book_available_from: BTreeMap<Market, TimestampNs>,
     trade_aggregates:
         BTreeMap<(Market, CandleInterval), BTreeMap<TradeAggregateKey, AggressiveTradeAggregate>>,
     pruned_trade_aggregate_through: BTreeMap<(Market, CandleInterval), TimestampNs>,
@@ -1380,7 +1394,10 @@ impl CommonFeatureEngine {
     /// Returns [`FeatureError::ConflictingEvent`] for a reused identity with a
     /// nonidentical immutable payload, or rejects input before its retained
     /// source horizon instead of silently changing a bounded feature window.
-    /// Any error leaves all retained source and aggregate state unchanged.
+    /// Any error leaves all retained source and aggregate state unchanged. The
+    /// engine deliberately has no [`Clone`] implementation: observation first
+    /// preflights its one market's bounded mutations, then commits them, so a
+    /// high-rate update never copies global multi-market state.
     pub fn observe(&mut self, event: &MarketEvent) -> Result<(), FeatureError> {
         if let Some(existing) = self.seen_events.get(event.event_id()) {
             return event_duplicate_result(existing, event);
@@ -1388,13 +1405,15 @@ impl CommonFeatureEngine {
         if let Some(existing) = self.finalized_events.get(event.event_id()) {
             return event_duplicate_result(existing, event);
         }
-        let mut staged = self.clone();
-        staged.observe_new(event)?;
-        *self = staged;
+        let trade_plans = self.preflight_observation(event)?;
+        self.commit_observation(event, trade_plans);
         Ok(())
     }
 
-    fn observe_new(&mut self, event: &MarketEvent) -> Result<(), FeatureError> {
+    fn preflight_observation(
+        &self,
+        event: &MarketEvent,
+    ) -> Result<Option<[TradeAggregatePlan; 2]>, FeatureError> {
         self.ensure_market_capacity(event.market())?;
         let accepts = self
             .events
@@ -1412,20 +1431,37 @@ impl CommonFeatureEngine {
                 event_time: event.event_time(),
             });
         }
-        if matches!(event.kind(), MarketEventKind::Trade(_)) {
-            self.record_trade_aggregates(event)?;
+        let plans = match event.kind() {
+            MarketEventKind::Trade(trade) => Some(self.preflight_trade_aggregates(event, trade)?),
+            MarketEventKind::Metadata(_)
+            | MarketEventKind::AssetContext(_)
+            | MarketEventKind::Funding(_)
+            | MarketEventKind::BookSnapshot(_)
+            | MarketEventKind::Bbo(_)
+            | MarketEventKind::CompletedCandle(_) => None,
+        };
+        Ok(plans)
+    }
+
+    fn commit_observation(
+        &mut self,
+        event: &MarketEvent,
+        trade_plans: Option<[TradeAggregatePlan; 2]>,
+    ) {
+        if let Some(plans) = trade_plans {
+            self.commit_trade_aggregates(event, plans);
         }
         let history = self.events.entry(event.market().clone()).or_default();
         let pruned = history.insert(event.clone());
         self.seen_events
             .insert(event.event_id().clone(), event.clone());
         for event in pruned {
+            self.record_pruned_point_source(&event);
             self.seen_events.remove(event.event_id());
             self.record_finalized_event(event);
         }
         self.refresh_boundary_samples(event);
         self.markets.insert(event.market().clone());
-        Ok(())
     }
 
     /// Adds one immutable completed candle to its independent `(market, sleeve)` warmup state.
@@ -1690,6 +1726,7 @@ impl CommonFeatureEngine {
             MAX_HOURLY_CANDLE_HISTORY,
             CandleInterval::OneHour,
         )?;
+        let hourly_as_of_time = hourly_history.last()?.close_time().ok()?;
         let current_hourly_realized_volatility_20 =
             realized_volatility(hourly_history, HOURLY_REALIZED_VOLATILITY_WINDOW)?;
         let hourly_realized_volatility_20_history = (HOURLY_REALIZED_VOLATILITY_WINDOW
@@ -1728,6 +1765,7 @@ impl CommonFeatureEngine {
             market,
             sleeve,
             as_of_time,
+            hourly_as_of_time,
             primary_candle_provenance: &primary_candle_provenance,
             hourly_candle_provenance: &hourly_candle_provenance,
             hourly_volatility: &hourly_realized_volatility_20_history,
@@ -1740,6 +1778,7 @@ impl CommonFeatureEngine {
             market: market.as_str().to_owned(),
             sleeve: sleeve_name(sleeve).to_owned(),
             as_of_time_ns: as_of_time.value(),
+            hourly_as_of_time_ns: hourly_as_of_time.value(),
             primary_candle_provenance,
             hourly_candle_provenance,
             hourly_realized_volatility_20_history,
@@ -1844,6 +1883,16 @@ impl CommonFeatureEngine {
         let stale_bbo_or_book = bbo_event
             .is_some_and(|event| !is_fresh_book_input(event, as_of_time))
             || book_event.is_some_and(|event| !is_fresh_book_input(event, as_of_time));
+        let point_source_history_pruned = self
+            .pruned_bbo_available_from
+            .get(&market)
+            .is_some_and(|available_from| bbo_event.is_none() && *available_from <= as_of_time)
+            || self
+                .pruned_book_available_from
+                .get(&market)
+                .is_some_and(|available_from| {
+                    book_event.is_none() && *available_from <= as_of_time
+                });
         let microstructure = bbo.is_some()
             && book.is_some()
             && !stale_bbo_or_book
@@ -1864,6 +1913,10 @@ impl CommonFeatureEngine {
         let mut unready_reason =
             (primary_history_pruned || hourly_history_pruned || microstructure_history_pruned)
                 .then_some(FeatureUnreadyReason::HistoryPruned)
+                .or_else(|| {
+                    point_source_history_pruned
+                        .then_some(FeatureUnreadyReason::PointSourceHistoryPruned)
+                })
                 .or_else(|| stale_bbo_or_book.then_some(FeatureUnreadyReason::StaleBboOrBook))
                 .or_else(|| incomplete_source_reason(completeness));
         if unready_reason.is_none() {
@@ -2054,6 +2107,22 @@ impl CommonFeatureEngine {
         }
     }
 
+    fn record_pruned_point_source(&mut self, event: &MarketEvent) {
+        let history = match event.kind() {
+            MarketEventKind::Bbo(_) => &mut self.pruned_bbo_available_from,
+            MarketEventKind::BookSnapshot(_) => &mut self.pruned_book_available_from,
+            MarketEventKind::Metadata(_)
+            | MarketEventKind::AssetContext(_)
+            | MarketEventKind::Funding(_)
+            | MarketEventKind::Trade(_)
+            | MarketEventKind::CompletedCandle(_) => return,
+        };
+        history
+            .entry(event.market().clone())
+            .and_modify(|earliest| *earliest = (*earliest).min(event.received_at()))
+            .or_insert(event.received_at());
+    }
+
     fn record_finalized_candle(&mut self, candle: Candle) {
         let candle_id = (
             candle.market().clone(),
@@ -2135,46 +2204,108 @@ impl CommonFeatureEngine {
         })
     }
 
-    fn record_trade_aggregates(&mut self, event: &MarketEvent) -> Result<(), FeatureError> {
-        for sleeve in [CandleInterval::FifteenMinutes, CandleInterval::OneHour] {
-            let key = (event.market().clone(), sleeve);
-            let event_bucket_close = bucket_close(event.event_time(), MICRO_5_MINUTES_NS).ok_or(
-                FeatureError::Arithmetic {
-                    operation: "trade aggregate bucket close",
+    fn preflight_trade_aggregates(
+        &self,
+        event: &MarketEvent,
+        trade: &crate::event::Trade,
+    ) -> Result<[TradeAggregatePlan; 2], FeatureError> {
+        let notional = trade
+            .price()
+            .value()
+            .checked_mul(trade.quantity().value())
+            .ok_or(FeatureError::Arithmetic {
+                operation: "trade aggregate notional",
+            })?;
+        let preflight_sleeve =
+            |sleeve| self.preflight_trade_aggregate(event, trade.side(), notional, sleeve);
+        Ok([
+            preflight_sleeve(CandleInterval::FifteenMinutes)?,
+            preflight_sleeve(CandleInterval::OneHour)?,
+        ])
+    }
+
+    fn preflight_trade_aggregate(
+        &self,
+        event: &MarketEvent,
+        side: crate::domain::Side,
+        notional: Decimal,
+        sleeve: CandleInterval,
+    ) -> Result<TradeAggregatePlan, FeatureError> {
+        let key = (event.market().clone(), sleeve);
+        let event_bucket_close = bucket_close(event.event_time(), MICRO_5_MINUTES_NS).ok_or(
+            FeatureError::Arithmetic {
+                operation: "trade aggregate bucket close",
+            },
+        )?;
+        let available_at = bucket_close(event.received_at(), sleeve.duration().value()).ok_or(
+            FeatureError::Arithmetic {
+                operation: "trade aggregate availability boundary",
+            },
+        )?;
+        let aggregate_key = (event_bucket_close, available_at);
+        let next_notional =
+            match self
+                .trade_aggregates
+                .get(&key)
+                .and_then(|aggregates| aggregates.get(&aggregate_key))
+            {
+                Some(existing) => match side {
+                    crate::domain::Side::Buy => existing.buy_notional.checked_add(notional).ok_or(
+                        FeatureError::Arithmetic {
+                            operation: "trade aggregate buy notional",
+                        },
+                    )?,
+                    crate::domain::Side::Sell => existing
+                        .sell_notional
+                        .checked_add(notional)
+                        .ok_or(FeatureError::Arithmetic {
+                            operation: "trade aggregate sell notional",
+                        })?,
                 },
-            )?;
-            let available_at = bucket_close(event.received_at(), sleeve.duration().value()).ok_or(
-                FeatureError::Arithmetic {
-                    operation: "trade aggregate availability boundary",
-                },
-            )?;
-            let aggregate_key = (event_bucket_close, available_at);
-            let aggregates = self.trade_aggregates.entry(key.clone()).or_default();
-            if let Some(existing) = aggregates.get_mut(&aggregate_key) {
-                existing.add_trade(event)?;
+                None => {
+                    if self.trade_aggregates.get(&key).is_some_and(|aggregates| {
+                        aggregates.len() == TRADE_AGGREGATE_HISTORY
+                            && aggregates
+                                .first_key_value()
+                                .is_some_and(|(first, _)| aggregate_key <= *first)
+                    }) {
+                        return Err(FeatureError::EventOutsideRetention {
+                            market: event.market().clone(),
+                            event_time: event.event_time(),
+                        });
+                    }
+                    notional
+                }
+            };
+        Ok(TradeAggregatePlan {
+            key,
+            aggregate_key,
+            side,
+            notional,
+            next_notional,
+        })
+    }
+
+    fn commit_trade_aggregates(&mut self, event: &MarketEvent, plans: [TradeAggregatePlan; 2]) {
+        for plan in plans {
+            let aggregates = self.trade_aggregates.entry(plan.key.clone()).or_default();
+            if let Some(existing) = aggregates.get_mut(&plan.aggregate_key) {
+                existing.add_trade(event, plan.side, plan.next_notional);
                 continue;
             }
-            if aggregates.len() == TRADE_AGGREGATE_HISTORY
-                && aggregates
-                    .first_key_value()
-                    .is_some_and(|(first, _)| aggregate_key <= *first)
-            {
-                return Err(FeatureError::EventOutsideRetention {
-                    market: event.market().clone(),
-                    event_time: event.event_time(),
-                });
-            }
-            aggregates.insert(aggregate_key, AggressiveTradeAggregate::from_trade(event)?);
+            aggregates.insert(
+                plan.aggregate_key,
+                AggressiveTradeAggregate::from_trade(event, plan.side, plan.notional),
+            );
             while aggregates.len() > TRADE_AGGREGATE_HISTORY {
                 if let Some(((discarded_bucket_close, _), _)) = aggregates.pop_first() {
                     self.pruned_trade_aggregate_through
-                        .entry(key.clone())
+                        .entry(plan.key.clone())
                         .and_modify(|through| *through = (*through).max(discarded_bucket_close))
                         .or_insert(discarded_bucket_close);
                 }
             }
         }
-        Ok(())
     }
 
     fn trade_window(
@@ -2839,6 +2970,7 @@ struct LongHorizonDigestInputs<'a> {
     market: &'a Market,
     sleeve: CandleInterval,
     as_of_time: TimestampNs,
+    hourly_as_of_time: TimestampNs,
     primary_candle_provenance: &'a [LongHorizonCandleProvenance],
     hourly_candle_provenance: &'a [LongHorizonCandleProvenance],
     hourly_volatility: &'a [TimedFeatureValue],
@@ -2853,6 +2985,7 @@ fn long_horizon_input_digest(inputs: &LongHorizonDigestInputs<'_>) -> String {
     hasher.update(inputs.market.as_str().as_bytes());
     hasher.update(&[0, candle_interval_tag(inputs.sleeve)]);
     hasher.update(&inputs.as_of_time.value().to_be_bytes());
+    hasher.update(&inputs.hourly_as_of_time.value().to_be_bytes());
     for candle in inputs
         .primary_candle_provenance
         .iter()
@@ -3282,6 +3415,7 @@ const fn unready_reason_tag(reason: Option<FeatureUnreadyReason>) -> u8 {
     match reason {
         None => 0,
         Some(FeatureUnreadyReason::HistoryPruned) => 1,
+        Some(FeatureUnreadyReason::PointSourceHistoryPruned) => 11,
         Some(FeatureUnreadyReason::CandleHistory) => 2,
         Some(FeatureUnreadyReason::ContextHistory) => 3,
         Some(FeatureUnreadyReason::FundingHistory) => 4,
@@ -3972,6 +4106,73 @@ mod tests {
     }
 
     #[test]
+    fn pruned_bbo_and_book_sources_make_historical_recomputation_explicitly_unavailable() {
+        let btc = market("BTC");
+        let eth = market("ETH");
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        for (market, offset) in [(btc.clone(), dec!(100)), (eth.clone(), dec!(200))] {
+            populate(
+                &mut engine,
+                &mut aggregator,
+                market,
+                0,
+                128,
+                offset,
+                dec!(1),
+            );
+        }
+        let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
+        complete_with_canonical_funding_history(&mut engine, &mut aggregator, decision);
+        let universe = tradeable_universe(decision, [btc.clone(), eth]);
+        let before = engine
+            .snapshots_at_with_universe(
+                crate::event::CandleInterval::FifteenMinutes,
+                decision,
+                Some(&universe),
+            )
+            .into_iter()
+            .find(|snapshot| snapshot.market() == &btc)
+            .expect("BTC snapshot must exist");
+        assert!(before.is_ready());
+
+        for sequence in 0..=super::POINT_EVENT_HISTORY {
+            let at = absolute_timestamp(i128::from(decision.value()) + sequence as i128 + 1);
+            let bbo = bbo_at_absolute(
+                btc.clone(),
+                i128::from(at.value()),
+                i128::from(at.value()),
+                sequence as u64 + 10_000,
+                dec!(100),
+            );
+            let book = book_at_absolute(
+                btc.clone(),
+                i128::from(at.value()),
+                i128::from(at.value()),
+                sequence as u64 + 10_000,
+                dec!(100),
+            );
+            engine.observe(&bbo).expect("future BBO must be accepted");
+            engine.observe(&book).expect("future book must be accepted");
+        }
+
+        let historical = engine
+            .snapshots_at_with_universe(
+                crate::event::CandleInterval::FifteenMinutes,
+                decision,
+                Some(&universe),
+            )
+            .into_iter()
+            .find(|snapshot| snapshot.market() == &btc)
+            .expect("BTC historical snapshot must remain addressable");
+        assert_eq!(
+            historical.unready_reason(),
+            Some(FeatureUnreadyReason::PointSourceHistoryPruned)
+        );
+        assert!(historical.values().is_empty());
+    }
+
+    #[test]
     fn delayed_direct_events_are_excluded_from_decision_provenance() {
         let mut engine = CommonFeatureEngine::new();
         let mut aggregator = CandleAggregator::new();
@@ -4454,6 +4655,110 @@ mod tests {
     }
 
     #[test]
+    fn long_horizon_history_round_trips_at_each_fifteen_minute_hour_phase() {
+        const BARS: u64 = 90 * 24 * 4 + 20 * 4 + 4;
+
+        let market = market("BTC");
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        let hour = populate_long_history(
+            &mut engine,
+            &mut aggregator,
+            market.clone(),
+            ReceiptDelays::default(),
+        );
+        let on_hour = engine
+            .long_horizon_history_at(&market, crate::event::CandleInterval::FifteenMinutes, hour)
+            .expect("on-hour history must be available");
+        let on_hour_json = serde_json::to_value(&on_hour).expect("history must serialize");
+        assert_eq!(on_hour_json["hourly_as_of_time_ns"], hour.value());
+        assert_eq!(
+            serde_json::from_value::<super::LongHorizonFeatureHistory>(on_hour_json)
+                .expect("on-hour history must deserialize"),
+            on_hour
+        );
+
+        for offset in 1..=4 {
+            populate_with_receipt_delays(
+                &mut engine,
+                &mut aggregator,
+                market.clone(),
+                PopulateRange {
+                    start: BARS + offset - 1,
+                    count: 1,
+                    offset: dec!(100),
+                    step: dec!(1),
+                    volume_spike: None,
+                },
+                None,
+                ReceiptDelays::default(),
+            );
+            let as_of_time = timestamp(i128::from(BARS + offset) * FIFTEEN_MINUTES_NS);
+            complete(&mut engine, &mut aggregator, as_of_time);
+            let expected_hourly_as_of = if offset == 4 { as_of_time } else { hour };
+            let history = engine
+                .long_horizon_history_at(
+                    &market,
+                    crate::event::CandleInterval::FifteenMinutes,
+                    as_of_time,
+                )
+                .expect("each fifteen-minute phase must retain long-horizon history");
+            let encoded = serde_json::to_value(&history).expect("history must serialize");
+            assert_eq!(
+                encoded["hourly_as_of_time_ns"],
+                expected_hourly_as_of.value()
+            );
+            assert_eq!(
+                serde_json::from_value::<super::LongHorizonFeatureHistory>(encoded)
+                    .expect("history must deserialize at every hour phase"),
+                history
+            );
+        }
+    }
+
+    #[test]
+    fn long_horizon_history_rejects_tampered_hourly_boundary() {
+        let market = market("BTC");
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        let hour = populate_long_history(
+            &mut engine,
+            &mut aggregator,
+            market.clone(),
+            ReceiptDelays::default(),
+        );
+        let history = engine
+            .long_horizon_history_at(&market, crate::event::CandleInterval::FifteenMinutes, hour)
+            .expect("long-horizon history must be available");
+        let encoded = serde_json::to_value(history).expect("history must serialize");
+        let mut non_hourly_boundary = encoded.clone();
+        non_hourly_boundary["hourly_as_of_time_ns"] = serde_json::Value::from(
+            hour.value() + i64::try_from(FIFTEEN_MINUTES_NS).expect("fixed interval fits i64"),
+        );
+
+        let error = serde_json::from_value::<super::LongHorizonFeatureHistory>(non_hourly_boundary)
+            .expect_err("a non-hourly boundary must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("long-horizon history hourly as-of boundary is invalid")
+        );
+
+        let mut shifted_hourly_boundary = encoded;
+        shifted_hourly_boundary["hourly_as_of_time_ns"] = serde_json::Value::from(
+            hour.value() - crate::event::CandleInterval::OneHour.duration().value(),
+        );
+        let error =
+            serde_json::from_value::<super::LongHorizonFeatureHistory>(shifted_hourly_boundary)
+                .expect_err("a mismatched hourly boundary must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("long-horizon history hourly as-of boundary is invalid")
+        );
+    }
+
+    #[test]
     fn long_horizon_history_json_rejects_forged_digest_and_sample_ordering() {
         let market = market("BTC");
         let mut engine = CommonFeatureEngine::new();
@@ -4516,6 +4821,13 @@ mod tests {
             source_error
                 .to_string()
                 .contains("long-horizon history sample source event ID is invalid")
+        );
+
+        let mut unknown_nested = serde_json::to_value(&history).expect("history must serialize");
+        unknown_nested["completeness"]["unexpected"] = serde_json::Value::Bool(true);
+        assert!(
+            serde_json::from_value::<super::LongHorizonFeatureHistory>(unknown_nested).is_err(),
+            "unknown nested long-horizon fields must fail closed"
         );
     }
 
@@ -5196,8 +5508,7 @@ mod tests {
         .expect("test trade event must be valid");
         let candidate_bucket = super::bucket_close(event.event_time(), super::MICRO_5_MINUTES_NS)
             .expect("candidate bucket must be valid");
-        let aggregate = super::AggressiveTradeAggregate::from_trade(&event)
-            .expect("test aggregate must be valid");
+        let aggregate = super::AggressiveTradeAggregate::from_trade(&event, Side::Buy, dec!(100));
         let mut engine = CommonFeatureEngine::new();
         engine.markets.insert(btc.clone());
         for (sleeve, before_candidate) in [
@@ -5232,6 +5543,40 @@ mod tests {
         assert_eq!(engine.trade_aggregates, before_aggregates);
         assert!(engine.seen_events.is_empty());
         assert!(engine.events.is_empty());
+    }
+
+    #[test]
+    fn observing_one_market_preserves_unrelated_market_state_without_global_staging() {
+        let btc = market("BTC");
+        let eth = market("ETH");
+        let mut engine = CommonFeatureEngine::new();
+        let eth_event = bbo_at(eth.clone(), 100, 1, dec!(200));
+        engine
+            .observe(&eth_event)
+            .expect("ETH observation must be accepted");
+        let eth_bbo = engine
+            .events
+            .get(&eth)
+            .expect("ETH source state must exist")
+            .bbo
+            .clone();
+        let markets_before = engine.markets.clone();
+
+        let btc_event = bbo_at(btc.clone(), 101, 2, dec!(100));
+        engine
+            .observe(&btc_event)
+            .expect("BTC observation must be accepted");
+
+        assert_eq!(
+            engine
+                .events
+                .get(&eth)
+                .expect("ETH source state must remain present")
+                .bbo,
+            eth_bbo
+        );
+        assert_eq!(engine.markets, [btc, eth].into_iter().collect());
+        assert_ne!(engine.markets, markets_before);
     }
 
     #[test]

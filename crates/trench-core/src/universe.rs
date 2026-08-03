@@ -118,6 +118,7 @@ impl TradeableUniverse {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TradeableUniverseWire {
     as_of_time_ns: i64,
     markets: Vec<String>,
@@ -196,6 +197,22 @@ mod tests {
         let decoded: TradeableUniverse =
             serde_json::from_str(&encoded).expect("universe must deserialize");
         assert_eq!(decoded, universe);
+    }
+
+    #[test]
+    fn serialized_universe_rejects_unknown_wire_fields() {
+        let universe = TradeableUniverse::new(
+            TimestampNs::new(3_600_000_000_000).expect("timestamp must be valid"),
+            [Market::new("BTC").expect("market must be valid")],
+        )
+        .expect("membership must be valid");
+        let mut encoded = serde_json::to_value(universe).expect("universe must serialize");
+        encoded["unexpected"] = serde_json::Value::Bool(true);
+
+        assert!(
+            serde_json::from_value::<TradeableUniverse>(encoded).is_err(),
+            "unknown universe wire fields must fail closed"
+        );
     }
 
     #[test]
