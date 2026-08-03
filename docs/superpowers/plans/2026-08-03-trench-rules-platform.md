@@ -152,13 +152,14 @@ git commit -m "build: scaffold paper trading workspace"
 
 - [ ] **Step 1: Write failing value-type tests**
 
-Cover rejection of zero/negative/non-finite prices, negative quantities, unknown ledger names, leverage outside `5..=20`, cross margin, fee values below the required 7.5 bps per side, and risk settings above the approved limits. Include this happy-path shape:
+Cover rejection of zero/negative/non-finite prices, negative quantities, unknown ledger names, leverage outside `5..=20`, cross margin, fee values below the required 7.5 bps per side, and risk settings above the approved limits. Rules configuration has only `mode=collect_only|active`; active mode requires an artifact path plus digest, while threshold/ATR/take-profit values are forbidden in TOML because they must come from the validated artifact. Include this collector happy-path shape:
 
 ```rust
 let cfg = PaperConfig::from_toml(include_str!("../../../config/paper.example.toml"))?;
 assert_eq!(cfg.risk.initial_equity, Usdc::new(dec!(100))?);
 assert_eq!(cfg.risk.max_leverage, Leverage::new(20)?);
 assert_eq!(cfg.margin_mode, MarginMode::Isolated);
+assert_eq!(cfg.rules.mode, RulesMode::CollectOnly);
 ```
 
 - [ ] **Step 2: Run the tests and observe the missing modules**
@@ -169,7 +170,7 @@ Expected: FAIL because the types do not exist.
 
 - [ ] **Step 3: Implement strong types and fail-closed config parsing**
 
-Implement private-field newtypes `Price`, `Quantity`, `Usdc`, `Bps`, `Leverage`, `Market`, `RunId`, and `EventId`; enums `Side`, `Sleeve`, `LedgerId`, and the single-variant `MarginMode::Isolated`. Constructors return `DomainError` via `thiserror`. `PaperConfig::validate` must enforce every fixed limit from design sections 6 and 8 and reject unknown TOML fields with `#[serde(deny_unknown_fields)]`.
+Implement private-field newtypes `Price`, `Quantity`, `Usdc`, `Bps`, `Leverage`, `Market`, `RunId`, and `EventId`; enums `Side`, `Sleeve`, `LedgerId`, `RulesMode`, and the single-variant `MarginMode::Isolated`. Constructors return `DomainError` via `thiserror`. `PaperConfig::validate` must enforce every fixed limit from design sections 6 and 8, require `rules.artifact_path` plus `rules.artifact_digest` only in active mode, forbid independently configurable selected rule values, and reject unknown TOML fields with `#[serde(deny_unknown_fields)]`.
 
 Do not implement implicit `From<f64>` conversions. Implement explicit checked helpers and arithmetic that preserves units.
 
@@ -322,7 +323,7 @@ Expected: FAIL because `WsClient` is absent.
 
 - [ ] **Step 3: Implement bounded async ingestion**
 
-Use rustls, `tokio::select!`, a bounded `mpsc` output, heartbeat timeout, capped exponential reconnect with full jitter, and cancellation tokens. On reconnect, obtain fresh metadata/book snapshots through `InfoClient`, request exchange candles covering every recoverable 15-minute/1-hour gap, reconcile them against locally derived OHLCV, emit corrected completed candles only when source trades agree, record unavailable/conflicting spans explicitly, then resume incremental data. Duplicate identities are dropped; non-monotonic/crossed data emits quarantine state rather than being repaired.
+Use rustls, `tokio::select!`, a bounded `mpsc` output, heartbeat timeout, capped exponential reconnect with full jitter, and cancellation tokens. On reconnect, obtain fresh metadata/book snapshots through `InfoClient`, emit the exact gap plus a typed `GapRecoveryRequest` for each affected market/interval, then resume incremental data in quarantined state. Duplicate identities are dropped; non-monotonic/crossed data emits quarantine state rather than being repaired. Task 7A consumes recovery requests after candle aggregation exists.
 
 - [ ] **Step 4: Run async tests**
 
@@ -337,14 +338,13 @@ git add crates/trench-hyperliquid
 git commit -m "feat(market): add resilient public WebSocket ingestion"
 ```
 
-### Task 6A: Import official historical market archives locally
+### Task 6A: Parse official historical market archives locally
 
 **Files:**
 - Create: `crates/trench-hyperliquid/src/archive.rs`
 - Modify: `crates/trench-hyperliquid/src/lib.rs`
-- Modify: `crates/trenchd/src/commands.rs`
 - Create: `tests/fixtures/archive/l2-sample.lz4`
-- Test: parser and command integration tests
+- Test: bounded parser tests
 
 - [ ] **Step 1: Write failing official-format parser tests**
 
@@ -356,25 +356,25 @@ Run: `cargo test -p trench-hyperliquid archive::tests`
 
 Expected: FAIL because the archive importer is absent.
 
-- [ ] **Step 3: Implement an explicit-path, offline importer**
+- [ ] **Step 3: Implement a bounded explicit-path archive reader**
 
-Add `trenchd import-archive --config PATH --source ABSOLUTE_PATH --manifest ABSOLUTE_PATH`. The command accepts only previously downloaded official archive files beneath the resolved source root, verifies requester-pays source metadata/digests, streams decompression with bounded memory, normalizes through the same wire conversion as live events, and writes ordinary atomic Parquet partitions. It contains no AWS client or credential field; an operator may download requester-pays data on a trusted workstation, but credentials never enter the repository or VPS.
+`ArchiveReader::open(source_root, manifest)` accepts only previously downloaded official archive files beneath a resolved root, verifies requester-pays source metadata/digests, streams decompression with bounded memory, and yields normalized events through the same wire conversion as live data. It contains no storage, candle, AWS client, or credential dependency; an operator may download requester-pays data on a trusted workstation, but credentials never enter the repository or VPS.
 
-- [ ] **Step 4: Reconcile imported candles and gaps**
+- [ ] **Step 4: Validate archive completeness metadata**
 
-Derive candles from imported trades, compare with official candle snapshots, and persist exact unavailable/conflicting intervals. Backtests and rule selection must exclude those intervals; they may not substitute current universe membership, mid prices, or synthesized books.
+Return ordered normalized events plus exact present/missing/conflicting source spans. Do not derive candles or write Parquet in this task; Task 7A performs candle reconciliation after the aggregator exists and Task 14 integrates atomic storage.
 
 - [ ] **Step 5: Run importer tests**
 
-Run: `cargo test -p trench-hyperliquid archive::tests && cargo test -p trenchd commands::import_archive_tests`
+Run: `cargo test -p trench-hyperliquid archive::tests`
 
-Expected: PASS with deterministic partition/manifest digests.
+Expected: PASS with deterministic event/span digests.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/trench-hyperliquid crates/trenchd tests/fixtures/archive
-git commit -m "feat(data): import official historical archives"
+git add crates/trench-hyperliquid tests/fixtures/archive
+git commit -m "feat(data): parse official historical archives"
 ```
 
 ### Task 7: Build completed candles and point-in-time common features
@@ -411,6 +411,45 @@ Expected: PASS.
 ```bash
 git add crates/trench-core
 git commit -m "feat(features): add point-in-time market features"
+```
+
+### Task 7A: Reconcile live gaps and archive candles
+
+**Files:**
+- Create: `crates/trench-hyperliquid/src/recovery.rs`
+- Modify: `crates/trench-hyperliquid/src/lib.rs`
+- Modify: `crates/trench-hyperliquid/src/ws.rs`
+- Test: recovery tests using the candle aggregator and archive fixture
+
+- [ ] **Step 1: Write failing live-gap reconciliation tests**
+
+Feed a Task-6 `GapRecoveryRequest`, mock `candleSnapshot` responses for the exact 15-minute/1-hour range, and provide locally derived trades. Assert matching OHLCV closes the gap and rebuilds warmup, a mismatch persists a conflict/quarantine span, and an unavailable interval stays unavailable. No strategy-ready event may occur before every required interval is resolved or explicitly unavailable.
+
+- [ ] **Step 2: Write failing archive reconciliation tests**
+
+Stream Task-6A normalized archive trades/books through the real `CandleAggregator`, compare against point-in-time official candles, and assert deterministic completed candles plus present/missing/conflicting spans. Reject synthesized books, current-universe substitution, or midpoint fills.
+
+- [ ] **Step 3: Verify failure**
+
+Run: `cargo test -p trench-hyperliquid recovery::tests`
+
+Expected: FAIL because recovery orchestration is absent.
+
+- [ ] **Step 4: Implement recovery as a pure event producer**
+
+`GapRecovery` accepts a typed request, explicit REST/archive streams, and prior candle state, then emits normalized backfill events plus a complete `RecoveryResult`; it does not write storage or own readiness. Live WebSocket orchestration consumes the result and exits quarantine only on a complete result. Archive import and durable persistence are connected later in Task 14 after the Parquet store exists.
+
+- [ ] **Step 5: Run focused tests**
+
+Run: `cargo test -p trench-hyperliquid recovery::tests && cargo test -p trench-core candle::tests`
+
+Expected: PASS with byte-stable event/span digests.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/trench-hyperliquid
+git commit -m "feat(data): reconcile market data gaps"
 ```
 
 ### Task 8: Implement the dynamic native-perp universe
@@ -583,7 +622,7 @@ Expected: FAIL because broker modules do not exist.
 
 - [ ] **Step 4: Implement the broker state machine**
 
-Use explicit states `PendingEntry`, `Open`, `NormalExit`, `MandatoryExit`, `Flat`, `Liquidated`, and `Unresolved`. Consume only immutable books/events supplied by the engine. Every transition emits order/fill/cost records and updated stops/targets sized to actual fills. Primary fills are taker-only; maker results are isolated counterfactual records.
+Use explicit states `PendingEntry`, `Open`, `NormalExit`, `MandatoryExit`, `Flat`, `Liquidated`, and `Unresolved`. Consume only immutable books/events supplied by the engine. Every transition emits order/fill/cost records and updated stops/targets sized to actual fills. Decision-to-book and trigger-to-book latencies are persisted as append-only observed samples with deployment/run digests for later robustness sampling. Primary fills are taker-only; maker results are isolated counterfactual records.
 
 - [ ] **Step 5: Run broker tests**
 
@@ -643,13 +682,15 @@ git commit -m "feat(engine): connect rules risk and paper execution"
 - Create: `crates/trench-storage/src/parquet.rs`
 - Create: `crates/trench-storage/src/replay.rs`
 - Modify: `crates/trench-storage/src/lib.rs`
+- Create: `crates/trenchd/src/commands.rs`
+- Modify: `crates/trenchd/src/main.rs`
 - Create: `tests/fixtures/stream/basic.jsonl`
 - Create: `tests/fixtures/stream/gap-and-partial.jsonl`
 - Test: `crates/trench-storage/tests/recovery.rs`
 
 - [ ] **Step 1: Write failing partition/replay tests**
 
-Write an event batch to a temp directory, inject failure before rename, and assert only a `.tmp` sibling exists and is ignored. Complete a write and assert schema hash, row count, min/max event time, and content digest match its manifest. Replay shuffled input sources and assert ordered events and final engine digest equal the golden result.
+Write an event batch to a temp directory, inject failure before rename, and assert only a `.tmp` sibling exists and is ignored. Complete a write and assert schema hash, row count, min/max event time, and content digest match its manifest. Stream the official archive fixture through `ArchiveReader` and `GapRecovery` into the same sink and assert identical normalized partitions to an equivalent live fixture. Replay shuffled input sources and assert ordered events and final engine digest equal the golden result.
 
 - [ ] **Step 2: Verify failure**
 
@@ -661,20 +702,22 @@ Expected: FAIL because Parquet/replay code is absent.
 
 Partition high-rate rows by UTC date/event kind/market, write a bounded batch to a temporary sibling, fsync file and directory, validate by reopening, then atomically rename. Retain normalized trades, bounded BBO/L2, candles, contexts, funding, and feature matrices. Replay merges partitions by `(event_time, deterministic_kind_order, event_id)` and verifies config, code, schema, and data digests before yielding.
 
+Now add `trenchd import-archive --config PATH --source ABSOLUTE_PATH --manifest ABSOLUTE_PATH`. It composes the already-tested `ArchiveReader` and `GapRecovery` with this atomic Parquet sink, persists present/missing/conflicting intervals, and emits a content-addressed import manifest. It has no AWS/credential code and never writes through an alternate storage path.
+
 - [ ] **Step 4: Add golden fixtures**
 
 The basic fixture must open and close one rules trade. The gap fixture must exercise disconnect quarantine, a partial entry, a mandatory residual exit, and unresolved end-of-data rejection. Store expected final ledger/event digests alongside each fixture.
 
 - [ ] **Step 5: Run replay tests**
 
-Run: `cargo test -p trench-storage && cargo test -p trench-core engine::tests`
+Run: `cargo test -p trench-storage && cargo test -p trench-core engine::tests && cargo test -p trenchd commands::import_archive_tests`
 
 Expected: PASS with byte-stable digests.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/trench-storage tests/fixtures/stream
+git add crates/trench-storage crates/trenchd tests/fixtures/stream
 git commit -m "feat(replay): persist and replay market events"
 ```
 
@@ -685,7 +728,7 @@ git commit -m "feat(replay): persist and replay market events"
 - Create: `crates/trenchd/src/admin.rs`
 - Create: `crates/trenchd/src/readiness.rs`
 - Create: `crates/trenchd/src/writer.rs`
-- Create: `crates/trenchd/src/commands.rs`
+- Modify: `crates/trenchd/src/commands.rs`
 - Modify: `crates/trenchd/src/main.rs`
 - Modify: `crates/trenchd/Cargo.toml`
 
@@ -778,9 +821,13 @@ git commit -m "test: enforce paper-only platform invariants"
 
 **Files:**
 - Create: `crates/trench-core/src/validation.rs`
+- Modify: `crates/trench-core/src/config.rs`
+- Modify: `crates/trench-core/src/strategy/rules.rs`
 - Modify: `crates/trench-core/src/lib.rs`
 - Modify: `crates/trenchd/src/commands.rs`
+- Modify: `crates/trenchd/src/app.rs`
 - Modify: `crates/trench-storage/src/replay.rs`
+- Modify: `config/paper.example.toml`
 - Test: chronological-fold and end-to-end selection tests
 
 - [ ] **Step 1: Write failing fold and grid tests**
@@ -805,18 +852,20 @@ Add:
 trenchd research rules --config PATH --manifest PATH --output DIRECTORY
 ```
 
-The command builds point-in-time folds from the replay manifest, runs declared candidates through `Engine`, writes one immutable prediction/intent/trade/cost stream per candidate/fold, freezes the selected rules config before each outer test, and emits a canonical `rules-validation.json`. That report includes code/config/data/universe/schema digests, fold boundaries, excluded gaps, every tried selection, inner/test outcomes, trade count, and a content-addressed `rules-artifact.json`. It does not calculate a second approximate cost model.
+The command builds point-in-time folds from the replay manifest, runs declared candidates through `Engine`, writes one immutable prediction/intent/trade/cost stream per candidate/fold, freezes the selected rules config before each outer test, and emits a canonical `rules-validation.json`. That report includes code/config/data/universe/schema digests, fold boundaries, excluded gaps, every tried selection, inner/test outcomes, trade count, and a content-addressed `rules-artifact.json`. The artifact itself contains the selected threshold, ATR floor, take-profit, immutable family/regime definitions, code/feature/data cutoffs, artifact version, and aggregate BLAKE3 digest. It does not calculate a second approximate cost model.
+
+`RulesStrategy::from_artifact` is the only active-mode constructor. At startup `trenchd` resolves the configured artifact path without symlink escape, verifies its configured/content/code/feature digest and eligibility report, and builds the strategy from the artifact values. A missing/mismatched/ineligible artifact leaves only `rules_only` unready; arbitrary threshold/ATR/TP TOML values are invalid. Update `paper.example.toml` with a truthful `collect_only` example and document the exact active fields without a fake digest.
 
 - [ ] **Step 5: Prove no test reuse and stable freezing**
 
-Alter an outer-test outcome and assert the selected config for that fold is unchanged; alter a development outcome and assert the new artifact/report digest captures any legitimate change. Run: `cargo test -p trench-core validation::tests && cargo test -p trenchd commands::rules_research_tests`
+Alter an outer-test outcome and assert the selected config for that fold is unchanged; alter a development outcome and assert the new artifact/report digest captures any legitimate change. Start active mode with each wrong path/digest/code/feature/selected-value case and assert the rules ledger is unready and cannot signal; start with the exact artifact and assert the runtime explanation records the same selected values/digest. Run: `cargo test -p trench-core validation::tests && cargo test -p trenchd commands::rules_research_tests && cargo test -p trenchd app::rules_artifact_tests`
 
 Expected: PASS with byte-stable reports for fixed fixtures.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/trench-core crates/trenchd crates/trench-storage
+git add crates/trench-core crates/trenchd crates/trench-storage config/paper.example.toml
 git commit -m "feat(research): validate and freeze rules strategy"
 ```
 

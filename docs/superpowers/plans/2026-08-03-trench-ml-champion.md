@@ -244,10 +244,51 @@ git add ml/src/trench_ml/data/folds.py ml/tests/data/test_folds.py
 git commit -m "feat(ml): add purged temporal folds"
 ```
 
-### Task 5: Train deterministic LightGBM regression and class heads
+### Task 4A: Implement calibration primitives and the ML decision policy
 
 **Files:**
 - Create: `ml/src/trench_ml/models/__init__.py`
+- Create: `ml/src/trench_ml/models/calibration.py`
+- Create: `ml/tests/models/test_calibration.py`
+- Create: `crates/trench-core/src/strategy/ml.rs`
+- Modify: `crates/trench-core/src/strategy/mod.rs`
+- Modify: `crates/trench-core/src/lib.rs`
+- Test: Python calibration and Rust policy tests
+
+- [ ] **Step 1: Write failing calibration tests**
+
+Fit one positive temperature on chronological calibration rows and assert probabilities sum to one. Fit the one-sided 80% split-conformal residual quantile with correct finite-sample indexing. Reject non-finite/raw-order mismatches, ECE above 0.05, or calibrated multiclass Brier worse than raw. For inner model selection, assert the last 30 chronological days of each purged inner-training window are temporary calibration-only rows and never booster-training or validation rows.
+
+- [ ] **Step 2: Write failing Rust decision-policy tests**
+
+Construct a frozen `MlForecast` without a trained model and assert it becomes an un-sized `SignalCandidate`. Given a public `CostQuote`, require regression/class direction agreement, probability `>=0.58`, directional 80% conformal lower net bound above zero, and predicted gross movement `>=1.5 * full_cost`; return an intent bound only to the opaque quote ID. Reject late or artifact/config/feature/schema mismatches. Test shared stop/target/time/opposite-class behavior without an ML ledger.
+
+- [ ] **Step 3: Verify failure**
+
+Run: `cd ml && uv run pytest tests/models/test_calibration.py -q && cd .. && cargo test -p trench-core strategy::ml::tests`
+
+Expected: FAIL because calibration and the policy primitive are absent.
+
+- [ ] **Step 4: Implement reusable primitives**
+
+Implement deterministic temperature/conformal fit/transform functions that operate on explicit arrays and return canonical JSON state. Implement `MlDecisionPolicy` as pure Rust over `MlForecast`, common feature state, and `CostQuote`; it owns no worker, model, ledger, risk, or I/O. Define the authoritative forecast Parquet/wire fields here so offline evaluation and the later runtime client share the exact policy input.
+
+- [ ] **Step 5: Run focused quality checks**
+
+Run: `cd ml && uv run pytest tests/models/test_calibration.py -q && uv run ruff check src/trench_ml/models/calibration.py tests/models/test_calibration.py && cd .. && cargo test -p trench-core strategy::ml::tests && cargo clippy -p trench-core --all-targets -- -D warnings`
+
+Expected: PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add ml/src/trench_ml/models ml/tests/models crates/trench-core
+git commit -m "feat(ml): add calibrated decision policy"
+```
+
+### Task 5: Train deterministic LightGBM regression and class heads
+
+**Files:**
 - Create: `ml/src/trench_ml/models/lightgbm.py`
 - Create: `ml/src/trench_ml/evaluation_bridge.py`
 - Create: `ml/tests/models/test_lightgbm.py`
@@ -274,7 +315,9 @@ trenchd evaluate-forecasts --config PATH --replay-manifest PATH --forecast-parqu
 
 It verifies row/data/config/schema digests, replays forecasts through the same signal → sealed risk quote → cost acceptance → broker/ledger engine as runtime, and atomically emits trades, attributed costs, rejections, daily equity, and a result digest. It has no alternate sizing/fill implementation.
 
-`RustBrokerEvaluator` invokes that binary with an argv list (never a shell), explicit timeout/temp directory, and verifies the returned manifest/digests before exposing net expectancy. Train one Huber regression (`alpha=0.9`) and one three-class model per sleeve. Use development-fold inverse-frequency class weights, `deterministic=true`, `force_col_wise=true`, at most 2,000 trees, early stopping 100, bagging fraction 0.8/frequency 1, declared NumPy/LightGBM seeds, and one native thread count recorded in the manifest. Score every candidate only through this bridge; select median inner-fold net expectancy then lower complexity. Refit only on the 305 development days.
+`RustBrokerEvaluator` invokes that binary with an argv list (never a shell), explicit timeout/temp directory, and verifies the returned manifest/digests before exposing net expectancy. Train one Huber regression (`alpha=0.9`) and one three-class model per sleeve. Use development-fold inverse-frequency class weights, `deterministic=true`, `force_col_wise=true`, at most 2,000 trees, early stopping 100, bagging fraction 0.8/frequency 1, declared NumPy/LightGBM seeds, and one native thread count recorded in the manifest.
+
+For each inner fold, reserve its last 30 purged training days for temporary temperature/conformal calibration, train boosters only on the preceding inner-training rows, transform validation forecasts with those temporary calibrators, then score every candidate only through the Rust bridge and the already-implemented `MlDecisionPolicy`. Select median inner-fold net expectancy then lower complexity. After selection, refit boosters on all 305 development days; Task 6 fits the final calibrators only on the subsequent 60-day calibration window.
 
 - [ ] **Step 4: Run model tests**
 
@@ -292,14 +335,14 @@ git commit -m "feat(ml): train deterministic LightGBM heads"
 ### Task 6: Calibrate forecasts and create safe frozen artifacts
 
 **Files:**
-- Create: `ml/src/trench_ml/models/calibration.py`
+- Modify: `ml/src/trench_ml/models/calibration.py`
 - Create: `ml/src/trench_ml/models/artifact.py`
-- Create: `ml/tests/models/test_calibration.py`
+- Modify: `ml/tests/models/test_calibration.py`
 - Create: `ml/tests/models/test_artifact.py`
 
 - [ ] **Step 1: Write failing calibration tests**
 
-Fit one positive temperature on the chronological 60-day calibration window and assert probabilities sum to one. Fit the one-sided 80% split-conformal residual quantile and test finite-sample quantile indexing. Reject an artifact when ECE exceeds 0.05 or calibrated multiclass Brier is worse than raw.
+Using the selected boosters refit on all 305 development days, fit the existing temperature/conformal primitives on exactly the subsequent 60 chronological days and assert no development/test row enters. Reject final calibration when ECE exceeds 0.05 or calibrated multiclass Brier is worse than raw, and bind its row/dataset/model digests into the artifact.
 
 - [ ] **Step 2: Write failing artifact-security tests**
 
@@ -309,11 +352,11 @@ Round-trip LightGBM text, canonical JSON calibration/config/license manifests, a
 
 Run: `cd ml && uv run pytest tests/models/test_calibration.py tests/models/test_artifact.py -q`
 
-Expected: FAIL because calibration/artifact modules are absent.
+Expected: FAIL because final artifact assembly is absent.
 
 - [ ] **Step 4: Implement content-addressed artifacts**
 
-An artifact directory contains `regressor.txt`, `classifier.txt`, `calibration.json`, `feature-schema.json`, `training-manifest.json`, `license-manifest.json`, and `artifact.json`. `artifact.json` lists BLAKE3 digests of every file and the aggregate digest. Load into a new immutable directory, verify everything before constructing boosters, and atomically switch a `champion.json` pointer only through the later manual promotion command.
+Fit final calibration only through the Task-4A primitives and the declared 60-day manifest. An artifact directory contains `regressor.txt`, `classifier.txt`, `calibration.json`, `feature-schema.json`, `training-manifest.json`, `license-manifest.json`, and `artifact.json`. `artifact.json` lists BLAKE3 digests of every file and the aggregate digest. Load into a new immutable directory, verify everything before constructing boosters, and emit a candidate pointer only through the later manual promotion command.
 
 - [ ] **Step 5: Run tests**
 
@@ -338,7 +381,7 @@ git commit -m "feat(ml): freeze calibrated model artifacts"
 
 - [ ] **Step 1: Write failing worker protocol tests**
 
-Start the worker in a temporary directory; assert socket mode `0600`, length-prefixed MessagePack framing, maximum frame/row limits, exact request-response ID, model/config/schema digest echo, finite outputs, calibrated `short/flat/long` probabilities, regression point estimate, and directional conformal lower bound. Register up to three immutable shadow artifacts by digest, request champion plus candidate inference in one bar batch, and prove candidate failure cannot alter champion output. Test stale, duplicate, oversized, truncated, wrong-UID (where supported), unregistered artifact, fourth candidate, digest collision, and deadline-cancelled requests.
+Start the worker in a temporary directory; assert socket mode `0600`, length-prefixed MessagePack framing, maximum frame/row limits, exact request-response ID, model/config/schema digest echo, finite outputs, calibrated `short/flat/long` probabilities, regression point estimate, and directional conformal lower bound. Reconcile desired shadow sets `{A,B}`, `{B,C}`, and `{}`; prove removed boosters unload, replacements do not consume a fourth slot, and a failed new-set load leaves the prior set intact. Request champion plus candidates in one bar batch and prove candidate failure cannot alter champion output. Test stale, duplicate, oversized, truncated, wrong-UID (where supported), unregistered artifact, over-three desired set, digest collision, and deadline-cancelled requests.
 
 - [ ] **Step 2: Verify failure**
 
@@ -350,7 +393,7 @@ Expected: FAIL because the worker is absent.
 
 Load one verified champion artifact per sleeve at process start and never reload a digest in place. Bind only an explicitly configured Unix path beneath a `0700` directory, remove only a stale socket owned by the current UID, cap concurrent requests with an asyncio semaphore, and use bounded frame reads. Return structured errors without stack traces or environment dumps.
 
-Implement explicit `register_shadow`, `list_artifacts`, and `infer` payload types. Only the authenticated Rust daemon peer may register a content-addressed artifact path resolved beneath the configured model root with no symlink escape; the worker verifies all artifact/license/schema/config digests, loads at most three production-eligible shadows, and never changes the champion pointer. Inference requests name exact artifact digests and responses are keyed by digest. On restart the worker starts champion-only; the Rust handshake re-registers active database shadows before their next bar, with missed boundaries recorded rather than backfilled.
+Implement explicit `sync_shadows`, `list_artifacts`, and `infer` payload types. `sync_shadows` receives the complete desired digest/path set, validates every path beneath the model root and every artifact/license/schema/config digest, loads additions into a temporary registry, then atomically swaps registries and drops removed boosters only if the entire set succeeds. The set is capped at three and never changes the champion pointer. Only the authenticated Rust daemon peer may call it. Inference requests name exact artifact digests and responses are keyed by digest. On restart the worker starts champion-only; the Rust handshake syncs the active database set before its next bar, with missed boundaries recorded rather than backfilled.
 
 - [ ] **Step 4: Generate compatibility fixtures and rerun**
 
@@ -378,7 +421,7 @@ git commit -m "feat(ml): serve frozen Unix-socket inference"
 
 - [ ] **Step 1: Write failing compatibility/deadline tests**
 
-Decode Python request/response fixtures in Rust and assert field-for-field parity; encode through the declared canonical field order and compare with the fixture bytes. Test unknown schema/payload type, stale response, digest mismatch, duplicate response ID, non-finite output, worker disconnect, shadow registration/list recovery, candidate-only failure, and a fixed two-second default deadline. Assert champion failure skips only that ML boundary, candidate failure skips only that shadow, and global/`rules_only` readiness remain unchanged.
+Decode Python request/response fixtures in Rust and assert field-for-field parity; encode through the declared canonical field order and compare with the fixture bytes. Test unknown schema/payload type, stale response, digest mismatch, duplicate response ID, non-finite output, worker disconnect, shadow full-set sync/list/recovery including removals, candidate-only failure, and a fixed two-second default deadline. Assert champion failure skips only that ML boundary, candidate failure skips only that shadow, and global/`rules_only` readiness remain unchanged.
 
 - [ ] **Step 2: Verify failure**
 
@@ -388,7 +431,7 @@ Expected: FAIL because `MlClient` is absent.
 
 - [ ] **Step 3: Implement the bounded client**
 
-Add `rmp-serde` to the workspace and use a Unix stream, length-prefixed MessagePack, maximum frame/row limits, exact schema structs, one in-flight request per connection, and `tokio::time::timeout`. Construct each request from a frozen Rust feature batch plus the registered champion/active-shadow digest list and persist request timestamps before send; persist every per-artifact response/failure with actual latency. Expose bounded register/list calls used by startup reconciliation. Never retry a missed bar-close forecast or open TCP.
+Add `rmp-serde` to the workspace and use a Unix stream, length-prefixed MessagePack, maximum frame/row limits, exact schema structs, one in-flight request per connection, and `tokio::time::timeout`. Construct each request from a frozen Rust feature batch plus the registered champion/active-shadow digest list and persist request timestamps before send; persist every per-artifact response/failure with actual latency. Expose bounded full-set sync/list calls used by startup and every registration/pause reconciliation. Never retry a missed bar-close forecast or open TCP.
 
 - [ ] **Step 4: Run Rust/Python contract tests**
 
@@ -406,7 +449,7 @@ git commit -m "feat(daemon): add scoped ML inference client"
 ### Task 9: Convert validated forecasts into `ml_champion` intents
 
 **Files:**
-- Create: `crates/trench-core/src/strategy/ml.rs`
+- Modify: `crates/trench-core/src/strategy/ml.rs`
 - Modify: `crates/trench-core/src/strategy/mod.rs`
 - Modify: `crates/trench-core/src/engine.rs`
 - Create: `crates/trench-core/tests/ml_ledger.rs`
@@ -423,7 +466,7 @@ Feed identical market events to `rules_only` and `ml_champion`; mutate each sign
 
 Run: `cargo test -p trench-core strategy::ml::tests && cargo test -p trench-core --test ml_ledger`
 
-Expected: FAIL because the ML strategy/ledger path is absent.
+Expected: FAIL because runtime ML ledger integration is absent.
 
 - [ ] **Step 4: Implement forecast events and ML arbitration**
 
@@ -461,11 +504,22 @@ Use hand-calculated fixtures for both the frozen rules report and ML trades: net
 
 - [ ] **Step 2: Write failing robustness tests**
 
-Use seeded stationary bootstrap from `arch`, block-trade Monte Carlo, cost/latency multipliers, leave-one-asset/regime-out, parameter perturbation, feature-family ablation, deflated Sharpe, and combinatorially symmetric cross-validation PBO. Add TreeSHAP checks that explanations use the frozen feature order and that aggregate importance/stability is reported by fold, asset, and regime. Assert time/block structure is preserved and seed/config/digest are recorded.
+Require named, independently digestible scenarios—not one generic stress flag:
+
+- bull, bear, range, high-volatility, low-liquidity, funding-extreme, listing, delisting, and exchange-gap partitions from point-in-time labels;
+- base, 1.5x, and 2x complete-cost/latency replays plus a frozen severe replay using 2x fees/funding, 3x spread/depth/latency, and 10% missed entry/exit attempts;
+- seeded block-trade Monte Carlo over returns plus empirical missed-fill, slippage, and latency paths;
+- sampling from the append-only measured deployment decision-latency distribution, with missing deployment samples making forward promotion ineligible rather than substituting zero latency;
+- leave-one-asset and leave-one-regime-out, declared parameter perturbations, and feature-family ablations;
+- deflated Sharpe and combinatorially symmetric cross-validation PBO;
+- for ML, prediction-decile gross/net-return monotonicity plus weekly ECE/PSI drift;
+- TreeSHAP using the frozen feature order, summarized by fold, asset, and regime.
+
+Assert time/block structure is preserved and every scenario records sample count, exclusions, seeds, config/data/latency digest, outcome, and unresolved-state/breaker/liquidation flags. A missing required regime/result cannot be reported as survival.
 
 - [ ] **Step 3: Write failing gate-table tests**
 
-Express every design section 10.3 threshold in a typed gate table keyed by `strategy_kind=rules|ml`. Test each common gate failing alone: 90 days, 100 trades, 95% bootstrap lower mean above zero, DSR probability 0.95, PBO 0.20, positive 1.5x expectancy, no 2x breaker, 35% asset/40% month concentration, positive without best asset, zero liquidation, no 8% breaker, stress survival, and paired lower bound/no-worse drawdown for replacements. Test ECE/weekly drift/PSI only for ML and prove they cannot accidentally block or silently pass a required common rules gate.
+Express every design section 10.3 threshold in a typed gate table keyed by `strategy_kind=rules|ml`. Test each common gate failing alone: 90 days, 100 trades, 95% bootstrap lower mean above zero, DSR probability 0.95, PBO 0.20, positive 1.5x expectancy, no 2x breaker, 35% asset/40% month concentration, positive without best asset, zero liquidation, no 8% breaker, every named robustness result present with no state corruption, and paired lower bound/no-worse drawdown for replacements. Test ECE/weekly drift/PSI only for ML and prove they cannot accidentally block or silently pass a required common rules gate. Decile monotonicity is always reported for ML and may diagnose/reject a candidate through the declared report review, but no undeclared numeric promotion threshold is invented.
 
 - [ ] **Step 4: Verify failure**
 
@@ -475,7 +529,7 @@ Expected: FAIL because evaluation modules are absent.
 
 - [ ] **Step 5: Implement deterministic reports**
 
-The evaluator accepts either the phase-1 content-addressed `rules-artifact.json` plus its authoritative Rust trade streams or an ML artifact plus its authoritative forecast evaluation streams. Reports must separate gross alpha, protocol fee, builder fee, spread, depth, latency, funding, and liquidation; include every gate as pass/fail/not-applicable plus evidence digest; and distinguish offline outer-fold, provisional bootstrap, forward absolute, and paired replacement eligibility for each strategy kind. Rules and ML never share selection results or signals. Never auto-relax or auto-promote.
+The evaluator accepts either the phase-1 content-addressed `rules-artifact.json` plus its authoritative Rust trade streams or an ML artifact plus its authoritative forecast evaluation streams. It must execute and embed the full named scenario matrix from Step 2, not consume a caller-supplied summary boolean. Reports must separate gross alpha, protocol fee, builder fee, spread, depth, latency, funding, and liquidation; include every gate/scenario as pass/fail/not-applicable plus evidence digest; and distinguish offline outer-fold, provisional bootstrap, forward absolute, and paired replacement eligibility for each strategy kind. Rules and ML never share selection results or signals. Never auto-relax or auto-promote.
 
 - [ ] **Step 6: Run evaluation tests**
 
@@ -532,7 +586,9 @@ trenchd shadow pause --socket PATH --run-id ID --reason TEXT
 trenchd forward activate --socket PATH --run-manifest PATH --burn-in-report PATH
 ```
 
-For ML, the daemon first asks the worker to load/verify the inert content-addressed artifact, then atomically registers it with an activation boundary before any prediction can be requested. For rules, it verifies the frozen rules artifact locally. At each completed bar the daemon schedules visible champion plus every active ML shadow in one bounded inference batch and computes active rules shadows locally; it journals each decision before routing it through that shadow's isolated engine. Worker/candidate failure pauses only that shadow. Startup reconciles database registrations with the worker list before scheduling.
+For ML registration, the writer first inserts the verified candidate as `pending`; the daemon computes the desired set of current active shadows plus that candidate and calls transactional `sync_shadows`. On success the writer activates it at the next bar boundary; on failure it marks the candidate failed and re-syncs the prior active set. Pausing/removing a shadow changes database state first, inference immediately omits it, and a full-set sync unloads it. Because sync replaces the complete set, a stale loaded digest can never permanently consume a slot; periodic/startup reconciliation compares database desired state with `list_artifacts` until equal. For rules, the daemon verifies the frozen rules artifact locally without worker state.
+
+At each completed bar the daemon schedules visible champion plus every active ML shadow in one bounded inference batch and computes active rules shadows locally; it journals each decision before routing it through that shadow's isolated engine. Worker/candidate failure pauses only that shadow. Startup completes database/worker set reconciliation before scheduling.
 
 - [ ] **Step 5: Run persistence/isolation tests**
 
