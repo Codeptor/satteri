@@ -2130,6 +2130,8 @@ mod tests {
                 .local_addr()
                 .expect("loopback address is available")
         );
+        let (frames_sent, frames_were_sent) = oneshot::channel();
+        let (release_server, wait_for_test) = oneshot::channel();
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.expect("accept client");
             let mut socket = accept_async(socket)
@@ -2174,11 +2176,20 @@ mod tests {
                 ))
                 .await
                 .expect("replay the formerly staged trade");
+            let _ = frames_sent.send(());
+
+            // Keep the peer alive until the test observes both outputs. Dropping
+            // the socket here can race frame delivery with a reconnect gap.
+            let _ = wait_for_test.await;
         });
 
         let config = WsConfig::with_limits(vec![market("BTC")], WsLimits::fast_for_test())
             .expect("test configuration is valid");
         let mut stream = WsClient::new_for_test(config, endpoint).start();
+        timeout(Duration::from_secs(1), frames_were_sent)
+            .await
+            .expect("server must queue both trade frames before assertions")
+            .expect("server must report queued trade frames");
         let rejected = timeout(Duration::from_secs(1), stream.recv())
             .await
             .expect("malformed batch rejection before timeout")
@@ -2198,7 +2209,8 @@ mod tests {
             panic!("replayed trade must remain a trade event");
         };
         assert_eq!(trade.trade_id(), 41);
-        stream.cancel();
+        stream.shutdown().await;
+        let _ = release_server.send(());
         server.await.expect("server task must complete");
     }
 
