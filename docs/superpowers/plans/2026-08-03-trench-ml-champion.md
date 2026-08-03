@@ -381,7 +381,7 @@ git commit -m "feat(ml): freeze calibrated model artifacts"
 
 - [ ] **Step 1: Write failing worker protocol tests**
 
-Start the worker in a temporary directory; assert socket mode `0600`, length-prefixed MessagePack framing, maximum frame/row limits, exact request-response ID, model/config/schema digest echo, finite outputs, calibrated `short/flat/long` probabilities, regression point estimate, and directional conformal lower bound. Reconcile desired shadow sets `{A,B}`, `{B,C}`, and `{}`; prove removed boosters unload, replacements do not consume a fourth slot, and a failed new-set load leaves the prior set intact. Request champion plus candidates in one bar batch and prove candidate failure cannot alter champion output. Test stale, duplicate, oversized, truncated, wrong-UID (where supported), unregistered artifact, over-three desired set, digest collision, and deadline-cancelled requests.
+Start the worker in a temporary directory; assert socket mode `0600`, length-prefixed MessagePack framing, maximum frame/row limits, exact request-response ID, model/config/schema digest echo, finite outputs, calibrated `short/flat/long` probabilities, regression point estimate, and directional conformal lower bound. Load the champion named by canonical `champion.json`, echo its full digest set during handshake, and fail closed on a missing/mutated/incompatible pointer. Reconcile desired shadow sets `{A,B}`, `{B,C}`, and `{}`; prove removed boosters unload, replacements do not consume a fourth slot, and a failed new-set load leaves the prior set intact. Request champion plus candidates in one bar batch and prove candidate failure cannot alter champion output. Test stale, duplicate, oversized, truncated, wrong-UID (where supported), unregistered artifact, over-three desired set, digest collision, and deadline-cancelled requests.
 
 - [ ] **Step 2: Verify failure**
 
@@ -391,7 +391,7 @@ Expected: FAIL because the worker is absent.
 
 - [ ] **Step 3: Implement bounded inference**
 
-Load one verified champion artifact per sleeve at process start and never reload a digest in place. Bind only an explicitly configured Unix path beneath a `0700` directory, remove only a stale socket owned by the current UID, cap concurrent requests with an asyncio semaphore, and use bounded frame reads. Return structured errors without stack traces or environment dumps.
+Load one verified champion artifact per sleeve from the configured canonical `champion.json` at process start and never reload a digest in place. Bind only an explicitly configured Unix path beneath a `0700` directory, remove only a stale socket owned by the current UID, cap concurrent requests with an asyncio semaphore, and use bounded frame reads. Return structured errors without stack traces or environment dumps.
 
 Implement explicit `sync_shadows`, `list_artifacts`, and `infer` payload types. `sync_shadows` receives the complete desired digest/path set, validates every path beneath the model root and every artifact/license/schema/config digest, loads additions into a temporary registry, then atomically swaps registries and drops removed boosters only if the entire set succeeds. The set is capped at three and never changes the champion pointer. Only the authenticated Rust daemon peer may call it. Inference requests name exact artifact digests and responses are keyed by digest. On restart the worker starts champion-only; the Rust handshake syncs the active database set before its next bar, with missed boundaries recorded rather than backfilled.
 
@@ -421,7 +421,7 @@ git commit -m "feat(ml): serve frozen Unix-socket inference"
 
 - [ ] **Step 1: Write failing compatibility/deadline tests**
 
-Decode Python request/response fixtures in Rust and assert field-for-field parity; encode through the declared canonical field order and compare with the fixture bytes. Test unknown schema/payload type, stale response, digest mismatch, duplicate response ID, non-finite output, worker disconnect, shadow full-set sync/list/recovery including removals, candidate-only failure, and a fixed two-second default deadline. Assert champion failure skips only that ML boundary, candidate failure skips only that shadow, and global/`rules_only` readiness remain unchanged.
+Decode Python request/response fixtures in Rust and assert field-for-field parity; encode through the declared canonical field order and compare with the fixture bytes. Test unknown schema/payload type, stale response, digest mismatch, duplicate response ID, non-finite output, worker disconnect, expected-versus-handshake champion mismatch, shadow full-set sync/list/recovery including removals, candidate-only failure, and a fixed two-second default deadline. Assert champion failure skips only that ML boundary, candidate failure skips only that shadow, and global/`rules_only` readiness remain unchanged.
 
 - [ ] **Step 2: Verify failure**
 
@@ -431,7 +431,7 @@ Expected: FAIL because `MlClient` is absent.
 
 - [ ] **Step 3: Implement the bounded client**
 
-Add `rmp-serde` to the workspace and use a Unix stream, length-prefixed MessagePack, maximum frame/row limits, exact schema structs, one in-flight request per connection, and `tokio::time::timeout`. Construct each request from a frozen Rust feature batch plus the registered champion/active-shadow digest list and persist request timestamps before send; persist every per-artifact response/failure with actual latency. Expose bounded full-set sync/list calls used by startup and every registration/pause reconciliation. Never retry a missed bar-close forecast or open TCP.
+Add `rmp-serde` to the workspace and use a Unix stream, length-prefixed MessagePack, maximum frame/row limits, exact schema structs, one in-flight request per connection, and `tokio::time::timeout`. The startup handshake returns the champion artifact/report/code/config/feature/schema/license digest set; the client compares it with the writer's pending/active champion before allowing ML readiness. Construct each request from a frozen Rust feature batch plus the registered champion/active-shadow digest list and persist request timestamps before send; persist every per-artifact response/failure with actual latency. Expose bounded full-set sync/list calls used by startup and every registration/pause reconciliation. Never retry a missed bar-close forecast or open TCP.
 
 - [ ] **Step 4: Run Rust/Python contract tests**
 
@@ -561,7 +561,7 @@ git commit -m "feat(research): add robust promotion gates"
 
 - [ ] **Step 1: Write failing registration tests**
 
-Register both a rules-config candidate and an ML artifact with immutable kind/code/config/feature/model-or-rules/data-cutoff/license digests before their first decision. Assert an altered digest, late registration, more than three production-eligible shadows in aggregate, duplicate active version, research-only artifact, or mutation after outcomes is rejected. Test versioned admin commands for register/list/pause and `forward activate`; non-owner, stale report, non-reconciled run, and already-started outcomes fail closed.
+Register both a rules-config candidate and an ML artifact with immutable kind/code/config/feature/model-or-rules/data-cutoff/license digests before their first decision. Assert an altered digest, late registration, more than three production-eligible shadows in aggregate, duplicate active version, research-only artifact, or mutation after outcomes is rejected. Test versioned admin commands for register/list/pause, `release prepare`, `run rotate`, `champion activate`, and `forward activate`; non-owner, stale report, non-reconciled run, non-flat visible ledger, reused run ID, and already-started outcomes fail closed. Inject crashes before/after release quiescence, the pending champion transaction, champion-pointer rename, worker restart, and handshake; no decision may cross a release/champion digest boundary or be journaled under the old run with the new digest or under the new run with the old digest.
 
 - [ ] **Step 2: Write failing shadow-isolation tests**
 
@@ -575,7 +575,7 @@ Expected: FAIL because strategy-validation tables/shadow state are absent.
 
 - [ ] **Step 4: Implement the generic evaluation-only lifecycle**
 
-The migration adds generic `strategy_artifacts` (`kind=rules|ml`), `artifact_files`, `shadow_runs`, `shadow_decisions`, `shadow_ledger_transitions`, `forward_runs`, and `promotion_reports` with immutable triggers/constraints. `ShadowRun` wraps an isolated engine/ledger and is never a `LedgerId`; expose results only to evaluation/reporting. Active shadow count is checked transactionally.
+The migration adds generic `strategy_artifacts` (`kind=rules|ml`), `artifact_files`, `shadow_runs`, `shadow_decisions`, `shadow_ledger_transitions`, `release_activations`, `champion_activations`, `forward_runs`, and `promotion_reports` with immutable triggers/constraints. `ShadowRun` wraps an isolated engine/ledger and is never a `LedgerId`; expose results only to evaluation/reporting. Active shadow count is checked transactionally. A forward run stores the exact code/config/rules/model/feature/schema/license digests. It may be inserted as `burn_in` only for a fully verified current digest set or as `burn_in_pending` only for a champion awaiting handshake; permitted transitions are `burn_in_pending -> burn_in -> forward_active -> closed` and `burn_in -> forward_active -> closed`. Immutable constraints reject decisions whose run/artifact digests do not match.
 
 Extend the authenticated admin protocol with:
 
@@ -583,8 +583,19 @@ Extend the authenticated admin protocol with:
 trenchd shadow register --socket PATH --kind rules|ml --artifact-manifest PATH
 trenchd shadow list --socket PATH
 trenchd shadow pause --socket PATH --run-id ID --reason TEXT
+trenchd release prepare --socket PATH --release-manifest PATH
+trenchd run rotate --socket PATH --run-manifest PATH --reason initial|release_change|rules_change [--prepare-id ID]
+trenchd champion activate --socket PATH --candidate-pointer PATH --run-manifest PATH
 trenchd forward activate --socket PATH --run-manifest PATH --burn-in-report PATH
 ```
+
+`release prepare` verifies the candidate release manifest/digests through an explicit immutable path, immediately blocks new entries while preserving normal and mandatory exit handling, and returns non-ready until both visible ledgers are flat/reconciled with no pending or unresolved order. It then records a durable `release_pending` ID and candidate digest in one writer transaction. Repeated calls for the same digest are idempotent; a different candidate is rejected until the pending change is explicitly abandoned before any file activation. The entry block survives restart, eliminating the status-check/activation race.
+
+`run rotate` is the generic writer-owned boundary for an initial run or a code/config/rules release change. Startup compares the running release and rules digests with the last run and blocks all new decisions on mismatch. For `release_change|rules_change`, it also requires a matching durable `release_pending` ID created before file activation. At a completed boundary, rotation requires flat/reconciled visible ledgers and no pending/unresolved order, closes the prior run if present, creates fresh 100-USDC ledgers, binds a new `burn_in` run to every current digest, consumes the pending release record when applicable, and only then arms the next decision boundary. It is idempotent by proposed run ID and cannot reuse outcomes. Release tooling may switch files and restart exact services, but cannot bypass this database transition.
+
+`champion activate` is the only code path that may replace live `champion.json`. At the next completed boundary it pauses all visible-strategy decision scheduling, drains inference, and requires both visible ledgers to be flat/reconciled with no pending or unresolved order. In one writer transaction it closes any prior evidence run with reason `champion_change`, creates a fresh 100-USDC-per-ledger `burn_in_pending` run bound to the candidate and current release/rules digests, and records a pending activation before atomically writing/fsyncing the champion pointer. It then remains ML-unready and returns `pending_worker_restart`; it never records a prediction yet. If pointer publication fails, the durable pending state is retryable but the closed run never resumes.
+
+After the operator restarts only the worker, the exact startup handshake completes the pending activation: one writer transaction records the new champion, changes that same run to `burn_in`, and arms scheduling for the next bar boundary. A wrong/old worker leaves the run pending and all visible decisions paused. Startup reconciliation resumes or safely fails this state after a crash based on the database, pointer, and worker digests; there is no rollback to the closed evidence run. Thus the new run ID/digest binding is durable before inference resumes. `forward activate` can later change only this same run from `burn_in` to `forward_active` after its matching 24-hour report.
 
 For ML registration, the writer first inserts the verified candidate as `pending`; the daemon computes the desired set of current active shadows plus that candidate and calls transactional `sync_shadows`. On success the writer activates it at the next bar boundary; on failure it marks the candidate failed and re-syncs the prior active set. Pausing/removing a shadow changes database state first, inference immediately omits it, and a full-set sync unloads it. Because sync replaces the complete set, a stale loaded digest can never permanently consume a slot; periodic/startup reconciliation compares database desired state with `list_artifacts` until equal. For rules, the daemon verifies the frozen rules artifact locally without worker state.
 
@@ -592,7 +603,7 @@ At each completed bar the daemon schedules visible champion plus every active ML
 
 - [ ] **Step 5: Run persistence/isolation tests**
 
-Run: `cargo test -p trench-storage strategy::tests && cargo test -p trench-core shadow::tests && cargo test -p trenchd admin::shadow_tests`
+Run: `cargo test -p trench-storage strategy::tests && cargo test -p trench-core shadow::tests && cargo test -p trenchd admin::shadow_tests && cargo test -p trenchd admin::release_prepare_tests && cargo test -p trenchd admin::run_rotation_tests && cargo test -p trenchd admin::champion_activation_tests`
 
 Expected: PASS.
 

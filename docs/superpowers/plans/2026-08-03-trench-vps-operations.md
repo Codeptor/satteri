@@ -12,7 +12,7 @@
 
 ## Scope and prerequisites
 
-Execute this only after the [rules platform](2026-08-03-trench-rules-platform.md) passes; enable the ML unit only after the [ML champion plan](2026-08-03-trench-ml-champion.md) passes and a valid artifact is installed. The target is SSH alias `gifgoblin`, measured as Ubuntu 24.04, 6 shared EPYC vCPUs, about 12 GB RAM, and 174 GB free disk. Re-measure rather than trusting those numbers at deployment time.
+Execute this after both the [rules platform](2026-08-03-trench-rules-platform.md) and [ML champion plan](2026-08-03-trench-ml-champion.md) pass; the ML unit may remain disabled until a valid champion is installed. The target is SSH alias `gifgoblin`, measured as Ubuntu 24.04, 6 shared EPYC vCPUs, about 12 GB RAM, and 174 GB free disk. Re-measure rather than trusting those numbers at deployment time.
 
 Current read-only evidence narrows the network blocker: `eth0` is routable and netplan reports it online, IPv4 and IPv6 HTTPS work, but networkd keeps its administrative state at `configuring`; the generated default-route states remain `requesting/configuring`, both generated wait-online commands time out, and the unit stays failed. Root access is required to inspect the protected cloud-init netplan and networkd journal. The deployment must correct that pending route configuration until `eth0` becomes `configured`; it must not suppress the unit or replace it with an optimistic wait override.
 
@@ -179,7 +179,7 @@ On pull request and main push, run Rust format/clippy/tests, Python `uv sync --f
 
 - [ ] **Step 3: Implement release assembly**
 
-For an explicit signed/annotated tag or manual workflow dispatch, build `trenchd` for `x86_64-unknown-linux-musl`, download a pinned x86_64 Linux `uv` binary and verify its published checksum, then package both binaries, `ml/src`, `ml/pyproject.toml`, `ml/uv.lock`, schemas, both production configs, the approved content-addressed rules artifact/report, systemd/sysusers/tmpfiles files, and scripts. A forward-capable bundle is rejected unless `paper.toml` active-mode path/digest exactly matches the packaged rules artifact; an explicitly labeled collector-only bundle may omit it but cannot start forward evidence. Exclude test fixtures, other reports, datasets, SDK archive, docs, Git metadata, and model binaries. Emit `release-manifest.json` with Git commit, tag, Rust/Python/uv/lock/schema/config/rules-artifact digests, per-file BLAKE3/SHA-256, and build timestamp; generate a provenance attestation and immutable artifact digest.
+For an explicit signed/annotated tag or manual workflow dispatch, build `trenchd` for `x86_64-unknown-linux-musl`, download a pinned x86_64 Linux `uv` binary and verify its published checksum, then package both binaries, `ml/src`, `ml/pyproject.toml`, `ml/uv.lock`, schemas, both production configs, the approved content-addressed rules artifact/report, systemd/sysusers/tmpfiles files, and scripts. Place `paper.toml`, its declared `rules-artifact.json`, and `rules-validation.json` together under `deploy/config/`; a forward-capable bundle is rejected unless both filenames/digests exactly match that pair. An explicitly labeled collector-only bundle may omit the pair but cannot start forward evidence. Exclude test fixtures, other reports, datasets, SDK archive, docs, Git metadata, and model binaries. Emit `release-manifest.json` with Git commit, tag, Rust/Python/uv/lock/schema/config/rules-artifact/report digests, per-file BLAKE3/SHA-256, and build timestamp; generate a provenance attestation and immutable artifact digest.
 
 - [ ] **Step 4: Verify locally**
 
@@ -225,7 +225,7 @@ Run `systemd-analyze verify` against the initial absent files and assert failure
 
 `sysusers.d` creates a system `trenchbot` user/group with `/var/lib/trenchbot` and `/usr/sbin/nologin`. `tmpfiles.d` creates `/etc/trenchbot` as root:`trenchbot` `0750`, plus `/var/lib/trenchbot/{sqlite,parquet,models}`, `/var/backups/trenchbot`, and `/run/trenchbot` at `0700`. The slice uses `CPUQuota=300%`, `MemoryHigh=3G`, `MemoryMax=4G`, `TasksMax=512`, and accounting enabled, leaving the majority of the measured host memory plus three vCPUs available to other workloads.
 
-`deploy/config/paper.toml` contains the exact production public REST/WS endpoints, `/var/lib` data paths, `/run/trenchbot/admin.sock`, `/run/trenchbot/ml.sock`, `127.0.0.1:9464`, frozen universe/risk/fee settings, `rules.mode=active`, `/opt/trenchbot/current/artifacts/rules/rules-artifact.json`, its release-supplied digest, and no independently tunable rule values or secret field. `deploy/config/ml.toml` contains the Unix socket, content-addressed model root, worker limits/deadline, feature/config digests supplied at release time, and no database/exchange/credential field.
+`deploy/config/paper.toml` contains the exact production public REST/WS endpoints, `/var/lib` data paths, `/run/trenchbot/admin.sock`, `/run/trenchbot/ml.sock`, `127.0.0.1:9464`, frozen universe/risk/fee settings, `rules.mode=active`, sibling filenames `rules-artifact.json` and `rules-validation.json`, their release-supplied digests, and no independently tunable rule values or secret field. Both files are packaged beside `paper.toml`; `trenchd` resolves them relative to the canonical physical config target, so staged validation reads the staged pair and `/etc/trenchbot/paper.toml` reads the pair in the atomically selected release. `deploy/config/ml.toml` contains the Unix socket, content-addressed model root, worker limits/deadline, feature/config digests supplied at release time, and no database/exchange/credential field.
 
 - [ ] **Step 3: Create hardened service units**
 
@@ -301,15 +301,17 @@ git commit -m "ops: verify shared VPS prerequisites"
 
 - [ ] **Step 1: Write failing path/digest tests**
 
-Use temporary explicit roots to test bad/missing digest, traversal/symlink escape, wrong owner/mode, missing/invalid paper or ML config, rules-artifact mismatch, existing digest with different content, failed uv sync, bad binary doctor, schema incompatibility, and interruption immediately before/after the single activation rename. Assert no broad recursive deletion, the old `current` target remains active on pre-rename failure, both stable `/etc` config links always resolve through the same `current` target, and a repeated identical install is idempotent.
+Use temporary explicit roots to test bad/missing digest, traversal/symlink escape, wrong owner/mode, missing/invalid paper or ML config, rules-artifact/report mismatch, existing digest with different content, failed uv sync, bad binary doctor, schema incompatibility, absent/stale/wrong-digest `release_pending` ID, an active non-flat/unreconciled forward run, and interruption immediately before/after the single activation rename. Cover first install plus an upgrade where `current` still points to a different valid artifact/report pair: staged doctor must read only the staged config siblings. Assert no broad recursive deletion, the old `current` target remains active on pre-rename failure, both stable `/etc` config links always resolve through the same `current` target, and a repeated identical install is idempotent.
 
-- [ ] **Step 2: Implement staged preparation**
+- [ ] **Step 2: Implement immutable preparation**
 
-The root-run script accepts exactly `--bundle ABSOLUTE_FILE --release-root /opt/trenchbot/releases --config-root /etc/trenchbot --data-root /var/lib/trenchbot`. Resolve/validate every target, verify manifest/provenance/file hashes including bundled `uv` and rules artifact, create one same-filesystem temporary release directory with `mktemp -d`, install the binaries, run the bundled `uv sync --frozen --no-dev` inside staging, and place both configs plus the rules artifact inside that release. Validate them through staged `trenchd doctor` plus `trench-ml config check`, require public/Unix/local paths and exact release/rules digests, set config/artifact ownership root:`trenchbot` mode `0640`, then make all release files root-owned/read-only.
+Implement `install-release.sh prepare --bundle ABSOLUTE_FILE --release-root /opt/trenchbot/releases --config-root /etc/trenchbot --data-root /var/lib/trenchbot`. Resolve/validate every target, verify manifest/provenance/file hashes including bundled `uv` and the rules artifact/report pair, create one same-filesystem temporary release directory with `mktemp -d`, install the binaries, run the bundled `uv sync --frozen --no-dev` inside staging, and place `paper.toml`, `rules-artifact.json`, and `rules-validation.json` together under staged `deploy/config/`. Invoke the staged binary as `STAGE/bin/trenchd doctor --config STAGE/deploy/config/paper.toml`; its canonical-config sibling rule must make it validate only those staged files, without a staging override or any `/opt/trenchbot/current` lookup. Run staged `trench-ml config check` likewise, require public/Unix/local paths and exact release/rules digests, set config/artifact/report ownership root:`trenchbot` mode `0640`, make all release files root-owned/read-only, and atomically rename the directory to `/opt/trenchbot/releases/<digest>`. Print that inert immutable path/digest; do not touch `current`. An identical prepare is idempotent.
 
 - [ ] **Step 3: Implement explicit activation**
 
-Create `/etc/trenchbot/paper.toml -> /opt/trenchbot/current/deploy/config/paper.toml` and `/etc/trenchbot/ml.toml -> /opt/trenchbot/current/deploy/config/ml.toml` once; on later installs require those exact stable targets and never replace them. After every staged validation succeeds, create one new `current` symlink sibling and atomically rename only it to `/opt/trenchbot/current`. That single directory indirection switches the binary, Python environment, both configs, schemas, and packaged rules artifact as one filesystem operation. Before a forward schema migration, request and verify an online backup through the running admin socket; never activate an older schema binary afterward. Retain the previous release and backup. Do not start/restart services inside the installer; activation and service restart are separate observable commands.
+Implement `install-release.sh activate --release /opt/trenchbot/releases/<digest> --release-root /opt/trenchbot/releases --config-root /etc/trenchbot --data-root /var/lib/trenchbot --prepare-id ID`. Before an existing deployment is upgraded, invoke `trenchd release prepare` against that immutable release manifest; the old daemon durably blocks entries, reaches flat/reconciled state, and returns the ID. Activation re-verifies every release file and queries the old admin socket, refusing unless the ID is still pending and matches the exact release digest; request and verify an online backup before a schema change. For a first install only, replace `--prepare-id` with `--initial` and prove `current`, the database, and any prior run are absent. If `current` already resolves to the exact verified digest, return success before requiring either flag and change nothing.
+
+Create `/etc/trenchbot/paper.toml -> /opt/trenchbot/current/deploy/config/paper.toml` and `/etc/trenchbot/ml.toml -> /opt/trenchbot/current/deploy/config/ml.toml` once; on later installs require those exact stable targets and never replace them. Create one new `current` symlink sibling and atomically rename only it to `/opt/trenchbot/current`. That single directory indirection switches the binary, Python environment, both configs, schemas, and packaged rules artifact/report as one filesystem operation. Never activate an older schema binary afterward. Retain the previous release and backup. The installer does not start/restart services or directly mutate SQLite; immutable preparation, admin quiescence, filesystem activation, exact service restart, and writer-owned `run rotate` remain separately journaled operations.
 
 - [ ] **Step 4: Run script tests**
 
@@ -332,21 +334,21 @@ git commit -m "ops: install verified immutable releases"
 
 - [ ] **Step 1: Write failing artifact/report/activation tests**
 
-Use explicit temporary roots and a tiny valid artifact to cover bad artifact/report/license/config/feature/schema/code digests, research-only license, failed promotion gates, path traversal or symlink escape, wrong ownership/mode, an existing digest with different content, incompatibility with the active release, and interruption immediately before/after the one champion-pointer rename. Assert a failed install leaves the prior `champion.json` and immutable model directory untouched, and an identical reinstall is idempotent.
+Use explicit temporary roots and a tiny valid artifact to cover bad artifact/report/license/config/feature/schema/code digests, research-only license, failed promotion gates, path traversal or symlink escape, wrong ownership/mode, an existing digest with different content, incompatibility with the active release, and interruption immediately before/after candidate publication. Assert this script can never create or replace live `champion.json`, a failed install leaves prior immutable model state untouched, and an identical reinstall is idempotent.
 
 - [ ] **Step 2: Implement verified staging**
 
 The root-run script accepts exactly `--artifact ABSOLUTE_DIRECTORY --report ABSOLUTE_FILE --model-root /var/lib/trenchbot/models --release-root /opt/trenchbot/current`. Resolve every path, reject sources beneath the model target, verify the current release/config/schema digests, then invoke the current release's `trench-ml promote` as `trenchbot` with an argv array and a private same-filesystem staging target. That command must verify the artifact, license, offline/forward promotion report, data cutoff, and paired gates before producing an approved pointer. Reopen every copied file, verify its manifest, and make the content-addressed model directory read-only.
 
-- [ ] **Step 3: Activate exactly one pointer**
+- [ ] **Step 3: Publish an inert candidate pointer**
 
-Write canonical `champion.json` to a sibling temporary file containing the artifact path plus artifact/report/code/config/feature/schema/license digests, fsync the file and model-root directory, then atomically rename only that file. Never edit an artifact in place, automatically restart a service, or make a failed candidate visible. The ML worker and Rust handshake must reject a pointer that does not match the running release; an operator restarts only `trench-ml.service` after successful activation, and any champion change creates a new forward run ID.
+Write canonical `candidate-<digest>.json` to a sibling temporary file containing the immutable artifact path plus artifact/report/code/config/feature/schema/license digests, fsync the file and model-root directory, then atomically rename only that candidate file. The script has no permission or code path to replace `champion.json`, mutate forward-run state, or restart a service. The authenticated writer-owned `trenchd champion activate` transition from the ML plan is the sole activation path.
 
 - [ ] **Step 4: Run script tests**
 
 Run: `shellcheck deploy/scripts/install-model.sh && bats deploy/tests/install-model.bats`
 
-Expected: PASS with failure injection preserving the prior champion and with no secret or network dependency.
+Expected: PASS with failure injection preserving the prior champion, publishing only an inert candidate, and using no secret or network dependency.
 
 - [ ] **Step 5: Commit**
 
@@ -364,7 +366,7 @@ git commit -m "ops: install verified ML champions"
 
 - [ ] **Step 1: Write smoke-test failure fixtures**
 
-Test nonzero exit for inactive/failed units, watchdog miss, non-loopback listener, readiness blocker, schema/config digest mismatch, ledger not exactly 100 USDC on a fresh run, unexpected writable path, disk above threshold, and modification/restart of protected neighboring services.
+Test nonzero exit for inactive/failed units, watchdog miss, non-loopback listener, readiness blocker, schema/config/run digest mismatch, a missing required run rotation, ledger not exactly 100 USDC on a fresh run, unexpected writable path, disk above threshold, and modification/restart of protected neighboring services.
 
 - [ ] **Step 2: Snapshot neighboring state before activation**
 
@@ -372,11 +374,11 @@ Over SSH, record hashes/status/start timestamps for existing containers and GIF 
 
 - [ ] **Step 3: Install system definitions, release, and optional champion**
 
-Run sysusers/tmpfiles, copy verified unit files, daemon-reload, and install the verified application release. If an approved ML artifact is in scope, transfer only its artifact directory plus promotion report, run `install-model.sh`, inspect the resulting digest, then start `trench-ml.service`; otherwise leave ML in its valid degraded state. Start `trenchd.service` and backup/retention timers, use exact unit names, and wait for readiness. Never restart all services or Docker.
+Run sysusers/tmpfiles, copy verified unit files, daemon-reload, and use `install-release.sh prepare` to publish an inert release. For an upgrade, call `trenchd release prepare` against that release manifest and wait for its durable ID; stop only `trench-ml.service`, then call `install-release.sh activate` with the ID. For a proven first install use its explicit `--initial` path. Start/restart only `trenchd.service` and start the backup/retention timers in decisions-paused/ML-degraded mode. If an approved replacement ML artifact is in scope, transfer only its artifact directory plus promotion report, run `install-model.sh`, inspect the inert candidate digest, and invoke `trenchd champion activate --socket /run/trenchbot/admin.sock --candidate-pointer ABSOLUTE_PATH --run-manifest ABSOLUTE_PATH`. Require the command to report a durable `pending_worker_restart` transition and a fresh run ID before starting only `trench-ml.service`; wait until status reports the exact champion digest and that run in `burn_in` before any ML inference boundary. If the existing champion remains compatible, start only `trench-ml.service`, require its exact current-release handshake, then invoke `trenchd run rotate --socket /run/trenchbot/admin.sock --run-manifest ABSOLUTE_PATH --reason initial|release_change|rules_change` with the pending prepare ID when applicable. With no champion installed, invoke the same rotation in explicit ML-degraded mode. Require the new `burn_in` run before decisions resume; otherwise leave decisions paused. Use exact unit names and never restart all services or Docker.
 
 - [ ] **Step 4: Run post-activation smoke**
 
-The script checks loopback endpoints, systemd status/watchdog, journal error codes, current-release digest, config/schema fingerprint, SQLite integrity/reconciliation, event freshness, universe explanation, two ledger identities/equity, timers, resource slice, writable paths, listeners, and protected-neighbor before/after state.
+The script checks loopback endpoints, systemd status/watchdog, journal error codes, current-release digest, config/schema fingerprint, exact active-or-burn-in run/digest binding, SQLite integrity/reconciliation, event freshness, universe explanation, two ledger identities/equity, timers, resource slice, writable paths, listeners, and protected-neighbor before/after state.
 
 Run: `ssh gifgoblin 'sudo /opt/trenchbot/current/deploy/scripts/smoke-test.sh --config /etc/trenchbot/paper.toml'`
 
@@ -446,7 +448,7 @@ Invoke the phase-2 Rust admin client explicitly:
 trenchd forward activate --socket /run/trenchbot/admin.sock --run-manifest ABSOLUTE_PATH --burn-in-report ABSOLUTE_PATH
 ```
 
-The writer verifies and atomically marks the run `forward_active` only after the 24-hour burn-in report passes. The daemon then schedules both visible strategies and all registered rules/ML shadows automatically; it does not auto-promote, relax minimum trades, backfill missed decisions, or count pre-registration outcomes.
+The writer verifies the run is already the `burn_in` run created by the champion/release activation transition, that its code/config/rules/model digests match the manifest and worker handshake, and that the same-run 24-hour burn-in report passes before atomically marking it `forward_active`. A stale run ID or a report spanning an earlier champion/release is rejected. The daemon then schedules both visible strategies and all registered rules/ML shadows automatically; it does not auto-promote, relax minimum trades, backfill missed decisions, or count pre-registration outcomes.
 
 - [ ] **Step 4: Validate daily/weekly operator checks**
 
