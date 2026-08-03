@@ -4,6 +4,7 @@
 //! its configuration constrained to the documented public connection budgets.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
@@ -11,7 +12,11 @@ use rand::random;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::Value;
+#[cfg(test)]
+use std::sync::Arc;
 use thiserror::Error;
+#[cfg(test)]
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
@@ -174,7 +179,7 @@ impl WsLimits {
         self.read_timeout
     }
 
-    /// Returns the finite deadline for recovering every selected L2 snapshot.
+    /// Returns the finite deadline for every connection to receive all selected L2 snapshots.
     #[must_use]
     pub const fn snapshot_recovery_timeout(self) -> Duration {
         self.snapshot_recovery_timeout
@@ -339,6 +344,8 @@ impl WsConfig {
 pub struct WsClient {
     config: WsConfig,
     endpoint: WsEndpoint,
+    #[cfg(test)]
+    write_stall: TestWriteStall,
 }
 
 impl WsClient {
@@ -348,6 +355,8 @@ impl WsClient {
         Self {
             config,
             endpoint: WsEndpoint::production(),
+            #[cfg(test)]
+            write_stall: None,
         }
     }
 
@@ -375,8 +384,12 @@ impl WsClient {
         let task_cancellation = cancellation.clone();
         let config = self.config.clone();
         let endpoint = self.endpoint.clone();
+        #[cfg(test)]
+        let write_stall = self.write_stall.clone();
+        #[cfg(not(test))]
+        let write_stall = ();
         let task = tokio::spawn(async move {
-            run_client(config, endpoint, sender, task_cancellation).await;
+            run_client(config, endpoint, sender, task_cancellation, write_stall).await;
         });
         WsStream {
             receiver,
@@ -390,6 +403,20 @@ impl WsClient {
         Self {
             config,
             endpoint: WsEndpoint::test_loopback(endpoint),
+            write_stall: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_stalled_writes_test(
+        config: WsConfig,
+        endpoint: String,
+        write_started: Arc<Notify>,
+    ) -> Self {
+        Self {
+            config,
+            endpoint: WsEndpoint::test_loopback(endpoint),
+            write_stall: Some(write_started),
         }
     }
 }
@@ -725,11 +752,66 @@ impl WsEndpoint {
 
 type ClientSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
+#[cfg(test)]
+type TestWriteStall = Option<Arc<Notify>>;
+
+#[cfg(not(test))]
+type TestWriteStall = ();
+
+enum TimedIo<T> {
+    Completed(T),
+    TimedOut,
+    Cancelled,
+}
+
+struct ConnectionIo<'a> {
+    cancellation: &'a CancellationToken,
+    test_write_stall: &'a TestWriteStall,
+}
+
+async fn cancellable_timeout<T>(
+    duration: Duration,
+    cancellation: &CancellationToken,
+    operation: impl Future<Output = T>,
+) -> TimedIo<T> {
+    tokio::select! {
+        _ = cancellation.cancelled() => TimedIo::Cancelled,
+        result = timeout(duration, operation) => match result {
+            Ok(value) => TimedIo::Completed(value),
+            Err(_) => TimedIo::TimedOut,
+        },
+    }
+}
+
+async fn send_socket_message(
+    sink: &mut futures_util::stream::SplitSink<ClientSocket, Message>,
+    message: Message,
+    duration: Duration,
+    io: &ConnectionIo<'_>,
+) -> TimedIo<Result<(), tokio_tungstenite::tungstenite::Error>> {
+    #[cfg(test)]
+    if let Some(write_started) = io.test_write_stall {
+        write_started.notify_one();
+        return cancellable_timeout(
+            duration,
+            io.cancellation,
+            std::future::pending::<Result<(), tokio_tungstenite::tungstenite::Error>>(),
+        )
+        .await;
+    }
+
+    #[cfg(not(test))]
+    let _ = io.test_write_stall;
+
+    cancellable_timeout(duration, io.cancellation, sink.send(message)).await
+}
+
 async fn run_client(
     config: WsConfig,
     endpoint: WsEndpoint,
     output: mpsc::Sender<WsOutput>,
     cancellation: CancellationToken,
+    test_write_stall: TestWriteStall,
 ) {
     let mut retry = 0_u32;
     let mut backoff = ReconnectBackoff::new(random());
@@ -748,14 +830,15 @@ async fn run_client(
             .max_write_buffer_size(WEBSOCKET_MAX_WRITE_BUFFER_BYTES)
             .max_message_size(Some(config.limits.max_inbound_message_bytes()))
             .max_frame_size(Some(config.limits.max_inbound_message_bytes()));
-        let connected = timeout(
+        let connected = cancellable_timeout(
             config.limits.connect_timeout(),
+            &cancellation,
             connect_async_with_config(endpoint.as_str(), Some(socket_config), false),
         )
         .await;
         let socket = match connected {
-            Ok(Ok((socket, _))) => socket,
-            Ok(Err(error)) => {
+            TimedIo::Completed(Ok((socket, _))) => socket,
+            TimedIo::Completed(Err(error)) => {
                 tracing::warn!(error = %error, "public WebSocket connection failed");
                 if !emit_gaps(
                     &mut state,
@@ -778,7 +861,7 @@ async fn run_client(
                 }
                 continue;
             }
-            Err(_) => {
+            TimedIo::TimedOut => {
                 tracing::warn!("public WebSocket connection timed out");
                 if !emit_gaps(
                     &mut state,
@@ -801,6 +884,7 @@ async fn run_client(
                 }
                 continue;
             }
+            TimedIo::Cancelled => return,
         };
         state.record_reconnect_connection();
         let connection = run_connection(
@@ -810,6 +894,7 @@ async fn run_client(
             &cancellation,
             &mut state,
             &mut decoder,
+            &test_write_stall,
         )
         .await;
         if connection.healthy {
@@ -936,8 +1021,13 @@ async fn run_connection(
     cancellation: &CancellationToken,
     state: &mut StreamState,
     decoder: &mut Decoder,
+    test_write_stall: &TestWriteStall,
 ) -> ConnectionOutcome {
     let (mut sink, mut source) = socket.split();
+    let io = ConnectionIo {
+        cancellation,
+        test_write_stall,
+    };
     for market in config.markets() {
         for kind in ["l2Book", "trades", "bbo"] {
             let subscription = serde_json::json!({
@@ -945,20 +1035,25 @@ async fn run_connection(
                 "subscription": {"type": kind, "coin": market.as_str()}
             })
             .to_string();
-            match timeout(
+            match send_socket_message(
+                &mut sink,
+                Message::Text(subscription.into()),
                 config.limits.connect_timeout(),
-                sink.send(Message::Text(subscription.into())),
+                &io,
             )
             .await
             {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
+                TimedIo::Completed(Ok(())) => {}
+                TimedIo::Completed(Err(error)) => {
                     tracing::warn!(error = %error, "public WebSocket subscription write failed");
                     return ConnectionOutcome::unhealthy(ConnectionEnd::TransportError);
                 }
-                Err(_) => {
+                TimedIo::TimedOut => {
                     tracing::warn!("public WebSocket subscription write timed out");
                     return ConnectionOutcome::unhealthy(ConnectionEnd::TransportError);
+                }
+                TimedIo::Cancelled => {
+                    return ConnectionOutcome::unhealthy(ConnectionEnd::Cancelled);
                 }
             }
         }
@@ -966,7 +1061,6 @@ async fn run_connection(
 
     decoder.begin_connection();
     let mut healthy = false;
-    let recovery_required = state.has_pending_gaps();
     let mut recovered_markets = BTreeSet::new();
     let mut heartbeat_due = Box::pin(tokio::time::sleep(config.limits.heartbeat_interval()));
     let mut read_deadline = Box::pin(tokio::time::sleep(config.limits.read_timeout()));
@@ -979,20 +1073,25 @@ async fn run_connection(
                 return ConnectionOutcome { end: ConnectionEnd::Cancelled, healthy };
             }
             _ = &mut heartbeat_due => {
-                match timeout(
+                match send_socket_message(
+                    &mut sink,
+                    Message::Text("{\"method\":\"ping\"}".into()),
                     config.limits.connect_timeout(),
-                    sink.send(Message::Text("{\"method\":\"ping\"}".into())),
+                    &io,
                 ).await {
-                    Ok(Ok(())) => {
+                    TimedIo::Completed(Ok(())) => {
                         heartbeat_due.as_mut().reset(Instant::now() + config.limits.heartbeat_interval());
                     }
-                    Ok(Err(error)) => {
+                    TimedIo::Completed(Err(error)) => {
                         tracing::warn!(error = %error, "public WebSocket heartbeat write failed");
                         return ConnectionOutcome { end: ConnectionEnd::TransportError, healthy };
                     }
-                    Err(_) => {
+                    TimedIo::TimedOut => {
                         tracing::warn!("public WebSocket heartbeat write timed out");
                         return ConnectionOutcome { end: ConnectionEnd::TransportError, healthy };
+                    }
+                    TimedIo::Cancelled => {
+                        return ConnectionOutcome { end: ConnectionEnd::Cancelled, healthy };
                     }
                 }
             }
@@ -1000,7 +1099,7 @@ async fn run_connection(
                 tracing::warn!("public WebSocket read deadline elapsed");
                 return ConnectionOutcome { end: ConnectionEnd::ReadTimeout, healthy };
             }
-            _ = &mut snapshot_recovery_deadline, if recovery_required && !healthy => {
+            _ = &mut snapshot_recovery_deadline, if !healthy => {
                 tracing::warn!("public WebSocket snapshot recovery deadline elapsed");
                 return ConnectionOutcome { end: ConnectionEnd::SnapshotRecoveryTimeout, healthy };
             }
@@ -1023,7 +1122,7 @@ async fn run_connection(
                     config,
                     output,
                     state,
-                    cancellation,
+                    &io,
                 ).await {
                     FrameOutcome::Continue => {}
                     FrameOutcome::FreshL2(market) => {
@@ -1045,6 +1144,9 @@ async fn run_connection(
                             healthy,
                         };
                     }
+                    FrameOutcome::Cancelled => {
+                        return ConnectionOutcome { end: ConnectionEnd::Cancelled, healthy };
+                    }
                 }
             }
         }
@@ -1058,7 +1160,7 @@ async fn handle_frame(
     config: &WsConfig,
     output: &mpsc::Sender<WsOutput>,
     state: &mut StreamState,
-    cancellation: &CancellationToken,
+    io: &ConnectionIo<'_>,
 ) -> FrameOutcome {
     let received_at = match now_timestamp() {
         Some(timestamp) => timestamp,
@@ -1069,7 +1171,7 @@ async fn handle_frame(
             if frame.len() > config.limits.max_inbound_message_bytes() {
                 return if emit_rejection(
                     output,
-                    cancellation,
+                    io.cancellation,
                     received_at,
                     RejectionReason::MessageTooLarge,
                 )
@@ -1091,11 +1193,12 @@ async fn handle_frame(
                     });
                     for event in events {
                         let gap = state.record_event(&event);
-                        if !send_output(output, cancellation, WsOutput::MarketEvent(event)).await {
+                        if !send_output(output, io.cancellation, WsOutput::MarketEvent(event)).await
+                        {
                             return FrameOutcome::OutputClosed;
                         }
                         if let Some(gap) = gap
-                            && !send_output(output, cancellation, WsOutput::Gap(gap)).await
+                            && !send_output(output, io.cancellation, WsOutput::Gap(gap)).await
                         {
                             return FrameOutcome::OutputClosed;
                         }
@@ -1114,7 +1217,7 @@ async fn handle_frame(
                 Err(DecodeError::TradeIdentityLimit { max_identities }) => {
                     if send_output(
                         output,
-                        cancellation,
+                        io.cancellation,
                         WsOutput::Terminal(WsTerminal::TradeIdentityLimit(TradeIdentityLimit {
                             max_identities,
                         })),
@@ -1128,7 +1231,7 @@ async fn handle_frame(
                 }
                 Err(error) => {
                     tracing::warn!(reason = ?error, "public WebSocket update rejected");
-                    if emit_rejection(output, cancellation, received_at, error.into()).await {
+                    if emit_rejection(output, io.cancellation, received_at, error.into()).await {
                         FrameOutcome::Continue
                     } else {
                         FrameOutcome::OutputClosed
@@ -1137,21 +1240,24 @@ async fn handle_frame(
             }
         }
         Message::Ping(payload) => {
-            match timeout(
+            match send_socket_message(
+                sink,
+                Message::Pong(payload),
                 config.limits.connect_timeout(),
-                sink.send(Message::Pong(payload)),
+                io,
             )
             .await
             {
-                Ok(Ok(())) => FrameOutcome::Continue,
-                Ok(Err(error)) => {
+                TimedIo::Completed(Ok(())) => FrameOutcome::Continue,
+                TimedIo::Completed(Err(error)) => {
                     tracing::warn!(error = %error, "public WebSocket pong write failed");
                     FrameOutcome::TransportError
                 }
-                Err(_) => {
+                TimedIo::TimedOut => {
                     tracing::warn!("public WebSocket pong write timed out");
                     FrameOutcome::TransportError
                 }
+                TimedIo::Cancelled => FrameOutcome::Cancelled,
             }
         }
         Message::Pong(_) => FrameOutcome::Continue,
@@ -1159,7 +1265,7 @@ async fn handle_frame(
         Message::Binary(_) | Message::Frame(_) => {
             if emit_rejection(
                 output,
-                cancellation,
+                io.cancellation,
                 received_at,
                 RejectionReason::NonTextFrame,
             )
@@ -1243,6 +1349,7 @@ enum FrameOutcome {
     TransportError,
     Terminal,
     OutputClosed,
+    Cancelled,
 }
 
 struct StreamState {
@@ -1306,10 +1413,6 @@ impl StreamState {
         for pending in self.pending_gaps.values_mut() {
             pending.reconnect_attempt = pending.reconnect_attempt.saturating_add(1);
         }
-    }
-
-    fn has_pending_gaps(&self) -> bool {
-        !self.pending_gaps.is_empty()
     }
 
     fn reconnect_exhausted(&self) -> Vec<GapEvent> {
@@ -1827,9 +1930,13 @@ fn is_plain_decimal(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use futures_util::{SinkExt, StreamExt};
     use serde_json::json;
+    use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
+    use tokio::sync::{Notify, oneshot};
     use tokio::time::{Duration, timeout};
     use tokio_tungstenite::{accept_async, tungstenite::Message};
     use trench_core::event::{MarketEventKind, TimestampNs};
@@ -2655,6 +2762,7 @@ mod tests {
                     .send(Message::Close(None))
                     .await
                     .expect("force reconnect");
+                let _ = timeout(Duration::from_millis(20), socket.next()).await;
             }
         });
 
@@ -2826,6 +2934,204 @@ mod tests {
         server
             .await
             .expect("server task must not observe a fourth reconnect");
+    }
+
+    #[tokio::test]
+    async fn initial_connection_without_l2_times_out_despite_acks_pongs_and_trades() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback WebSocket server");
+        let endpoint = format!(
+            "ws://{}",
+            listener
+                .local_addr()
+                .expect("loopback address is available")
+        );
+        let server = tokio::spawn(async move {
+            for connection in 0..3_u64 {
+                let (socket, _) = listener.accept().await.expect("accept reconnect");
+                let mut socket = accept_async(socket)
+                    .await
+                    .expect("accept WebSocket handshake");
+                for kind in ["l2Book", "trades", "bbo"] {
+                    let Some(Ok(Message::Text(subscription))) = socket.next().await else {
+                        panic!("client must subscribe before the readiness deadline");
+                    };
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(&subscription)
+                            .expect("subscription must be JSON"),
+                        json!({"method":"subscribe","subscription":{"type":kind,"coin":"BTC"}})
+                    );
+                    socket
+                        .send(Message::Text(
+                            json!({
+                                "channel": "subscriptionResponse",
+                                "data": {
+                                    "method": "subscribe",
+                                    "subscription": {"type": kind, "coin": "BTC"}
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .expect("acknowledge subscription");
+                }
+                for tick in 0..20_u64 {
+                    if socket
+                        .send(Message::Text(r#"{"channel":"pong"}"#.into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    if socket
+                        .send(Message::Text(
+                            json!({
+                                "channel": "trades",
+                                "data": [{
+                                    "coin": "BTC", "side": "B", "px": "1", "sz": "1",
+                                    "time": 1_700_000_000_000_i64 + i64::try_from(tick).expect("tick fits i64"),
+                                    "tid": connection * 100 + tick
+                                }]
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        });
+
+        let config = WsConfig::with_limits(vec![market("BTC")], WsLimits::fast_for_test())
+            .expect("test configuration is valid");
+        let mut stream = WsClient::new_for_test(config, endpoint).start();
+        let opened = loop {
+            let output = timeout(Duration::from_secs(1), stream.recv())
+                .await
+                .expect("readiness gap before timeout")
+                .expect("stream must remain open before exhaustion");
+            if let WsOutput::Gap(GapEvent::Opened(opened)) = output {
+                break opened;
+            }
+        };
+        assert_eq!(opened.reason(), GapReason::SnapshotRecoveryTimeout);
+        let exhausted = loop {
+            let output = timeout(Duration::from_secs(1), stream.recv())
+                .await
+                .expect("terminal gap before timeout")
+                .expect("exhaustion record must precede stream closure");
+            if let WsOutput::Gap(GapEvent::ReconnectExhausted(exhausted)) = output {
+                break exhausted;
+            }
+        };
+        assert_eq!(exhausted.reason(), GapReason::SnapshotRecoveryTimeout);
+        assert_eq!(exhausted.reconnect_attempts(), 2);
+        assert!(
+            timeout(Duration::from_secs(1), stream.recv())
+                .await
+                .expect("stream must stop after reconnect exhaustion")
+                .is_none()
+        );
+        server
+            .await
+            .expect("server must observe the bounded reconnect sequence");
+    }
+
+    #[tokio::test]
+    async fn initial_complete_l2_snapshots_keep_the_connection_healthy() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback WebSocket server");
+        let endpoint = format!(
+            "ws://{}",
+            listener
+                .local_addr()
+                .expect("loopback address is available")
+        );
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept client");
+            let mut socket = accept_async(socket)
+                .await
+                .expect("accept WebSocket handshake");
+            for (coin, kind) in [
+                ("BTC", "l2Book"),
+                ("BTC", "trades"),
+                ("BTC", "bbo"),
+                ("ETH", "l2Book"),
+                ("ETH", "trades"),
+                ("ETH", "bbo"),
+            ] {
+                let Some(Ok(Message::Text(subscription))) = socket.next().await else {
+                    panic!("client must subscribe before L2 readiness");
+                };
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&subscription)
+                        .expect("subscription must be JSON"),
+                    json!({"method":"subscribe","subscription":{"type":kind,"coin":coin}})
+                );
+            }
+            for coin in ["BTC", "ETH"] {
+                socket
+                    .send(Message::Text(
+                        json!({
+                            "channel": "l2Book",
+                            "data": {
+                                "coin": coin, "time": 1_700_000_000_000_i64,
+                                "levels": [
+                                    [{"px": "1", "sz": "1", "n": 1}],
+                                    [{"px": "2", "sz": "1", "n": 1}]
+                                ]
+                            }
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .expect("send initial L2 snapshot");
+            }
+            for _ in 0..20 {
+                if socket
+                    .send(Message::Text(r#"{"channel":"pong"}"#.into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        let config = WsConfig::with_limits(
+            vec![market("BTC"), market("ETH")],
+            WsLimits::fast_for_test(),
+        )
+        .expect("test configuration is valid");
+        let mut stream = WsClient::new_for_test(config, endpoint).start();
+        for _ in 0..2 {
+            assert!(matches!(
+                timeout(Duration::from_secs(1), stream.recv())
+                    .await
+                    .expect("initial L2 before timeout"),
+                Some(WsOutput::MarketEvent(_))
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            timeout(Duration::from_millis(20), stream.recv())
+                .await
+                .is_err(),
+            "all selected initial L2 snapshots must prevent a readiness-timeout gap"
+        );
+        stream.cancel();
+        server
+            .await
+            .expect("server task must complete after cancellation");
     }
 
     #[tokio::test]
@@ -3203,6 +3509,89 @@ mod tests {
             "shutdown must cancel an output enqueue without draining the receiver"
         );
         server.await.expect("server task must complete");
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_a_stalled_websocket_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback TCP server");
+        let endpoint = format!(
+            "ws://{}",
+            listener
+                .local_addr()
+                .expect("loopback address is available")
+        );
+        let (handshake_received, handshake_observed) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept TCP client");
+            let mut request = [0_u8; 1_024];
+            let bytes = socket
+                .read(&mut request)
+                .await
+                .expect("read WebSocket handshake request");
+            assert!(bytes > 0, "client must begin the WebSocket handshake");
+            let _ = handshake_received.send(());
+            let bytes = timeout(Duration::from_secs(1), socket.read(&mut request))
+                .await
+                .expect("client must close the stalled handshake connection")
+                .expect("read connection closure");
+            assert_eq!(bytes, 0, "cancellation must close the handshake connection");
+        });
+
+        let config = WsConfig::with_limits(vec![market("BTC")], WsLimits::fast_for_test())
+            .expect("test configuration is valid");
+        let stream = WsClient::new_for_test(config, endpoint).start();
+        handshake_observed
+            .await
+            .expect("server must observe the pending handshake");
+        assert!(
+            timeout(Duration::from_millis(50), stream.shutdown())
+                .await
+                .is_ok(),
+            "shutdown must preempt the configured handshake timeout"
+        );
+        server
+            .await
+            .expect("server task must finish after handshake cancellation");
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_a_stalled_websocket_write() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback WebSocket server");
+        let endpoint = format!(
+            "ws://{}",
+            listener
+                .local_addr()
+                .expect("loopback address is available")
+        );
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept client");
+            let mut socket = accept_async(socket)
+                .await
+                .expect("accept WebSocket handshake");
+            let _ = timeout(Duration::from_secs(1), socket.next()).await;
+        });
+
+        let write_started = Arc::new(Notify::new());
+        let config = WsConfig::with_limits(vec![market("BTC")], WsLimits::fast_for_test())
+            .expect("test configuration is valid");
+        let stream =
+            WsClient::new_for_stalled_writes_test(config, endpoint, write_started.clone()).start();
+        timeout(Duration::from_secs(1), write_started.notified())
+            .await
+            .expect("client must enter a pending WebSocket write");
+        assert!(
+            timeout(Duration::from_millis(50), stream.shutdown())
+                .await
+                .is_ok(),
+            "shutdown must preempt the configured WebSocket write timeout"
+        );
+        server
+            .await
+            .expect("server task must finish after write cancellation");
     }
 
     #[tokio::test]
