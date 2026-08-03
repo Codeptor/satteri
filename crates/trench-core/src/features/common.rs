@@ -13,18 +13,19 @@ use crate::event::{
     AssetContext, Bbo, BookSnapshot, CandleInterval, Funding, MarketEvent, MarketEventKind,
     TimestampNs,
 };
+use crate::universe::TradeableUniverse;
 
 const FEATURE_SCHEMA: &str = concat!(
-    "trench.common-features.v1\n",
+    "trench.common-features.v2\n",
     "warmup.bars=97;context_observations=30;funding_observations=30\n",
     "rule_history=derivatives:30d;hourly_realized_volatility_20:90d\n",
     "returns=1,2,4,8,16,32,96\n",
-    "ema=8,32;ema_slope=8:4\n",
+    "ema=8,20,32;ema_slope=8:4;close_ema_20_residual;high_low=10\n",
     "rsi=14;atr=14;adx=14;realized_volatility=8,20,64\n",
     "donchian=20;volume_robust_z=20\n",
     "premium;open_interest_change=1,4,16;funding=level,percentile:30\n",
-    "spread_bps;depth=10,25,50;trade_imbalance=5m,15m\n",
-    "cross_return_rank=4,16,96;hourly_regime\n"
+    "spread_bps;depth=sided:10,25,50;trade_imbalance=5m,15m\n",
+    "cross_return_rank=liquidity_adjusted:4,16;hourly_regime\n"
 );
 const MAX_BAR_LOOKBACK: usize = 97;
 const FIFTEEN_MINUTE_BARS_PER_DAY: usize = 24 * 4;
@@ -179,6 +180,7 @@ pub struct InputEventRange {
     first_event_time: TimestampNs,
     last_event_time: TimestampNs,
     spans: Vec<InputEventSpan>,
+    universe_digest: Option<String>,
     digest: String,
 }
 
@@ -219,6 +221,12 @@ impl InputEventRange {
         &self.digest
     }
 
+    /// Returns the frozen tradeable-universe content digest when ranks used it.
+    #[must_use]
+    pub fn universe_digest(&self) -> Option<&str> {
+        self.universe_digest.as_deref()
+    }
+
     fn from_spans(mut spans: Vec<InputEventSpan>) -> Option<Self> {
         spans.sort();
         spans.dedup();
@@ -237,19 +245,30 @@ impl InputEventRange {
             last_event_id: last.last_event_id.clone(),
             first_event_time: first.first_event_time,
             last_event_time: last.last_event_time,
-            digest: input_digest(&spans),
+            digest: input_digest(&spans, None),
             spans,
+            universe_digest: None,
         })
     }
 
     fn with_additional_spans(&self, additional: &[InputEventSpan]) -> Option<Self> {
         let mut spans = self.spans.clone();
         spans.extend_from_slice(additional);
-        Self::from_spans(spans)
+        let mut result = Self::from_spans(spans)?;
+        result.universe_digest = self.universe_digest.clone();
+        result.digest = input_digest(&result.spans, result.universe_digest.as_deref());
+        Some(result)
+    }
+
+    fn with_universe(&self, universe: &TradeableUniverse) -> Self {
+        let mut result = self.clone();
+        result.universe_digest = Some(universe.digest().to_owned());
+        result.digest = input_digest(&result.spans, result.universe_digest.as_deref());
+        result
     }
 }
 
-fn input_digest(spans: &[InputEventSpan]) -> String {
+fn input_digest(spans: &[InputEventSpan], universe_digest: Option<&str>) -> String {
     let mut hasher = Hasher::new_derive_key("trench.feature-input-range.v1");
     for span in spans {
         hasher.update(&[span.kind.identity_tag()]);
@@ -260,6 +279,10 @@ fn input_digest(spans: &[InputEventSpan]) -> String {
         hasher.update(span.last_event_id.as_str().as_bytes());
         hasher.update(&[0]);
         hasher.update(&span.available_at.value().to_be_bytes());
+    }
+    if let Some(universe_digest) = universe_digest {
+        hasher.update(b"universe\0");
+        hasher.update(universe_digest.as_bytes());
     }
     hasher.finalize().to_hex().to_string()
 }
@@ -504,6 +527,7 @@ pub struct FeatureSnapshot {
     completeness: FeatureCompleteness,
     unready_reason: Option<FeatureUnreadyReason>,
     schema_hash: String,
+    snapshot_hash: String,
     values: BTreeMap<String, Decimal>,
     regime: Option<RegimeInputs>,
 }
@@ -555,6 +579,12 @@ impl FeatureSnapshot {
     #[must_use]
     pub fn schema_hash(&self) -> &str {
         &self.schema_hash
+    }
+
+    /// Returns a stable digest of every immutable value and input contract.
+    #[must_use]
+    pub fn snapshot_hash(&self) -> &str {
+        &self.snapshot_hash
     }
 
     /// Returns complete finite decimal feature values keyed by stable schema name.
@@ -936,19 +966,41 @@ impl CommonFeatureEngine {
         sleeve: CandleInterval,
         as_of_time: TimestampNs,
     ) -> Vec<FeatureSnapshot> {
+        self.snapshots_at_with_universe(sleeve, as_of_time, None)
+    }
+
+    /// Builds immutable snapshots using one explicit frozen tradeable universe.
+    ///
+    /// A missing, stale, incomplete, or mismatched membership never falls back
+    /// to all locally warm markets: it leaves cross-sectional ranks unavailable
+    /// and every affected snapshot fails closed.
+    #[must_use]
+    pub fn snapshots_at_with_universe(
+        &self,
+        sleeve: CandleInterval,
+        as_of_time: TimestampNs,
+        universe: Option<&TradeableUniverse>,
+    ) -> Vec<FeatureSnapshot> {
         let mut bases = self
             .markets_at(sleeve, as_of_time)
             .into_iter()
             .map(|market| self.base_snapshot(market, sleeve, as_of_time))
             .collect::<Vec<_>>();
 
-        let complete = bases
-            .iter()
-            .filter(|base| base.completeness.primary_inputs_ready())
-            .map(|base| base.market.clone())
-            .collect::<Vec<_>>();
-        if complete.len() >= 2 {
-            add_cross_sectional_ranks(&mut bases, &complete, sleeve);
+        let complete = universe
+            .filter(|universe| universe.as_of_time() == as_of_time)
+            .and_then(|universe| {
+                let members = universe.markets().iter().cloned().collect::<Vec<_>>();
+                (members.len() >= 2
+                    && members.iter().all(|market| {
+                        bases.iter().any(|base| {
+                            base.market == *market && base.completeness.primary_inputs_ready()
+                        })
+                    }))
+                .then_some((universe, members))
+            });
+        if let Some((universe, members)) = complete {
+            add_cross_sectional_ranks(&mut bases, &members, sleeve, universe);
         }
 
         bases
@@ -958,21 +1010,26 @@ impl CommonFeatureEngine {
                     (!base.completeness.cross_section).then_some(FeatureUnreadyReason::CrossSection)
                 });
                 let is_ready = base.completeness.is_ready() && unready_reason.is_none();
-                FeatureSnapshot {
+                let schema_hash = schema_hash();
+                let values = if is_ready {
+                    base.values
+                } else {
+                    BTreeMap::new()
+                };
+                let mut snapshot = FeatureSnapshot {
                     market: base.market,
                     sleeve,
                     as_of_time,
                     input_range: base.input_range,
                     completeness: base.completeness,
                     unready_reason,
-                    schema_hash: schema_hash(),
-                    values: if is_ready {
-                        base.values
-                    } else {
-                        BTreeMap::new()
-                    },
+                    schema_hash,
+                    snapshot_hash: String::new(),
+                    values,
                     regime: base.regime,
-                }
+                };
+                snapshot.snapshot_hash = feature_snapshot_hash(&snapshot);
+                snapshot
             })
             .collect()
     }
@@ -1509,9 +1566,10 @@ fn add_cross_sectional_ranks(
     bases: &mut [BaseSnapshot],
     complete: &[Market],
     sleeve: CandleInterval,
+    universe: &TradeableUniverse,
 ) {
-    for lookback in [4_usize, 16, 96] {
-        let name = format!("return_{lookback}");
+    for lookback in [4_usize, 16] {
+        let name = format!("liquidity_adjusted_return_{lookback}");
         let rank_name = format!("cross_return_{lookback}_rank");
         let mut ranked = complete
             .iter()
@@ -1574,7 +1632,9 @@ fn add_cross_sectional_ranks(
             .flat_map(|(_, spans)| spans.iter().cloned())
             .collect::<Vec<_>>();
         if let Some(range) = &base.input_range {
-            base.input_range = range.with_additional_spans(&additional);
+            base.input_range = range
+                .with_additional_spans(&additional)
+                .map(|range| range.with_universe(universe));
         }
     }
 }
@@ -1607,9 +1667,17 @@ fn build_values(inputs: &SnapshotInputs<'_>) -> Option<BTreeMap<String, Decimal>
         );
     }
     let ema_8 = ema(&close_values, 8)?;
+    let ema_20 = ema(&close_values, 20)?;
     let ema_32 = ema(&close_values, 32)?;
+    let close = *close_values.last()?;
+    values.insert("close".to_owned(), close);
     values.insert("ema_8".to_owned(), ema_8);
+    values.insert("ema_20".to_owned(), ema_20);
     values.insert("ema_32".to_owned(), ema_32);
+    values.insert(
+        "close_ema_20_residual".to_owned(),
+        close.checked_sub(ema_20)?,
+    );
     values.insert("ema_8_32_ratio".to_owned(), ema_8.checked_div(ema_32)?);
     values.insert(
         "ema_8_slope_4".to_owned(),
@@ -1631,6 +1699,21 @@ fn build_values(inputs: &SnapshotInputs<'_>) -> Option<BTreeMap<String, Decimal>
     values.insert(
         "donchian_20_position".to_owned(),
         donchian_position(history, 20)?,
+    );
+    let adverse_window = history.get(history.len().checked_sub(10)?..)?;
+    values.insert(
+        "high_10".to_owned(),
+        adverse_window
+            .iter()
+            .map(|candle| candle.candle().high().value())
+            .max()?,
+    );
+    values.insert(
+        "low_10".to_owned(),
+        adverse_window
+            .iter()
+            .map(|candle| candle.candle().low().value())
+            .min()?,
     );
     values.insert(
         "volume_robust_z_20".to_owned(),
@@ -1673,7 +1756,22 @@ fn build_values(inputs: &SnapshotInputs<'_>) -> Option<BTreeMap<String, Decimal>
     let book = inputs.book?;
     values.insert("spread_bps".to_owned(), spread_bps(bbo)?);
     for bps in [10_u32, 25, 50] {
-        values.insert(format!("depth_{bps}bps"), depth(book, bbo, bps)?);
+        let bid_depth = depth(book, bbo, bps, BookSide::Bid)?;
+        let ask_depth = depth(book, bbo, bps, BookSide::Ask)?;
+        values.insert(format!("bid_depth_{bps}bps"), bid_depth);
+        values.insert(format!("ask_depth_{bps}bps"), ask_depth);
+        values.insert(format!("depth_{bps}bps"), bid_depth.checked_add(ask_depth)?);
+    }
+    let liquidity_factor = values
+        .get("depth_50bps")?
+        .checked_div(values.get("depth_50bps")?.checked_add(Decimal::from(500))?)?;
+    for lookback in [4_usize, 16] {
+        values.insert(
+            format!("liquidity_adjusted_return_{lookback}"),
+            values
+                .get(&format!("return_{lookback}"))?
+                .checked_mul(liquidity_factor)?,
+        );
     }
     values.insert(
         "trade_imbalance_5m".to_owned(),
@@ -2045,7 +2143,13 @@ fn spread_bps(bbo: &Bbo) -> Option<Decimal> {
         .checked_mul(Decimal::from(10_000))
 }
 
-fn depth(book: &BookSnapshot, bbo: &Bbo, bps: u32) -> Option<Decimal> {
+#[derive(Clone, Copy)]
+enum BookSide {
+    Bid,
+    Ask,
+}
+
+fn depth(book: &BookSnapshot, bbo: &Bbo, bps: u32, side: BookSide) -> Option<Decimal> {
     let bid = bbo.bid().price().value();
     let ask = bbo.ask().price().value();
     let mid = bid.checked_add(ask)?.checked_div(Decimal::from(2))?;
@@ -2054,12 +2158,15 @@ fn depth(book: &BookSnapshot, bbo: &Bbo, bps: u32) -> Option<Decimal> {
         .checked_div(Decimal::from(10_000))?;
     let lower = mid.checked_sub(band)?;
     let upper = mid.checked_add(band)?;
-    book.bids()
+    let levels = match side {
+        BookSide::Bid => book.bids(),
+        BookSide::Ask => book.asks(),
+    };
+    levels
         .iter()
-        .chain(book.asks())
-        .filter(|level| match level.price().value() >= mid {
-            true => level.price().value() <= upper,
-            false => level.price().value() >= lower,
+        .filter(|level| match side {
+            BookSide::Bid => level.price().value() >= lower && level.price().value() <= mid,
+            BookSide::Ask => level.price().value() >= mid && level.price().value() <= upper,
         })
         .try_fold(Decimal::ZERO, |total, level| {
             level
@@ -2104,18 +2211,85 @@ fn schema_hash() -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+fn feature_snapshot_hash(snapshot: &FeatureSnapshot) -> String {
+    let mut hasher = Hasher::new_derive_key("trench.feature-snapshot.v1");
+    hasher.update(snapshot.market.as_str().as_bytes());
+    hasher.update(&[0, candle_interval_tag(snapshot.sleeve)]);
+    hasher.update(&snapshot.as_of_time.value().to_be_bytes());
+    hasher.update(snapshot.schema_hash.as_bytes());
+    if let Some(input_range) = &snapshot.input_range {
+        hasher.update(input_range.digest().as_bytes());
+    } else {
+        hasher.update(b"none");
+    }
+    hasher.update(&[
+        u8::from(snapshot.completeness.candles),
+        u8::from(snapshot.completeness.context),
+        u8::from(snapshot.completeness.funding),
+        u8::from(snapshot.completeness.microstructure),
+        u8::from(snapshot.completeness.regime),
+        u8::from(snapshot.completeness.calculations),
+        u8::from(snapshot.completeness.cross_section),
+        unready_reason_tag(snapshot.unready_reason),
+    ]);
+    for (name, value) in &snapshot.values {
+        hasher.update(name.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(value.to_string().as_bytes());
+        hasher.update(&[0]);
+    }
+    if let Some(regime) = snapshot.regime {
+        for value in [
+            regime.ema_8,
+            regime.ema_32,
+            regime.atr_14,
+            regime.adx_14,
+            regime.realized_volatility_20,
+        ] {
+            hasher.update(value.to_string().as_bytes());
+            hasher.update(&[0]);
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+const fn candle_interval_tag(interval: CandleInterval) -> u8 {
+    match interval {
+        CandleInterval::FifteenMinutes => 0,
+        CandleInterval::OneHour => 1,
+    }
+}
+
+const fn unready_reason_tag(reason: Option<FeatureUnreadyReason>) -> u8 {
+    match reason {
+        None => 0,
+        Some(FeatureUnreadyReason::HistoryPruned) => 1,
+        Some(FeatureUnreadyReason::CandleHistory) => 2,
+        Some(FeatureUnreadyReason::ContextHistory) => 3,
+        Some(FeatureUnreadyReason::FundingHistory) => 4,
+        Some(FeatureUnreadyReason::Microstructure) => 5,
+        Some(FeatureUnreadyReason::HourlyRegime) => 6,
+        Some(FeatureUnreadyReason::CalculationFailed) => 7,
+        Some(FeatureUnreadyReason::CrossSection) => 8,
+        Some(FeatureUnreadyReason::InputProvenance) => 9,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
-    use super::{CommonFeatureEngine, FeatureError, FeatureInputKind, FeatureUnreadyReason};
+    use super::{
+        CommonFeatureEngine, FeatureError, FeatureInputKind, FeatureSnapshot, FeatureUnreadyReason,
+    };
     use crate::candle::CandleAggregator;
     use crate::domain::{Market, Price, Quantity, Side, Usdc};
     use crate::event::{
         AssetContext, Bbo, BookLevel, BookSnapshot, Funding, FundingRate, MarketEvent, TimestampNs,
         Trade,
     };
+    use crate::universe::TradeableUniverse;
 
     const FIFTEEN_MINUTES_NS: i128 = 900_000_000_000;
 
@@ -2359,6 +2533,22 @@ mod tests {
         }
     }
 
+    fn tradeable_universe(
+        decision: TimestampNs,
+        markets: impl IntoIterator<Item = Market>,
+    ) -> TradeableUniverse {
+        TradeableUniverse::new(decision, markets).expect("test universe must be valid")
+    }
+
+    fn frozen_snapshots(
+        engine: &CommonFeatureEngine,
+        sleeve: crate::event::CandleInterval,
+        decision: TimestampNs,
+    ) -> Vec<FeatureSnapshot> {
+        let universe = tradeable_universe(decision, engine.markets_at(sleeve, decision));
+        engine.snapshots_at_with_universe(sleeve, decision, Some(&universe))
+    }
+
     fn populate_long_history(
         engine: &mut CommonFeatureEngine,
         aggregator: &mut CandleAggregator,
@@ -2585,7 +2775,11 @@ mod tests {
         );
         let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
         complete(&mut engine, &mut aggregator, decision);
-        let before = engine.snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision);
+        let before = frozen_snapshots(
+            &engine,
+            crate::event::CandleInterval::FifteenMinutes,
+            decision,
+        );
         assert!(
             before.iter().all(|snapshot| snapshot.is_ready()),
             "unexpected unready snapshots: {before:#?}"
@@ -2607,7 +2801,11 @@ mod tests {
         );
         assert_eq!(
             before,
-            engine.snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision)
+            frozen_snapshots(
+                &engine,
+                crate::event::CandleInterval::FifteenMinutes,
+                decision
+            )
         );
     }
 
@@ -2638,8 +2836,11 @@ mod tests {
         let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
         complete(&mut engine, &mut aggregator, decision);
 
-        for snapshot in engine.snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision)
-        {
+        for snapshot in frozen_snapshots(
+            &engine,
+            crate::event::CandleInterval::FifteenMinutes,
+            decision,
+        ) {
             assert!(snapshot.is_ready(), "unexpected snapshot: {snapshot:#?}");
             assert!(
                 snapshot
@@ -2708,7 +2909,11 @@ mod tests {
         let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
         complete(&mut engine, &mut aggregator, decision);
 
-        let snapshots = engine.snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision);
+        let snapshots = frozen_snapshots(
+            &engine,
+            crate::event::CandleInterval::FifteenMinutes,
+            decision,
+        );
         assert_eq!(snapshots.len(), 2);
         for snapshot in snapshots {
             assert!(snapshot.is_ready(), "unexpected snapshot: {snapshot:#?}");
@@ -2729,7 +2934,8 @@ mod tests {
                 "spread_bps",
                 "depth_10bps",
                 "trade_imbalance_15m",
-                "cross_return_96_rank",
+                "cross_return_4_rank",
+                "cross_return_16_rank",
             ] {
                 assert!(
                     snapshot.values().contains_key(name),
@@ -2737,6 +2943,72 @@ mod tests {
                     snapshot.values()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn rules_inputs_require_a_frozen_tradeable_universe_and_retain_exact_contract_fields() {
+        let mut engine = CommonFeatureEngine::new();
+        let mut aggregator = CandleAggregator::new();
+        let markets = [market("BTC"), market("ETH")];
+        for (market, offset) in [
+            (markets[0].clone(), dec!(100)),
+            (markets[1].clone(), dec!(200)),
+        ] {
+            populate(
+                &mut engine,
+                &mut aggregator,
+                market,
+                0,
+                128,
+                offset,
+                dec!(1),
+            );
+        }
+        let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
+        complete(&mut engine, &mut aggregator, decision);
+
+        let without_membership = engine.snapshots_at_with_universe(
+            crate::event::CandleInterval::FifteenMinutes,
+            decision,
+            None,
+        );
+        assert!(
+            without_membership
+                .iter()
+                .all(|snapshot| !snapshot.is_ready())
+        );
+
+        let universe = tradeable_universe(decision, markets.clone());
+        let snapshots = engine.snapshots_at_with_universe(
+            crate::event::CandleInterval::FifteenMinutes,
+            decision,
+            Some(&universe),
+        );
+        for snapshot in snapshots {
+            assert!(snapshot.is_ready(), "unexpected snapshot: {snapshot:#?}");
+            for name in [
+                "close",
+                "ema_20",
+                "close_ema_20_residual",
+                "high_10",
+                "low_10",
+                "bid_depth_10bps",
+                "ask_depth_10bps",
+                "bid_depth_25bps",
+                "ask_depth_25bps",
+                "bid_depth_50bps",
+                "ask_depth_50bps",
+            ] {
+                assert!(snapshot.values().contains_key(name), "missing {name}");
+            }
+            assert_eq!(
+                snapshot
+                    .input_range()
+                    .and_then(|range| range.universe_digest()),
+                Some(universe.digest())
+            );
+            assert!(!snapshot.snapshot_hash().is_empty());
         }
     }
 
@@ -2758,8 +3030,11 @@ mod tests {
         let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
         complete(&mut engine, &mut aggregator, decision);
 
-        for snapshot in engine.snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision)
-        {
+        for snapshot in frozen_snapshots(
+            &engine,
+            crate::event::CandleInterval::FifteenMinutes,
+            decision,
+        ) {
             assert!(
                 snapshot.values()["ema_8_slope_4"] > Decimal::ZERO,
                 "rising EMA must have a positive slope"
@@ -2792,11 +3067,14 @@ mod tests {
         let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
         complete(&mut engine, &mut aggregator, decision);
 
-        let snapshot = engine
-            .snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision)
-            .into_iter()
-            .find(|snapshot| snapshot.market() == &market("BTC"))
-            .expect("BTC snapshot must exist");
+        let snapshot = frozen_snapshots(
+            &engine,
+            crate::event::CandleInterval::FifteenMinutes,
+            decision,
+        )
+        .into_iter()
+        .find(|snapshot| snapshot.market() == &market("BTC"))
+        .expect("BTC snapshot must exist");
         assert_eq!(snapshot.values()["volume_robust_z_20"], Decimal::ONE);
     }
 
@@ -2939,7 +3217,7 @@ mod tests {
     }
 
     #[test]
-    fn equal_cross_sectional_returns_receive_the_same_midrank() {
+    fn equal_tradeable_universe_returns_receive_the_same_midrank() {
         let mut engine = CommonFeatureEngine::new();
         let mut aggregator = CandleAggregator::new();
         for market in [market("ETH"), market("BTC")] {
@@ -2956,18 +3234,17 @@ mod tests {
         let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
         complete(&mut engine, &mut aggregator, decision);
 
-        for snapshot in engine.snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision)
-        {
+        for snapshot in frozen_snapshots(
+            &engine,
+            crate::event::CandleInterval::FifteenMinutes,
+            decision,
+        ) {
             assert_eq!(
                 snapshot.values().get("cross_return_4_rank"),
                 Some(&dec!(0.75))
             );
             assert_eq!(
                 snapshot.values().get("cross_return_16_rank"),
-                Some(&dec!(0.75))
-            );
-            assert_eq!(
-                snapshot.values().get("cross_return_96_rank"),
                 Some(&dec!(0.75))
             );
         }
@@ -3061,8 +3338,11 @@ mod tests {
         let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
         complete(&mut engine, &mut aggregator, decision);
 
-        for snapshot in engine.snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision)
-        {
+        for snapshot in frozen_snapshots(
+            &engine,
+            crate::event::CandleInterval::FifteenMinutes,
+            decision,
+        ) {
             assert!(snapshot.is_ready());
             assert_eq!(snapshot.values()["adx_14"], Decimal::ZERO);
             assert_eq!(snapshot.values()["realized_volatility_64"], Decimal::ZERO);
@@ -3138,11 +3418,14 @@ mod tests {
         let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
         complete(&mut engine, &mut aggregator, decision);
 
-        let before = engine
-            .snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision)
-            .into_iter()
-            .find(|snapshot| snapshot.market() == &market("BTC"))
-            .expect("BTC snapshot must exist");
+        let before = frozen_snapshots(
+            &engine,
+            crate::event::CandleInterval::FifteenMinutes,
+            decision,
+        )
+        .into_iter()
+        .find(|snapshot| snapshot.market() == &market("BTC"))
+        .expect("BTC snapshot must exist");
         let range = before
             .input_range()
             .expect("ready snapshot must retain provenance");
@@ -3176,11 +3459,14 @@ mod tests {
             &mut aggregator,
             timestamp(129 * FIFTEEN_MINUTES_NS),
         );
-        let after = engine
-            .snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision)
-            .into_iter()
-            .find(|snapshot| snapshot.market() == &market("BTC"))
-            .expect("BTC snapshot must still exist");
+        let after = frozen_snapshots(
+            &engine,
+            crate::event::CandleInterval::FifteenMinutes,
+            decision,
+        )
+        .into_iter()
+        .find(|snapshot| snapshot.market() == &market("BTC"))
+        .expect("BTC snapshot must still exist");
         assert_eq!(after.input_range(), before.input_range());
     }
 
@@ -3202,7 +3488,7 @@ mod tests {
         let decision = timestamp(388 * FIFTEEN_MINUTES_NS);
         complete(&mut engine, &mut aggregator, decision);
 
-        for snapshot in engine.snapshots_at(crate::event::CandleInterval::OneHour, decision) {
+        for snapshot in frozen_snapshots(&engine, crate::event::CandleInterval::OneHour, decision) {
             let candle_kinds = snapshot
                 .input_range()
                 .expect("ready snapshot must retain provenance")
@@ -3255,8 +3541,16 @@ mod tests {
         complete(&mut replay_engine, &mut replay_aggregator, decision);
 
         assert_eq!(
-            retained_engine.snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision),
-            replay_engine.snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision)
+            frozen_snapshots(
+                &retained_engine,
+                crate::event::CandleInterval::FifteenMinutes,
+                decision
+            ),
+            frozen_snapshots(
+                &replay_engine,
+                crate::event::CandleInterval::FifteenMinutes,
+                decision
+            )
         );
         assert!(
             retained_engine
