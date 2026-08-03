@@ -145,6 +145,12 @@ impl Quantity {
 pub struct Usdc(Decimal);
 
 impl Usdc {
+    /// Returns an exact zero synthetic-USDC amount.
+    #[must_use]
+    pub const fn zero() -> Self {
+        Self(Decimal::ZERO)
+    }
+
     /// Creates a nonnegative synthetic-USDC amount.
     ///
     /// # Errors
