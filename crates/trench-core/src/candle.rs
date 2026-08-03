@@ -1,6 +1,6 @@
 //! Deterministic completed candles derived from normalized public trades.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rust_decimal::Decimal;
 use thiserror::Error;
@@ -16,7 +16,14 @@ use crate::event::{
 /// finalized interval is rejected as [`CandleError::FinalizedReplayOutsideHorizon`].
 pub const FINALIZED_TRADE_ID_HORIZON: usize = 4_096;
 
-const MAX_PENDING_TRADES: usize = FINALIZED_TRADE_ID_HORIZON;
+/// Maximum concurrently pending markets in one deterministic aggregator.
+pub const MAX_PENDING_MARKETS: usize = 128;
+/// Maximum unfinalized normalized trades retained for any one market.
+///
+/// The bound covers the longest open one-hour bucket. It is deliberately
+/// provisioned independently per market so a deep market cannot consume the
+/// entire universe's deduplication budget before the watermark advances.
+pub const MAX_PENDING_TRADES_PER_MARKET: usize = 16_384;
 
 /// One immutable completed candle with its exact normalized-trade input range.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,10 +132,18 @@ pub enum CandleError {
         /// Receipt time supplied by the conflicting replay.
         received_at: TimestampNs,
     },
-    /// The bounded pending-trade buffer is full before a watermark advances.
-    #[error("pending trade capacity {limit} reached before finalization")]
+    /// One market exhausted its explicitly provisioned pending-trade buffer.
+    #[error("pending trade capacity {limit} reached for market {market:?} before finalization")]
     PendingTradeCapacity {
-        /// Maximum unique pending trades across all buckets.
+        /// Market whose independent capacity was exhausted.
+        market: Market,
+        /// Maximum unique pending trades for that market across both sleeves.
+        limit: usize,
+    },
+    /// A new market would exceed the finite pending-market capacity.
+    #[error("pending market capacity {limit} reached before finalization")]
+    PendingMarketCapacity {
+        /// Maximum concurrently pending markets.
         limit: usize,
     },
     /// A replay targeted a finalized interval after its bounded identity horizon expired.
@@ -205,6 +220,128 @@ struct BucketKey {
     open_time: TimestampNs,
 }
 
+/// Running exact aggregate for one nonempty candle bucket.
+///
+/// Only the two order-defining trades remain as full records. Every other
+/// trade is represented by the bounded global identity map until its one-hour
+/// bucket finalizes, avoiding a second full copy in each sleeve bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingCandle {
+    first: TradePoint,
+    last: TradePoint,
+    high: Price,
+    low: Price,
+    source_available_at: TimestampNs,
+    volume: Decimal,
+    buy_notional: Decimal,
+    sell_notional: Decimal,
+    trade_count: u64,
+    arithmetic_error: Option<&'static str>,
+}
+
+impl PendingCandle {
+    fn from_trade(trade: &TradePoint) -> Self {
+        let notional = trade.price.value().checked_mul(trade.quantity.value());
+        let (buy_notional, sell_notional) = match (trade.side, notional) {
+            (Side::Buy, Some(notional)) => (notional, Decimal::ZERO),
+            (Side::Sell, Some(notional)) => (Decimal::ZERO, notional),
+            (_, None) => (Decimal::ZERO, Decimal::ZERO),
+        };
+        Self {
+            first: trade.clone(),
+            last: trade.clone(),
+            high: trade.price,
+            low: trade.price,
+            source_available_at: trade.received_at,
+            volume: trade.quantity.value(),
+            buy_notional,
+            sell_notional,
+            trade_count: 1,
+            arithmetic_error: notional.is_none().then_some("candle trade notional"),
+        }
+    }
+
+    fn with_trade(&self, trade: &TradePoint) -> Self {
+        let mut next = Self {
+            first: self.first.clone().min(trade.clone()),
+            last: self.last.clone().max(trade.clone()),
+            high: self.high.max(trade.price),
+            low: self.low.min(trade.price),
+            source_available_at: self.source_available_at.max(trade.received_at),
+            volume: self.volume,
+            buy_notional: self.buy_notional,
+            sell_notional: self.sell_notional,
+            trade_count: self.trade_count,
+            arithmetic_error: self.arithmetic_error,
+        };
+        if next.arithmetic_error.is_some() {
+            return next;
+        }
+        let Some(notional) = trade.price.value().checked_mul(trade.quantity.value()) else {
+            next.arithmetic_error = Some("candle trade notional");
+            return next;
+        };
+        let Some(volume) = next.volume.checked_add(trade.quantity.value()) else {
+            next.arithmetic_error = Some("candle volume");
+            return next;
+        };
+        let (buy_notional, sell_notional) = match trade.side {
+            Side::Buy => (
+                next.buy_notional.checked_add(notional),
+                Some(next.sell_notional),
+            ),
+            Side::Sell => (
+                Some(next.buy_notional),
+                next.sell_notional.checked_add(notional),
+            ),
+        };
+        let Some(buy_notional) = buy_notional else {
+            next.arithmetic_error = Some("candle buy notional");
+            return next;
+        };
+        let Some(sell_notional) = sell_notional else {
+            next.arithmetic_error = Some("candle sell notional");
+            return next;
+        };
+        let Some(trade_count) = next.trade_count.checked_add(1) else {
+            next.arithmetic_error = Some("candle trade count");
+            return next;
+        };
+        next.volume = volume;
+        next.buy_notional = buy_notional;
+        next.sell_notional = sell_notional;
+        next.trade_count = trade_count;
+        next
+    }
+
+    fn candle(&self, key: &BucketKey) -> Result<Candle, CandleError> {
+        if let Some(operation) = self.arithmetic_error {
+            return Err(CandleError::Arithmetic { operation });
+        }
+        let candle = CompletedCandle::new(
+            key.interval,
+            key.open_time,
+            self.first.price,
+            self.high,
+            self.low,
+            self.last.price,
+            Quantity::new(self.volume).map_err(EventError::from)?,
+            self.trade_count,
+        )?;
+        Ok(Candle {
+            market: key.market.clone(),
+            candle,
+            first_event_id: self.first.event_id.clone(),
+            last_event_id: self.last.event_id.clone(),
+            first_event_time: self.first.event_time,
+            last_event_time: self.last.event_time,
+            source_available_at: self.source_available_at,
+            buy_notional: self.buy_notional,
+            sell_notional: self.sell_notional,
+        })
+    }
+}
+
 /// Stateful deterministic trade-to-candle aggregation for the two supported sleeves.
 ///
 /// Pending identities remain idempotent until both candle sleeves close. Fully
@@ -214,9 +351,11 @@ struct BucketKey {
 #[derive(Debug, Default)]
 pub struct CandleAggregator {
     seen: BTreeMap<EventId, TradePoint>,
+    pending_counts: BTreeMap<Market, usize>,
     finalized: BTreeMap<EventId, TradePoint>,
     finalized_order: BTreeMap<(TimestampNs, TimestampNs, EventId), EventId>,
-    pending: BTreeMap<BucketKey, Vec<TradePoint>>,
+    pending: BTreeMap<BucketKey, PendingCandle>,
+    hourly_trade_ids: BTreeMap<BucketKey, BTreeSet<EventId>>,
     watermark: Option<TimestampNs>,
 }
 
@@ -259,9 +398,20 @@ impl CandleAggregator {
             return duplicate_result(existing, &point);
         }
 
-        if self.seen.len() == MAX_PENDING_TRADES {
+        let pending_for_market = self
+            .pending_counts
+            .get(&point.market)
+            .copied()
+            .unwrap_or_default();
+        if pending_for_market == 0 && self.pending_counts.len() == MAX_PENDING_MARKETS {
+            return Err(CandleError::PendingMarketCapacity {
+                limit: MAX_PENDING_MARKETS,
+            });
+        }
+        if pending_for_market == MAX_PENDING_TRADES_PER_MARKET {
             return Err(CandleError::PendingTradeCapacity {
-                limit: MAX_PENDING_TRADES,
+                market: point.market.clone(),
+                limit: MAX_PENDING_TRADES_PER_MARKET,
             });
         }
 
@@ -294,10 +444,27 @@ impl CandleAggregator {
             }
         }
 
+        let accumulated = keys
+            .iter()
+            .map(|key| match self.pending.get(key) {
+                Some(existing) => existing.with_trade(&point),
+                None => PendingCandle::from_trade(&point),
+            })
+            .collect::<Vec<_>>();
         self.seen.insert(point.event_id.clone(), point.clone());
-        keys.into_iter().for_each(|key| {
-            self.pending.entry(key).or_default().push(point.clone());
-        });
+        self.pending_counts
+            .entry(point.market.clone())
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+        for (key, candle) in keys.into_iter().zip(accumulated) {
+            if key.interval == CandleInterval::OneHour {
+                self.hourly_trade_ids
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(point.event_id.clone());
+            }
+            self.pending.insert(key, candle);
+        }
         Ok(())
     }
 
@@ -336,34 +503,46 @@ impl CandleAggregator {
         let candles = complete
             .iter()
             .map(|key| {
-                let trades = self.pending.get(key).ok_or(CandleError::Invariant {
+                let pending = self.pending.get(key).ok_or(CandleError::Invariant {
                     reason: "selected pending bucket must remain present",
                 })?;
-                aggregate(key, trades)
+                pending.candle(key)
             })
             .collect::<Result<Vec<_>, _>>()?;
         for key in complete {
             self.pending.remove(&key).ok_or(CandleError::Invariant {
                 reason: "selected pending bucket must remain present",
             })?;
+            if key.interval == CandleInterval::OneHour {
+                let trade_ids =
+                    self.hourly_trade_ids
+                        .remove(&key)
+                        .ok_or(CandleError::Invariant {
+                            reason: "selected hourly bucket must retain its trade identities",
+                        })?;
+                for event_id in trade_ids {
+                    let trade = self.seen.remove(&event_id).ok_or(CandleError::Invariant {
+                        reason: "pending hourly trade identity must remain present",
+                    })?;
+                    let remove_market = {
+                        let count = self.pending_counts.get_mut(&trade.market).ok_or(
+                            CandleError::Invariant {
+                                reason: "pending trade market count must remain present",
+                            },
+                        )?;
+                        *count = count.checked_sub(1).ok_or(CandleError::Invariant {
+                            reason: "pending trade market count must not underflow",
+                        })?;
+                        *count == 0
+                    };
+                    if remove_market {
+                        self.pending_counts.remove(&trade.market);
+                    }
+                    self.record_finalized(trade);
+                }
+            }
         }
         self.watermark = Some(watermark);
-        let finalized = self
-            .seen
-            .values()
-            .filter(|trade| {
-                bucket_open(trade.event_time, CandleInterval::OneHour).is_ok_and(|open_time| {
-                    open_time
-                        .checked_add(CandleInterval::OneHour.duration())
-                        .is_ok_and(|close| close <= watermark)
-                })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        for trade in finalized {
-            self.seen.remove(&trade.event_id);
-            self.record_finalized(trade);
-        }
         Ok(candles)
     }
 
@@ -399,90 +578,6 @@ fn duplicate_result(existing: &TradePoint, incoming: &TradePoint) -> Result<(), 
 fn bucket_open(time: TimestampNs, interval: CandleInterval) -> Result<TimestampNs, CandleError> {
     let duration = interval.duration().value();
     TimestampNs::new(i128::from(time.value() / duration * duration)).map_err(CandleError::from)
-}
-
-fn aggregate(key: &BucketKey, trades: &[TradePoint]) -> Result<Candle, CandleError> {
-    let mut trades = trades.to_vec();
-    trades.sort();
-    let first = trades.first().ok_or(CandleError::Invariant {
-        reason: "pending candle must have at least one trade",
-    })?;
-    let last = trades.last().ok_or(CandleError::Invariant {
-        reason: "pending candle must have at least one trade",
-    })?;
-    let source_available_at =
-        trades
-            .iter()
-            .map(|trade| trade.received_at)
-            .max()
-            .ok_or(CandleError::Invariant {
-                reason: "pending candle must have at least one trade",
-            })?;
-    let mut high = first.price;
-    let mut low = first.price;
-    let mut volume = Decimal::ZERO;
-    let mut buy_notional = Decimal::ZERO;
-    let mut sell_notional = Decimal::ZERO;
-
-    for trade in &trades {
-        high = high.max(trade.price);
-        low = low.min(trade.price);
-        volume = volume
-            .checked_add(trade.quantity.value())
-            .ok_or(CandleError::Arithmetic {
-                operation: "candle volume",
-            })?;
-        let notional = trade
-            .price
-            .value()
-            .checked_mul(trade.quantity.value())
-            .ok_or(CandleError::Arithmetic {
-                operation: "candle trade notional",
-            })?;
-        match trade.side {
-            Side::Buy => {
-                buy_notional =
-                    buy_notional
-                        .checked_add(notional)
-                        .ok_or(CandleError::Arithmetic {
-                            operation: "candle buy notional",
-                        })?;
-            }
-            Side::Sell => {
-                sell_notional =
-                    sell_notional
-                        .checked_add(notional)
-                        .ok_or(CandleError::Arithmetic {
-                            operation: "candle sell notional",
-                        })?;
-            }
-        }
-    }
-    let volume = Quantity::new(volume).map_err(EventError::from)?;
-    let trade_count = u64::try_from(trades.len()).map_err(|_| CandleError::Arithmetic {
-        operation: "candle trade count",
-    })?;
-    let candle = CompletedCandle::new(
-        key.interval,
-        key.open_time,
-        first.price,
-        high,
-        low,
-        last.price,
-        volume,
-        trade_count,
-    )?;
-    Ok(Candle {
-        market: key.market.clone(),
-        candle,
-        first_event_id: first.event_id.clone(),
-        last_event_id: last.event_id.clone(),
-        first_event_time: first.event_time,
-        last_event_time: last.event_time,
-        source_available_at,
-        buy_notional,
-        sell_notional,
-    })
 }
 
 #[cfg(test)]
@@ -792,17 +887,62 @@ mod tests {
     #[test]
     fn refuses_new_trades_when_the_unfinalized_buffer_reaches_its_capacity() {
         let mut aggregator = CandleAggregator::new();
-        for trade_id in 0..super::MAX_PENDING_TRADES {
+        for trade_id in 0..super::MAX_PENDING_TRADES_PER_MARKET {
             aggregator
                 .ingest(&trade(1, trade_id as u64 + 1, dec!(100)))
                 .expect("trade within the pending capacity must be accepted");
         }
 
         assert_eq!(
-            aggregator.ingest(&trade(1, super::MAX_PENDING_TRADES as u64 + 1, dec!(100))),
+            aggregator.ingest(&trade(
+                1,
+                super::MAX_PENDING_TRADES_PER_MARKET as u64 + 1,
+                dec!(100),
+            )),
             Err(CandleError::PendingTradeCapacity {
-                limit: super::MAX_PENDING_TRADES,
+                market: Market::new("BTC").expect("test market must be valid"),
+                limit: super::MAX_PENDING_TRADES_PER_MARKET,
             })
+        );
+    }
+
+    #[test]
+    fn twenty_deep_markets_do_not_share_a_single_pending_trade_budget() {
+        let mut aggregator = CandleAggregator::new();
+        let per_market = super::MAX_PENDING_TRADES_PER_MARKET.min(4_097);
+
+        for market_index in 0..20_u64 {
+            let market =
+                Market::new(format!("M{market_index}")).expect("test market must be valid");
+            for trade_id in 0..per_market {
+                let event = MarketEvent::trade(
+                    timestamp(1),
+                    timestamp(1),
+                    market.clone(),
+                    Trade::new(
+                        trade_id as u64 + 1,
+                        Side::Buy,
+                        Price::new(dec!(100)).expect("test price must be valid"),
+                        Quantity::new(dec!(1)).expect("test quantity must be valid"),
+                    )
+                    .expect("test trade must be valid"),
+                )
+                .expect("test event must be valid");
+                aggregator
+                    .ingest(&event)
+                    .expect("each market receives its independently provisioned pending budget");
+            }
+        }
+
+        let candles = aggregator
+            .complete_through(timestamp(900_000_000_000))
+            .expect("watermark must be valid");
+        assert_eq!(
+            candles
+                .iter()
+                .filter(|candle| candle.candle().interval() == CandleInterval::FifteenMinutes)
+                .count(),
+            20
         );
     }
 
