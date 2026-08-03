@@ -16,9 +16,9 @@ const OFFICIAL_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
 const PRODUCTION_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PRODUCTION_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(debug_assertions)]
-const TEST_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
+const TEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(debug_assertions)]
-const TEST_REQUEST_TIMEOUT: Duration = Duration::from_millis(100);
+const TEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const USER_AGENT: &str = concat!(
     "satteri-trench-hyperliquid/",
     env!("CARGO_PKG_VERSION"),
@@ -138,6 +138,13 @@ impl CandleInterval {
         match self {
             Self::FifteenMinutes => "15m",
             Self::OneHour => "1h",
+        }
+    }
+
+    pub(crate) const fn duration_ms(self) -> i64 {
+        match self {
+            Self::FifteenMinutes => 900_000,
+            Self::OneHour => 3_600_000,
         }
     }
 }

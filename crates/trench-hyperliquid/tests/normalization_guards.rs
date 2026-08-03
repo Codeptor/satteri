@@ -97,11 +97,18 @@ async fn l2_result(body: Value) -> Result<L2Book, InfoError> {
 }
 
 async fn candles_result(body: Value) -> Result<Vec<Candle>, InfoError> {
+    candles_result_for_interval(body, CandleInterval::FifteenMinutes).await
+}
+
+async fn candles_result_for_interval(
+    body: Value,
+    interval: CandleInterval,
+) -> Result<Vec<Candle>, InfoError> {
     let (client, _server) = json_client(body).await;
     client
         .candle_snapshot(
             &Market::new("ETH").expect("valid market"),
-            CandleInterval::FifteenMinutes,
+            interval,
             TimeRange::new(START_MS, END_MS).expect("valid range"),
         )
         .await
@@ -462,7 +469,7 @@ async fn candles_enforce_requested_identity_time_price_volume_and_count() {
             "/T",
             json!(START_MS - 1),
             "candleSnapshot.T",
-            "must not precede the candle open",
+            "must equal the declared interval close",
         ),
         (
             "/o",
@@ -525,9 +532,115 @@ async fn candles_enforce_requested_identity_time_price_volume_and_count() {
     let mut zero_volume = candle_fixture();
     zero_volume["v"] = json!("0");
     assert_eq!(
-        candles_result(json!([zero_volume]))
+        candles_result(json!([zero_volume])).await,
+        Err(InfoError::InvalidResponse {
+            field: "candleSnapshot.activity",
+            requirement: "volume must be zero if and only if trade count is zero",
+        })
+    );
+}
+
+#[tokio::test]
+async fn candles_reject_a_one_hour_close_with_the_wrong_duration() {
+    let mut candle = candle_fixture();
+    candle["i"] = json!("1h");
+
+    assert_eq!(
+        candles_result_for_interval(json!([candle]), CandleInterval::OneHour).await,
+        Err(InfoError::InvalidResponse {
+            field: "candleSnapshot.T",
+            requirement: "must equal the declared interval close",
+        })
+    );
+}
+
+#[tokio::test]
+async fn candles_reject_a_fifteen_minute_close_that_is_one_millisecond_late() {
+    let mut candle = candle_fixture();
+    candle["T"] = json!(END_MS);
+
+    assert_eq!(
+        candles_result(json!([candle])).await,
+        Err(InfoError::InvalidResponse {
+            field: "candleSnapshot.T",
+            requirement: "must equal the declared interval close",
+        })
+    );
+}
+
+#[tokio::test]
+async fn candles_accept_an_exact_one_hour_close_that_overlaps_the_requested_range() {
+    let mut candle = candle_fixture();
+    candle["i"] = json!("1h");
+    candle["T"] = json!(START_MS + 3_600_000 - 1);
+
+    assert_eq!(
+        candles_result_for_interval(json!([candle]), CandleInterval::OneHour)
             .await
-            .expect("zero volume is valid")
+            .expect("one-hour candle must use its declared close")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn candles_reject_declared_close_time_overflow() {
+    let mut candle = candle_fixture();
+    candle["t"] = json!(i64::MAX);
+    candle["T"] = json!(i64::MAX);
+
+    assert_eq!(
+        candles_result(json!([candle])).await,
+        Err(InfoError::InvalidResponse {
+            field: "candleSnapshot.T",
+            requirement: "declared interval close must not overflow",
+        })
+    );
+}
+
+#[tokio::test]
+async fn candles_reject_positive_volume_without_trades() {
+    let mut candle = candle_fixture();
+    candle["n"] = json!(0);
+
+    assert_eq!(
+        candles_result(json!([candle])).await,
+        Err(InfoError::InvalidResponse {
+            field: "candleSnapshot.activity",
+            requirement: "volume must be zero if and only if trade count is zero",
+        })
+    );
+}
+
+#[tokio::test]
+async fn zero_trade_candles_must_have_flat_ohlc() {
+    let mut candle = candle_fixture();
+    candle["v"] = json!("0");
+    candle["n"] = json!(0);
+
+    assert_eq!(
+        candles_result(json!([candle])).await,
+        Err(InfoError::InvalidResponse {
+            field: "candleSnapshot.ohlc",
+            requirement: "zero-trade candles must be flat",
+        })
+    );
+}
+
+#[tokio::test]
+async fn flat_zero_trade_candles_are_valid() {
+    let mut candle = candle_fixture();
+    candle["o"] = json!("3100");
+    candle["c"] = json!("3100");
+    candle["h"] = json!("3100");
+    candle["l"] = json!("3100");
+    candle["v"] = json!("0");
+    candle["n"] = json!(0);
+
+    assert_eq!(
+        candles_result(json!([candle]))
+            .await
+            .expect("flat zero-trade candle must be valid")
             .len(),
         1
     );

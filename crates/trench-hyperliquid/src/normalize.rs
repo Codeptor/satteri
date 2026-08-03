@@ -616,10 +616,20 @@ fn normalize_candle(
     }
     require_positive_time(raw.t, "candleSnapshot.t")?;
     require_positive_time(raw.close_time, "candleSnapshot.T")?;
-    if raw.close_time < raw.t {
+    let expected_close_time = raw
+        .t
+        .checked_add(interval.duration_ms())
+        .and_then(|end_time| end_time.checked_sub(1))
+        .ok_or_else(|| {
+            invalid_response(
+                "candleSnapshot.T",
+                "declared interval close must not overflow",
+            )
+        })?;
+    if raw.close_time != expected_close_time {
         return Err(invalid_response(
             "candleSnapshot.T",
-            "must not precede the candle open",
+            "must equal the declared interval close",
         ));
     }
     if raw.t > range.end_ms() || raw.close_time < range.start_ms() {
@@ -641,6 +651,21 @@ fn normalize_candle(
     }
     let trade_count = u64::try_from(raw.n)
         .map_err(|_| invalid_response("candleSnapshot.n", "must be a nonnegative integer"))?;
+    let volume = parse_quantity(&raw.v, "candleSnapshot.v")?;
+    let has_volume = volume.value() != Decimal::ZERO;
+    let has_trades = trade_count > 0;
+    if has_volume != has_trades {
+        return Err(invalid_response(
+            "candleSnapshot.activity",
+            "volume must be zero if and only if trade count is zero",
+        ));
+    }
+    if !has_trades && (open != close || open != high || open != low) {
+        return Err(invalid_response(
+            "candleSnapshot.ohlc",
+            "zero-trade candles must be flat",
+        ));
+    }
     Ok(Candle {
         open_time_ms: raw.t,
         close_time_ms: raw.close_time,
@@ -650,7 +675,7 @@ fn normalize_candle(
         close,
         high,
         low,
-        volume: parse_quantity(&raw.v, "candleSnapshot.v")?,
+        volume,
         trade_count,
     })
 }

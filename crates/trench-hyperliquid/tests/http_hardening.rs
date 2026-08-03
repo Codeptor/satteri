@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use trench_core::domain::Market;
@@ -203,14 +203,19 @@ async fn fixed_request_deadline_is_enforced() -> Result<(), Box<dyn Error>> {
         .and(path("/info"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_delay(Duration::from_millis(300))
+                .set_delay(Duration::from_secs(2))
                 .set_body_json(json!({"BTC": "1"})),
         )
         .expect(1)
         .mount(&server)
         .await;
 
+    let started = Instant::now();
     assert_eq!(client.all_mids().await, Err(InfoError::Timeout));
+    assert!(
+        started.elapsed() >= Duration::from_millis(750),
+        "loopback deadline elapsed too quickly"
+    );
     Ok(())
 }
 
