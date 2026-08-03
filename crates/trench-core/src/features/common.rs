@@ -53,7 +53,11 @@ const POINT_EVENT_HISTORY: usize = 64;
 // newly completed bars. Thirty-day strategy state lives in canonical boundary
 // samples below, never in an event-count window vulnerable to feed bursts.
 const SOURCE_EVENT_HISTORY: usize = 512;
+// Raw trades are retained only for bounded identity replay. Feature windows
+// use receipt-aware aggregate buckets below, so deep markets cannot make a
+// valid decision depend on this event-count cache.
 const TRADE_EVENT_HISTORY: usize = 128;
+const TRADE_AGGREGATE_HISTORY: usize = 1_024;
 /// Number of source identities retained after their active feature history is pruned.
 ///
 /// Exact replays remain idempotent within this fixed-capacity horizon. Once it
@@ -117,6 +121,7 @@ pub struct InputEventSpan {
     last_event_time: TimestampNs,
     available_at: TimestampNs,
     sampled_at: Option<TimestampNs>,
+    aggregate_digest: Option<String>,
 }
 
 impl InputEventSpan {
@@ -165,6 +170,7 @@ impl InputEventSpan {
             last_event_time: event.event_time(),
             available_at: event.received_at(),
             sampled_at: None,
+            aggregate_digest: None,
         }
     }
 
@@ -177,6 +183,7 @@ impl InputEventSpan {
             last_event_time: candle.last_event_time(),
             available_at: candle.source_available_at(),
             sampled_at: None,
+            aggregate_digest: None,
         }
     }
 
@@ -184,6 +191,19 @@ impl InputEventSpan {
         Self {
             sampled_at: Some(sampled_at),
             ..Self::event(kind, event)
+        }
+    }
+
+    fn aggregate(kind: FeatureInputKind, aggregate: &AggressiveTradeAggregate) -> Self {
+        Self {
+            kind,
+            first_event_id: aggregate.first_event_id.clone(),
+            last_event_id: aggregate.last_event_id.clone(),
+            first_event_time: aggregate.first_event_time,
+            last_event_time: aggregate.last_event_time,
+            available_at: aggregate.available_at,
+            sampled_at: None,
+            aggregate_digest: Some(aggregate.digest()),
         }
     }
 }
@@ -299,6 +319,15 @@ fn input_digest(spans: &[InputEventSpan], universe_digest: Option<&str>) -> Stri
             Some(sampled_at) => {
                 hasher.update(&[1]);
                 hasher.update(&sampled_at.value().to_be_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+        match &span.aggregate_digest {
+            Some(digest) => {
+                hasher.update(&[1]);
+                hasher.update(digest.as_bytes());
             }
             None => {
                 hasher.update(&[0]);
@@ -765,6 +794,12 @@ pub enum FeatureError {
     /// A completed candle contained invalid timestamp arithmetic.
     #[error(transparent)]
     Event(#[from] crate::event::EventError),
+    /// Checked decimal arithmetic failed while aggregating bounded trade inputs.
+    #[error("checked decimal arithmetic failed while calculating {operation}")]
+    Arithmetic {
+        /// Failed calculation.
+        operation: &'static str,
+    },
 }
 
 type EventKey = (TimestampNs, TimestampNs, EventId);
@@ -772,6 +807,154 @@ type EventHistory = BTreeMap<EventKey, MarketEvent>;
 type CompletedCandleId = (Market, CandleInterval, TimestampNs);
 type CompletedCandleOrder = (TimestampNs, Market, CandleInterval);
 type BoundarySourceSamples = BTreeMap<(Market, CandleInterval), BTreeMap<TimestampNs, MarketEvent>>;
+type TradeAggregateKey = (TimestampNs, TimestampNs);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AggressiveTradeAggregate {
+    first_event_id: EventId,
+    last_event_id: EventId,
+    first_event_time: TimestampNs,
+    last_event_time: TimestampNs,
+    first_received_at: TimestampNs,
+    last_received_at: TimestampNs,
+    available_at: TimestampNs,
+    buy_notional: Decimal,
+    sell_notional: Decimal,
+}
+
+impl AggressiveTradeAggregate {
+    fn from_trade(event: &MarketEvent) -> Result<Self, FeatureError> {
+        let MarketEventKind::Trade(trade) = event.kind() else {
+            return Err(FeatureError::Arithmetic {
+                operation: "trade aggregate input kind",
+            });
+        };
+        let notional = trade
+            .price()
+            .value()
+            .checked_mul(trade.quantity().value())
+            .ok_or(FeatureError::Arithmetic {
+                operation: "trade aggregate notional",
+            })?;
+        let (buy_notional, sell_notional) = match trade.side() {
+            crate::domain::Side::Buy => (notional, Decimal::ZERO),
+            crate::domain::Side::Sell => (Decimal::ZERO, notional),
+        };
+        Ok(Self {
+            first_event_id: event.event_id().clone(),
+            last_event_id: event.event_id().clone(),
+            first_event_time: event.event_time(),
+            last_event_time: event.event_time(),
+            first_received_at: event.received_at(),
+            last_received_at: event.received_at(),
+            available_at: event.received_at(),
+            buy_notional,
+            sell_notional,
+        })
+    }
+
+    fn add_trade(&mut self, event: &MarketEvent) -> Result<(), FeatureError> {
+        let MarketEventKind::Trade(trade) = event.kind() else {
+            return Err(FeatureError::Arithmetic {
+                operation: "trade aggregate input kind",
+            });
+        };
+        let notional = trade
+            .price()
+            .value()
+            .checked_mul(trade.quantity().value())
+            .ok_or(FeatureError::Arithmetic {
+                operation: "trade aggregate notional",
+            })?;
+        let candidate_key = (event.event_time(), event.received_at(), event.event_id());
+        let first_key = (
+            self.first_event_time,
+            self.first_received_at,
+            &self.first_event_id,
+        );
+        if candidate_key < first_key {
+            self.first_event_id = event.event_id().clone();
+            self.first_event_time = event.event_time();
+            self.first_received_at = event.received_at();
+        }
+        let last_key = (
+            self.last_event_time,
+            self.last_received_at,
+            &self.last_event_id,
+        );
+        if candidate_key > last_key {
+            self.last_event_id = event.event_id().clone();
+            self.last_event_time = event.event_time();
+            self.last_received_at = event.received_at();
+        }
+        self.available_at = self.available_at.max(event.received_at());
+        match trade.side() {
+            crate::domain::Side::Buy => {
+                self.buy_notional =
+                    self.buy_notional
+                        .checked_add(notional)
+                        .ok_or(FeatureError::Arithmetic {
+                            operation: "trade aggregate buy notional",
+                        })?;
+            }
+            crate::domain::Side::Sell => {
+                self.sell_notional =
+                    self.sell_notional
+                        .checked_add(notional)
+                        .ok_or(FeatureError::Arithmetic {
+                            operation: "trade aggregate sell notional",
+                        })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn digest(&self) -> String {
+        let mut hasher = Hasher::new_derive_key("trench.trade-window-aggregate.v1");
+        for (event_time, received_at, event_id) in [
+            (
+                self.first_event_time,
+                self.first_received_at,
+                &self.first_event_id,
+            ),
+            (
+                self.last_event_time,
+                self.last_received_at,
+                &self.last_event_id,
+            ),
+        ] {
+            hasher.update(&event_time.value().to_be_bytes());
+            hasher.update(&received_at.value().to_be_bytes());
+            hasher.update(event_id.as_str().as_bytes());
+            hasher.update(&[0]);
+        }
+        hasher.update(&self.available_at.value().to_be_bytes());
+        hasher.update(self.buy_notional.to_string().as_bytes());
+        hasher.update(&[0]);
+        hasher.update(self.sell_notional.to_string().as_bytes());
+        hasher.finalize().to_hex().to_string()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AggressiveTradeWindow {
+    buy_notional: Decimal,
+    sell_notional: Decimal,
+    imbalance: Decimal,
+    spans: Vec<InputEventSpan>,
+}
+
+impl AggressiveTradeWindow {
+    const fn imbalance(&self) -> Decimal {
+        self.imbalance
+    }
+
+    fn calculate_imbalance(&self) -> Option<Decimal> {
+        self.buy_notional
+            .checked_sub(self.sell_notional)?
+            .checked_div(self.buy_notional.checked_add(self.sell_notional)?)
+    }
+}
 
 /// Bounded, source-specific point-in-time histories for one market.
 #[derive(Debug, Default)]
@@ -782,7 +965,6 @@ struct MarketEventHistory {
     books: EventHistory,
     trades: EventHistory,
     other: EventHistory,
-    latest_pruned_trade_time: Option<TimestampNs>,
 }
 
 impl MarketEventHistory {
@@ -800,9 +982,7 @@ impl MarketEventHistory {
     }
 
     fn insert(&mut self, event: MarketEvent) -> Vec<MarketEvent> {
-        let is_trade = matches!(event.kind(), MarketEventKind::Trade(_));
         let mut pruned = Vec::new();
-        let mut pruned_trade_time = None;
         {
             let limit = source_limit(event.kind());
             let source = self.source_mut(event.kind());
@@ -816,32 +996,11 @@ impl MarketEventHistory {
             );
             while source.len() > limit {
                 if let Some((_, discarded)) = source.pop_first() {
-                    if is_trade {
-                        pruned_trade_time = Some(
-                            pruned_trade_time
-                                .map_or(discarded.event_time(), |previous: TimestampNs| {
-                                    previous.max(discarded.event_time())
-                                }),
-                        );
-                    }
                     pruned.push(discarded);
                 }
             }
         }
-        if let Some(pruned_trade_time) = pruned_trade_time {
-            self.latest_pruned_trade_time = Some(
-                self.latest_pruned_trade_time
-                    .map_or(pruned_trade_time, |previous| {
-                        previous.max(pruned_trade_time)
-                    }),
-            );
-        }
         pruned
-    }
-
-    fn has_pruned_trade_after(&self, start: i64) -> bool {
-        self.latest_pruned_trade_time
-            .is_some_and(|time| time.value() > start)
     }
 
     fn source(&self, kind: &MarketEventKind) -> &EventHistory {
@@ -913,6 +1072,9 @@ pub struct CommonFeatureEngine {
     finalized_candle_order: BTreeMap<CompletedCandleOrder, CompletedCandleId>,
     markets: BTreeSet<Market>,
     events: BTreeMap<Market, MarketEventHistory>,
+    trade_aggregates:
+        BTreeMap<(Market, CandleInterval), BTreeMap<TradeAggregateKey, AggressiveTradeAggregate>>,
+    pruned_trade_aggregate_through: BTreeMap<(Market, CandleInterval), TimestampNs>,
     candles: BTreeMap<(Market, CandleInterval), BTreeMap<TimestampNs, Candle>>,
     context_samples: BoundarySourceSamples,
     funding_samples: BoundarySourceSamples,
@@ -946,8 +1108,11 @@ impl CommonFeatureEngine {
             return event_duplicate_result(existing, event);
         }
         self.ensure_market_capacity(event.market())?;
-        let history = self.events.entry(event.market().clone()).or_default();
-        if !history.accepts(event) {
+        let accepts = self
+            .events
+            .get(event.market())
+            .is_none_or(|history| history.accepts(event));
+        if !accepts {
             if self.finalized_events.len() == FINALIZED_EVENT_ID_HORIZON {
                 return Err(FeatureError::EventReplayOutsideHorizon {
                     event_id: event.event_id().clone(),
@@ -959,6 +1124,10 @@ impl CommonFeatureEngine {
                 event_time: event.event_time(),
             });
         }
+        if matches!(event.kind(), MarketEventKind::Trade(_)) {
+            self.record_trade_aggregates(event)?;
+        }
+        let history = self.events.entry(event.market().clone()).or_default();
         let pruned = history.insert(event.clone());
         self.seen_events
             .insert(event.event_id().clone(), event.clone());
@@ -1365,10 +1534,14 @@ impl CommonFeatureEngine {
                 .pruned_candle_through
                 .contains_key(&(market.clone(), CandleInterval::OneHour));
         let regime = hourly_history.and_then(hourly_regime);
-        let trades = self.trade_events(&market, as_of_time);
-        let microstructure_history_pruned = self.events.get(&market).is_some_and(|history| {
-            history.has_pruned_trade_after(as_of_time.value().saturating_sub(MICRO_15_MINUTES_NS))
-        });
+        let trade_window_5m = self.trade_window(&market, sleeve, as_of_time, MICRO_5_MINUTES_NS);
+        let trade_window_15m = self.trade_window(&market, sleeve, as_of_time, MICRO_15_MINUTES_NS);
+        let microstructure_history_pruned = self
+            .pruned_trade_aggregate_through
+            .get(&(market.clone(), sleeve))
+            .is_some_and(|through| {
+                through.value() > as_of_time.value().saturating_sub(MICRO_15_MINUTES_NS)
+            });
         let stale_bbo_or_book = bbo_event
             .is_some_and(|event| !is_fresh_book_input(event, as_of_time))
             || book_event.is_some_and(|event| !is_fresh_book_input(event, as_of_time));
@@ -1376,8 +1549,8 @@ impl CommonFeatureEngine {
             && book.is_some()
             && !stale_bbo_or_book
             && !microstructure_history_pruned
-            && trade_imbalance(&trades, as_of_time, MICRO_5_MINUTES_NS).is_some()
-            && trade_imbalance(&trades, as_of_time, MICRO_15_MINUTES_NS).is_some();
+            && trade_window_5m.is_some()
+            && trade_window_15m.is_some();
         let mut completeness = FeatureCompleteness {
             candles: feature_history.is_some(),
             context: context_events.is_some() && latest_context.is_some(),
@@ -1402,6 +1575,8 @@ impl CommonFeatureEngine {
                 Some(funding_events),
                 Some(bbo_event),
                 Some(book_event),
+                Some(trade_window_5m),
+                Some(trade_window_15m),
             ) = (
                 feature_history,
                 hourly_history,
@@ -1409,7 +1584,15 @@ impl CommonFeatureEngine {
                 funding_events,
                 bbo_event,
                 book_event,
+                trade_window_5m.as_ref(),
+                trade_window_15m.as_ref(),
             ) {
+                let microstructure_spans = trade_window_5m
+                    .spans
+                    .iter()
+                    .chain(&trade_window_15m.spans)
+                    .cloned()
+                    .collect::<Vec<_>>();
                 let range = input_range(
                     feature_history,
                     hourly_history,
@@ -1417,7 +1600,7 @@ impl CommonFeatureEngine {
                     &funding_events,
                     bbo_event,
                     book_event,
-                    &trades,
+                    &microstructure_spans,
                 );
                 if let Some(range) = range {
                     source_range = Some(range);
@@ -1429,8 +1612,8 @@ impl CommonFeatureEngine {
                         fundings: &funding_history,
                         bbo,
                         book,
-                        trades: &trades,
-                        as_of_time,
+                        trade_imbalance_5m: trade_window_5m.imbalance(),
+                        trade_imbalance_15m: trade_window_15m.imbalance(),
                     };
                     if let Some(built_values) = build_values(&inputs) {
                         completeness.calculations = true;
@@ -1525,23 +1708,6 @@ impl CommonFeatureEngine {
                 .rev()
                 .find(|event| event_is_available(event, as_of_time))
         })
-    }
-
-    fn trade_events(&self, market: &Market, as_of_time: TimestampNs) -> Vec<&MarketEvent> {
-        let microstructure_start = as_of_time.value().saturating_sub(MICRO_15_MINUTES_NS);
-        self.events
-            .get(market)
-            .map(|history| {
-                history
-                    .trades
-                    .values()
-                    .filter(|event| {
-                        event.event_time().value() > microstructure_start
-                            && event_is_available(event, as_of_time)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 
     fn ensure_market_capacity(&self, market: &Market) -> Result<(), FeatureError> {
@@ -1651,6 +1817,95 @@ impl CommonFeatureEngine {
                 .cloned()
         })
     }
+
+    fn record_trade_aggregates(&mut self, event: &MarketEvent) -> Result<(), FeatureError> {
+        for sleeve in [CandleInterval::FifteenMinutes, CandleInterval::OneHour] {
+            let key = (event.market().clone(), sleeve);
+            let event_bucket_close = bucket_close(event.event_time(), MICRO_5_MINUTES_NS).ok_or(
+                FeatureError::Arithmetic {
+                    operation: "trade aggregate bucket close",
+                },
+            )?;
+            let available_at = bucket_close(event.received_at(), sleeve.duration().value()).ok_or(
+                FeatureError::Arithmetic {
+                    operation: "trade aggregate availability boundary",
+                },
+            )?;
+            let aggregate_key = (event_bucket_close, available_at);
+            let aggregates = self.trade_aggregates.entry(key.clone()).or_default();
+            if let Some(existing) = aggregates.get_mut(&aggregate_key) {
+                existing.add_trade(event)?;
+                continue;
+            }
+            if aggregates.len() == TRADE_AGGREGATE_HISTORY
+                && aggregates
+                    .first_key_value()
+                    .is_some_and(|(first, _)| aggregate_key <= *first)
+            {
+                return Err(FeatureError::EventOutsideRetention {
+                    market: event.market().clone(),
+                    event_time: event.event_time(),
+                });
+            }
+            aggregates.insert(aggregate_key, AggressiveTradeAggregate::from_trade(event)?);
+            while aggregates.len() > TRADE_AGGREGATE_HISTORY {
+                if let Some(((discarded_bucket_close, _), _)) = aggregates.pop_first() {
+                    self.pruned_trade_aggregate_through
+                        .entry(key.clone())
+                        .and_modify(|through| *through = (*through).max(discarded_bucket_close))
+                        .or_insert(discarded_bucket_close);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn trade_window(
+        &self,
+        market: &Market,
+        sleeve: CandleInterval,
+        as_of_time: TimestampNs,
+        window_ns: i64,
+    ) -> Option<AggressiveTradeWindow> {
+        let start = as_of_time.value().checked_sub(window_ns)?;
+        let key = (market.clone(), sleeve);
+        if self
+            .pruned_trade_aggregate_through
+            .get(&key)
+            .is_some_and(|through| through.value() > start)
+        {
+            return None;
+        }
+        let aggregates = self.trade_aggregates.get(&key)?;
+        let mut window = AggressiveTradeWindow {
+            buy_notional: Decimal::ZERO,
+            sell_notional: Decimal::ZERO,
+            imbalance: Decimal::ZERO,
+            spans: Vec::new(),
+        };
+        for ((bucket_close, available_at), aggregate) in aggregates {
+            if bucket_close.value() <= start
+                || *bucket_close > as_of_time
+                || *available_at > as_of_time
+            {
+                continue;
+            }
+            window.buy_notional = window.buy_notional.checked_add(aggregate.buy_notional)?;
+            window.sell_notional = window.sell_notional.checked_add(aggregate.sell_notional)?;
+            window.spans.push(InputEventSpan::aggregate(
+                FeatureInputKind::MicrostructureTrade,
+                aggregate,
+            ));
+        }
+        window.imbalance = window.calculate_imbalance()?;
+        Some(window)
+    }
+}
+
+fn bucket_close(timestamp: TimestampNs, bucket_ns: i64) -> Option<TimestampNs> {
+    let remainder = timestamp.value().checked_rem(bucket_ns)?;
+    let adjustment = (bucket_ns - remainder).checked_rem(bucket_ns)?;
+    TimestampNs::new(i128::from(timestamp.value()).checked_add(i128::from(adjustment))?).ok()
 }
 
 fn boundary_sample_limit(interval: CandleInterval) -> usize {
@@ -1905,8 +2160,8 @@ struct SnapshotInputs<'a> {
     fundings: &'a [&'a Funding],
     bbo: Option<&'a Bbo>,
     book: Option<&'a BookSnapshot>,
-    trades: &'a [&'a MarketEvent],
-    as_of_time: TimestampNs,
+    trade_imbalance_5m: Decimal,
+    trade_imbalance_15m: Decimal,
 }
 
 fn build_values(inputs: &SnapshotInputs<'_>) -> Option<BTreeMap<String, Decimal>> {
@@ -2029,14 +2284,8 @@ fn build_values(inputs: &SnapshotInputs<'_>) -> Option<BTreeMap<String, Decimal>
                 .checked_mul(liquidity_factor)?,
         );
     }
-    values.insert(
-        "trade_imbalance_5m".to_owned(),
-        trade_imbalance(inputs.trades, inputs.as_of_time, MICRO_5_MINUTES_NS)?,
-    );
-    values.insert(
-        "trade_imbalance_15m".to_owned(),
-        trade_imbalance(inputs.trades, inputs.as_of_time, MICRO_15_MINUTES_NS)?,
-    );
+    values.insert("trade_imbalance_5m".to_owned(), inputs.trade_imbalance_5m);
+    values.insert("trade_imbalance_15m".to_owned(), inputs.trade_imbalance_15m);
     Some(values)
 }
 
@@ -2047,7 +2296,7 @@ fn input_range(
     funding_events: &[(TimestampNs, &MarketEvent)],
     bbo_event: &MarketEvent,
     book_event: &MarketEvent,
-    trades: &[&MarketEvent],
+    microstructure_spans: &[InputEventSpan],
 ) -> Option<InputEventRange> {
     let spans = feature_history
         .iter()
@@ -2071,11 +2320,7 @@ fn input_range(
             FeatureInputKind::Book,
             book_event,
         )))
-        .chain(
-            trades
-                .iter()
-                .map(|event| InputEventSpan::event(FeatureInputKind::MicrostructureTrade, event)),
-        )
+        .chain(microstructure_spans.iter().cloned())
         .collect::<Vec<_>>();
     InputEventRange::from_spans(spans)
 }
@@ -2492,34 +2737,6 @@ fn depth(book: &BookSnapshot, bbo: &Bbo, bps: u32, side: BookSide) -> Option<Dec
                 .checked_mul(level.quantity().value())
                 .and_then(|notional| total.checked_add(notional))
         })
-}
-
-fn trade_imbalance(
-    events: &[&MarketEvent],
-    as_of_time: TimestampNs,
-    window_ns: i64,
-) -> Option<Decimal> {
-    let start = as_of_time.value().checked_sub(window_ns)?;
-    let (buy, sell) =
-        events
-            .iter()
-            .try_fold((Decimal::ZERO, Decimal::ZERO), |(buy, sell), event| {
-                if event.event_time().value() <= start {
-                    return Some((buy, sell));
-                }
-                let MarketEventKind::Trade(trade) = event.kind() else {
-                    return Some((buy, sell));
-                };
-                let notional = trade
-                    .price()
-                    .value()
-                    .checked_mul(trade.quantity().value())?;
-                match trade.side() {
-                    crate::domain::Side::Buy => buy.checked_add(notional).map(|next| (next, sell)),
-                    crate::domain::Side::Sell => sell.checked_add(notional).map(|next| (buy, next)),
-                }
-            })?;
-    buy.checked_sub(sell)?.checked_div(buy.checked_add(sell)?)
 }
 
 fn schema_hash() -> String {
@@ -4276,27 +4493,37 @@ mod tests {
     }
 
     #[test]
-    fn pruned_trade_window_produces_an_explicit_unready_snapshot() {
-        let market = market("BTC");
+    fn high_rate_trade_windows_remain_exact_beyond_the_raw_event_cache() {
+        let btc = market("BTC");
+        let eth = market("ETH");
         let mut engine = CommonFeatureEngine::new();
         let mut aggregator = CandleAggregator::new();
         populate(
             &mut engine,
             &mut aggregator,
-            market.clone(),
+            btc.clone(),
             0,
             128,
             dec!(100),
             dec!(1),
         );
+        populate(
+            &mut engine,
+            &mut aggregator,
+            eth.clone(),
+            0,
+            128,
+            dec!(200),
+            dec!(1),
+        );
         let decision = timestamp(128 * FIFTEEN_MINUTES_NS);
-        complete(&mut engine, &mut aggregator, decision);
+        complete_with_canonical_funding_history(&mut engine, &mut aggregator, decision);
 
         for trade_id in 0..=super::TRADE_EVENT_HISTORY {
             let event = MarketEvent::trade(
                 timestamp(128 * FIFTEEN_MINUTES_NS - 1),
                 timestamp(128 * FIFTEEN_MINUTES_NS - 1),
-                market.clone(),
+                btc.clone(),
                 Trade::new(
                     10_000 + trade_id as u64,
                     Side::Buy,
@@ -4310,23 +4537,18 @@ mod tests {
         }
 
         let snapshot = engine
-            .snapshots_at(crate::event::CandleInterval::FifteenMinutes, decision)
+            .snapshots_at_with_universe(
+                crate::event::CandleInterval::FifteenMinutes,
+                decision,
+                Some(&tradeable_universe(decision, [btc.clone(), eth])),
+            )
             .into_iter()
-            .find(|snapshot| snapshot.market() == &market)
+            .find(|snapshot| snapshot.market() == &btc)
             .expect("the retained decision candle must produce a snapshot");
+        assert!(snapshot.is_ready(), "unexpected snapshot: {snapshot:#?}");
         assert_eq!(
-            snapshot.unready_reason(),
-            Some(FeatureUnreadyReason::HistoryPruned)
-        );
-        assert!(snapshot.values().is_empty());
-        assert_eq!(
-            engine
-                .events
-                .get(&market)
-                .expect("market event history must exist")
-                .trades
-                .len(),
-            super::TRADE_EVENT_HISTORY
+            snapshot.values().get("trade_imbalance_15m"),
+            Some(&Decimal::ONE)
         );
     }
 }
