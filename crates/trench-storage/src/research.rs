@@ -19,7 +19,7 @@ use trench_core::engine::{
     Engine, EngineContext, EngineEvent, EngineOutcome, EnginePersistenceKind, EngineRecord,
     EngineState, EntryCandidate, EventAdmission, SnapshotBindings, StrategyFingerprints,
 };
-use trench_core::event::{MarketEvent, MarketEventKind, TimestampNs};
+use trench_core::event::{DurationNs, MarketEvent, MarketEventKind, TimestampNs};
 use trench_core::features::common::{FeatureSnapshot, LongHorizonFeatureHistory};
 use trench_core::ledger::LedgerState;
 use trench_core::risk::sizing::RiskPolicy;
@@ -363,6 +363,113 @@ impl ResearchExecutionSetup {
     }
 }
 
+/// The replay-local execution view for market facts. Raw source books remain
+/// separately auditable from the subset that may reach the paper broker.
+#[derive(Debug, Default)]
+struct ResearchMarketState {
+    source_books: BTreeMap<Market, OrderBook>,
+    executable_books: BTreeMap<Market, OrderBook>,
+    recovered: BTreeMap<Market, TimestampNs>,
+    recovery_fences: BTreeMap<Market, EventId>,
+}
+
+/// The only two legal outcomes for a full L2 source fact in research replay.
+#[derive(Debug)]
+enum ReplayBookRoute {
+    /// The source fact remains durable evidence but cannot reach the broker.
+    Retained,
+    /// A fresh full book that passed the current recovery fence.
+    Executable(OrderBook),
+}
+
+impl ResearchMarketState {
+    /// Opens a new recovery fence exactly when its opaque snapshot source is
+    /// observed. Any prior ready state is invalid from this instant onward.
+    fn quarantine_at_anchor(
+        &mut self,
+        source: &MarketEvent,
+        boundary: &RecoveryBoundary,
+    ) -> Result<(), ValidationError> {
+        if source.event_id() != &boundary.snapshot_event_id || source.market() != boundary.market()
+        {
+            return Err(misaligned([MissingReplayInput::RecoveryBoundary]));
+        }
+        if self.recovery_fences.get(boundary.market()) == Some(boundary.event_id()) {
+            return Ok(());
+        }
+        self.quarantine_boundary(boundary)
+    }
+
+    fn quarantine_boundary(&mut self, boundary: &RecoveryBoundary) -> Result<(), ValidationError> {
+        if self
+            .recovery_fences
+            .insert(boundary.market().clone(), boundary.event_id().clone())
+            .is_some()
+        {
+            return Err(misaligned([MissingReplayInput::RecoveryBoundary]));
+        }
+        self.source_books.remove(boundary.market());
+        self.executable_books.remove(boundary.market());
+        self.recovered.remove(boundary.market());
+        Ok(())
+    }
+
+    /// Releases a fence only for the exact opaque recovery completion that
+    /// opened it. The evidence snapshot itself remains non-executable.
+    fn complete_recovery(&mut self, boundary: &RecoveryBoundary) -> Result<(), ValidationError> {
+        if self.recovery_fences.get(boundary.market()) != Some(boundary.event_id()) {
+            return Err(misaligned([MissingReplayInput::RecoveryBoundary]));
+        }
+        self.recovery_fences.remove(boundary.market());
+        self.executable_books.remove(boundary.market());
+        self.recovered
+            .insert(boundary.market().clone(), boundary.at());
+        Ok(())
+    }
+
+    /// Applies a source snapshot to its audit-only book chain and exposes it
+    /// to the engine only when both timestamps strictly exceed recovery.
+    fn observe_book(
+        &mut self,
+        source: &MarketEvent,
+        maximum_book_age: DurationNs,
+    ) -> Result<ReplayBookRoute, BookError> {
+        let book = OrderBook::apply_snapshot(
+            self.source_books.get(source.market()),
+            source,
+            maximum_book_age,
+        )?;
+        let executable = self.execution_ready(source.market())
+            && self
+                .recovered
+                .get(source.market())
+                .is_some_and(|recovered_at| {
+                    book.event_time() > *recovered_at && book.received_at() > *recovered_at
+                });
+        self.source_books
+            .insert(source.market().clone(), book.clone());
+        if executable {
+            self.executable_books
+                .insert(source.market().clone(), book.clone());
+            Ok(ReplayBookRoute::Executable(book))
+        } else {
+            Ok(ReplayBookRoute::Retained)
+        }
+    }
+
+    /// Returns whether a market currently has one completed, unfenced
+    /// recovery. This never proves that a book is available for execution.
+    fn execution_ready(&self, market: &Market) -> bool {
+        !self.recovery_fences.contains_key(market) && self.recovered.contains_key(market)
+    }
+
+    /// Returns whether source facts are currently inside an observed recovery
+    /// gap. Open positions may still consume a protective mark in this state.
+    fn recovery_fenced(&self, market: &Market) -> bool {
+        self.recovery_fences.contains_key(market)
+    }
+}
+
 /// The only production-engine implementation of [`RuleReplay`].
 ///
 /// `artifacts` contains a fully immutable artifact for every declared grid
@@ -431,66 +538,60 @@ impl EngineRuleReplay {
             .events()
             .iter()
             .filter(|event| {
-                event.event_time() >= source_start && event_as_of(event) < request.evaluation.end()
+                event_as_of(event) >= source_start && event_as_of(event) < request.evaluation.end()
             })
             .collect::<Vec<_>>();
         events.sort_by(|left, right| causal_event_order(left, right));
         let mut state = self.execution.state(source_start, BTreeMap::new())?;
         let initial_equity = state.ledger().equity().value();
         let mut evidence = ReplayEvidence::new(self.replay.digest(), &self.provenance, request);
-        let mut source_books = BTreeMap::<Market, OrderBook>::new();
-        let mut executable_books = BTreeMap::<Market, OrderBook>::new();
+        let mut markets = ResearchMarketState::default();
+        let recovery_anchors = self.recovery_anchor_index()?;
+        let recovery_anchor_schedule = self.recovery_anchor_schedule()?;
         let mut recovery_index = 0_usize;
-        let mut recovered = BTreeMap::<Market, TimestampNs>::new();
+        self.bootstrap_recoveries(
+            source_start,
+            &mut recovery_index,
+            &mut markets,
+            &mut state,
+            &mut evidence,
+        )?;
         let mut pending_rule_position = None::<RulePosition>;
         let mut rule_position = None::<RulePosition>;
 
         for event in events {
             let at = event_as_of(event);
-            self.apply_recoveries_before(
+            if let Some(indices) = recovery_anchor_schedule.get(&at) {
+                for index in indices {
+                    markets.quarantine_boundary(&self.recovery_boundaries[*index])?;
+                }
+            }
+            self.apply_ready_recoveries(
                 at,
                 &mut recovery_index,
-                &mut recovered,
+                &mut markets,
                 &mut state,
                 &mut evidence,
             )?;
+            if let Some(index) = recovery_anchors.get(event.event_id()) {
+                markets.quarantine_at_anchor(event, &self.recovery_boundaries[*index])?;
+            }
             match event.kind() {
                 MarketEventKind::BookSnapshot(_) => {
-                    let book = match OrderBook::apply_snapshot(
-                        source_books.get(event.market()),
-                        event,
-                        self.execution.broker_config.maximum_book_age(),
-                    ) {
-                        Ok(book) => book,
+                    let route = match markets
+                        .observe_book(event, self.execution.broker_config.maximum_book_age())
+                    {
+                        Ok(route) => route,
                         Err(BookError::Stale { .. }) => {
                             return Err(misaligned([MissingReplayInput::ExecutableBooks]));
                         }
-                        Err(BookError::NonMonotonicTime { .. }) => {
-                            let was_open = state.ledger().position().is_some();
-                            let prior = take_state(&self.execution, &mut state, at)?;
-                            let outcome =
-                                source_retained(event, at, prior).map_err(engine_failure)?;
-                            state = evidence.consume(was_open, outcome)?;
-                            sync_rule_position(
-                                &state,
-                                &mut rule_position,
-                                &mut pending_rule_position,
-                            );
-                            continue;
-                        }
+                        Err(BookError::NonMonotonicTime { .. }) => ReplayBookRoute::Retained,
                         Err(error) => return Err(engine_failure(error)),
                     };
-                    let executable = recovered.get(event.market()).is_some_and(|recovered_at| {
-                        book.event_time() > *recovered_at && book.received_at() > *recovered_at
-                    });
-                    source_books.insert(event.market().clone(), book.clone());
-                    if executable {
-                        executable_books.insert(event.market().clone(), book.clone());
-                    }
                     let was_open = state.ledger().position().is_some();
                     let prior = take_state(&self.execution, &mut state, at)?;
-                    let outcome = if executable {
-                        Engine::apply(
+                    let outcome = match route {
+                        ReplayBookRoute::Executable(book) => Engine::apply(
                             EngineEvent::ExecutableBook {
                                 event_id: event.event_id().clone(),
                                 at,
@@ -498,16 +599,18 @@ impl EngineRuleReplay {
                             },
                             prior,
                             &EngineContext::passive(EventAdmission::New),
-                        )
-                    } else {
-                        source_retained(event, at, prior)
+                        ),
+                        ReplayBookRoute::Retained => source_retained(event, at, prior),
                     }
                     .map_err(engine_failure)?;
                     state = evidence.consume(was_open, outcome)?;
                 }
                 MarketEventKind::AssetContext(context) => {
                     let was_open = state.ledger().position().is_some();
-                    let prior = take_state(&self.execution, &mut state, at)?;
+                    let protective_mark = state
+                        .ledger()
+                        .position()
+                        .is_some_and(|position| position.market() == event.market());
                     let exit = rule_position
                         .as_ref()
                         .and_then(|position| {
@@ -516,7 +619,8 @@ impl EngineRuleReplay {
                             })
                         })
                         .flatten();
-                    let outcome = if recovered.contains_key(event.market())
+                    let prior = take_state(&self.execution, &mut state, at)?;
+                    let outcome = if markets.execution_ready(event.market())
                         && let Some(reason) = exit
                     {
                         Engine::apply(
@@ -532,7 +636,7 @@ impl EngineRuleReplay {
                             prior,
                             &EngineContext::passive(EventAdmission::New),
                         )
-                    } else if recovered.contains_key(event.market()) {
+                    } else if markets.execution_ready(event.market()) || protective_mark {
                         Engine::apply(
                             EngineEvent::MarketMark {
                                 event_id: event.event_id().clone(),
@@ -554,7 +658,7 @@ impl EngineRuleReplay {
                 MarketEventKind::Funding(funding) => {
                     let was_open = state.ledger().position().is_some();
                     let prior = take_state(&self.execution, &mut state, at)?;
-                    let outcome = if recovered.contains_key(event.market())
+                    let outcome = if markets.execution_ready(event.market())
                         && let Some(mark_price) = funding.mark_price()
                     {
                         Engine::apply(
@@ -579,88 +683,96 @@ impl EngineRuleReplay {
                 MarketEventKind::CompletedCandle(candle)
                     if event.event_time() >= request.evaluation.start() =>
                 {
-                    let decision = self.decision_inputs(
-                        event,
-                        candle.interval(),
-                        &executable_books,
-                        &recovered,
-                    )?;
-                    let rule_decision = strategy.on_bar(decision.snapshot, decision.long_history);
-                    evidence.observe_prediction(
-                        event.event_id(),
-                        rule_decision.explanation_json().as_bytes(),
-                    );
-                    let exit = rule_position
-                        .as_ref()
-                        .and_then(|position| {
-                            (position.market() == event.market()).then(|| {
-                                strategy.exit_for(
-                                    position,
-                                    candle.close().value(),
-                                    rule_decision.composite(),
-                                    at,
-                                )
-                            })
-                        })
-                        .flatten();
-                    if let Some(reason) = exit {
-                        let was_open = state.ledger().position().is_some();
-                        let prior = take_state(&self.execution, &mut state, at)?;
-                        let outcome = Engine::apply(
-                            EngineEvent::ExitRequested {
-                                event_id: event.event_id().clone(),
-                                at,
-                                reason: broker_exit_reason(reason),
-                                market: event.market().clone(),
-                                price: candle.close(),
-                                event_time: event.event_time(),
-                                received_at: event.received_at(),
-                            },
-                            prior,
-                            &EngineContext::passive(EventAdmission::New),
-                        )
-                        .map_err(engine_failure)?;
-                        state = evidence.consume(was_open, outcome)?;
-                    } else if rule_position.is_none()
-                        && pending_rule_position.is_none()
-                        && let Some(candidate) = rule_decision.candidate()
-                    {
-                        if candidate.decision_time() != at {
-                            return Err(misaligned([MissingReplayInput::FeatureSnapshot]));
-                        }
-                        let context = EngineContext::new(
-                            EventAdmission::New,
-                            SnapshotBindings::new(
-                                decision.books.clone(),
-                                decision.universe.clone(),
-                            ),
-                            StrategyFingerprints::new(
-                                strategy.fingerprint(),
-                                "0000000000000000000000000000000000000000000000000000000000000000",
-                            ),
-                        );
-                        let was_open = state.ledger().position().is_some();
-                        let prior =
-                            take_state(&self.execution, &mut state, candidate.decision_time())?
-                                .with_risk_policies(decision.risk_policies.clone())
-                                .map_err(engine_failure)?;
-                        let outcome = Engine::apply_verified_entry_arbitration(
-                            event.event_id().clone(),
-                            candidate.decision_time(),
-                            vec![EntryCandidate::new(candidate.clone(), &strategy)],
-                            prior,
-                            &context,
-                        )
-                        .map_err(engine_failure)?;
-                        state = evidence.consume(was_open, outcome)?;
-                        if state.broker().state() == BrokerState::PendingEntry {
-                            pending_rule_position = RulePosition::from_candidate(candidate);
-                        }
-                    } else {
+                    if markets.recovery_fenced(event.market()) {
                         let was_open = state.ledger().position().is_some();
                         let prior = take_state(&self.execution, &mut state, at)?;
                         let outcome = source_retained(event, at, prior).map_err(engine_failure)?;
                         state = evidence.consume(was_open, outcome)?;
+                    } else {
+                        let decision = self.decision_inputs(
+                            event,
+                            candle.interval(),
+                            &markets.executable_books,
+                            &markets.recovered,
+                        )?;
+                        let rule_decision =
+                            strategy.on_bar(decision.snapshot, decision.long_history);
+                        evidence.observe_prediction(
+                            event.event_id(),
+                            rule_decision.explanation_json().as_bytes(),
+                        );
+                        let exit = rule_position
+                            .as_ref()
+                            .and_then(|position| {
+                                (position.market() == event.market()).then(|| {
+                                    strategy.exit_for(
+                                        position,
+                                        candle.close().value(),
+                                        rule_decision.composite(),
+                                        at,
+                                    )
+                                })
+                            })
+                            .flatten();
+                        if let Some(reason) = exit {
+                            let was_open = state.ledger().position().is_some();
+                            let prior = take_state(&self.execution, &mut state, at)?;
+                            let outcome = Engine::apply(
+                                EngineEvent::ExitRequested {
+                                    event_id: event.event_id().clone(),
+                                    at,
+                                    reason: broker_exit_reason(reason),
+                                    market: event.market().clone(),
+                                    price: candle.close(),
+                                    event_time: event.event_time(),
+                                    received_at: event.received_at(),
+                                },
+                                prior,
+                                &EngineContext::passive(EventAdmission::New),
+                            )
+                            .map_err(engine_failure)?;
+                            state = evidence.consume(was_open, outcome)?;
+                        } else if pending_rule_position.is_none()
+                            && let Some(candidate) = rule_decision.candidate()
+                        {
+                            if candidate.decision_time() != at {
+                                return Err(misaligned([MissingReplayInput::FeatureSnapshot]));
+                            }
+                            let context = EngineContext::new(
+                                EventAdmission::New,
+                                SnapshotBindings::new(
+                                    decision.books.clone(),
+                                    decision.universe.clone(),
+                                ),
+                                StrategyFingerprints::new(
+                                    strategy.fingerprint(),
+                                    "0000000000000000000000000000000000000000000000000000000000000000",
+                                ),
+                            );
+                            let was_open = state.ledger().position().is_some();
+                            let prior =
+                                take_state(&self.execution, &mut state, candidate.decision_time())?
+                                    .with_risk_policies(decision.risk_policies.clone())
+                                    .map_err(engine_failure)?;
+                            let outcome = Engine::apply_verified_entry_arbitration(
+                                event.event_id().clone(),
+                                candidate.decision_time(),
+                                vec![EntryCandidate::new(candidate.clone(), &strategy)],
+                                prior,
+                                &context,
+                            )
+                            .map_err(engine_failure)?;
+                            state = evidence.consume(was_open, outcome)?;
+                            if state.broker().state() == BrokerState::PendingEntry {
+                                pending_rule_position = RulePosition::from_candidate(candidate);
+                            }
+                        } else {
+                            let was_open = state.ledger().position().is_some();
+                            let prior = take_state(&self.execution, &mut state, at)?;
+                            let outcome =
+                                source_retained(event, at, prior).map_err(engine_failure)?;
+                            state = evidence.consume(was_open, outcome)?;
+                        }
                     }
                 }
                 _ => {
@@ -670,12 +782,19 @@ impl EngineRuleReplay {
                     state = evidence.consume(was_open, outcome)?;
                 }
             }
+            self.apply_ready_recoveries(
+                at,
+                &mut recovery_index,
+                &mut markets,
+                &mut state,
+                &mut evidence,
+            )?;
             sync_rule_position(&state, &mut rule_position, &mut pending_rule_position);
         }
-        self.apply_recoveries_before(
+        self.apply_ready_recoveries(
             request.evaluation.end(),
             &mut recovery_index,
-            &mut recovered,
+            &mut markets,
             &mut state,
             &mut evidence,
         )?;
@@ -708,35 +827,135 @@ impl EngineRuleReplay {
         evidence.outcome(net_pnl)
     }
 
-    fn apply_recoveries_before(
+    fn recovery_anchor_index(&self) -> Result<BTreeMap<EventId, usize>, ValidationError> {
+        self.recovery_boundaries.iter().enumerate().try_fold(
+            BTreeMap::<EventId, usize>::new(),
+            |mut anchors, (index, boundary)| {
+                if anchors
+                    .insert(boundary.snapshot_event_id.clone(), index)
+                    .is_some()
+                {
+                    return Err(misaligned([MissingReplayInput::RecoveryBoundary]));
+                }
+                Ok(anchors)
+            },
+        )
+    }
+
+    /// Schedules each opaque anchor at its source as-of time. Source facts
+    /// sharing that exact timestamp are fenced conservatively before an
+    /// arbitrary event-ID tie-break can expose an old executable book.
+    fn recovery_anchor_schedule(
         &self,
-        at: TimestampNs,
+    ) -> Result<BTreeMap<TimestampNs, Vec<usize>>, ValidationError> {
+        let source_times = self
+            .replay
+            .events()
+            .iter()
+            .map(|event| (event.event_id(), event_as_of(event)))
+            .collect::<BTreeMap<_, _>>();
+        self.recovery_boundaries.iter().enumerate().try_fold(
+            BTreeMap::<TimestampNs, Vec<usize>>::new(),
+            |mut schedule, (index, boundary)| {
+                let at = source_times
+                    .get(&boundary.snapshot_event_id)
+                    .copied()
+                    .ok_or_else(|| misaligned([MissingReplayInput::RecoveryBoundary]))?;
+                schedule.entry(at).or_default().push(index);
+                Ok(schedule)
+            },
+        )
+    }
+
+    /// Seeds the explicit replay window from recovery facts that were already
+    /// observed before its first source receipt. A completion restores only a
+    /// recovered timestamp; an already-open later gap immediately removes it.
+    fn bootstrap_recoveries(
+        &self,
+        source_start: TimestampNs,
         index: &mut usize,
-        recovered: &mut BTreeMap<Market, TimestampNs>,
+        markets: &mut ResearchMarketState,
         state: &mut EngineState,
         evidence: &mut ReplayEvidence,
     ) -> Result<(), ValidationError> {
+        let source_times = self
+            .replay
+            .events()
+            .iter()
+            .map(|event| (event.event_id(), event_as_of(event)))
+            .collect::<BTreeMap<_, _>>();
         while let Some(boundary) = self.recovery_boundaries.get(*index)
-            && boundary.at() < at
+            && boundary.at() < source_start
         {
-            let was_open = state.ledger().position().is_some();
-            let prior = take_state(&self.execution, state, boundary.at())?;
-            let outcome = Engine::apply(
-                EngineEvent::MarketRecovered {
-                    event_id: boundary.event_id().clone(),
-                    at: boundary.at(),
-                    market: boundary.market().clone(),
-                },
-                prior,
-                &EngineContext::passive(EventAdmission::New),
-            )
-            .map_err(engine_failure)?;
-            *state = evidence.consume(was_open, outcome)?;
-            recovered.insert(boundary.market().clone(), boundary.at());
+            self.apply_recovery_boundary(boundary, state, evidence)?;
+            markets
+                .recovered
+                .insert(boundary.market().clone(), boundary.at());
             *index = index
                 .checked_add(1)
                 .ok_or(ValidationError::InvalidEngineOutcome)?;
         }
+        for boundary in self.recovery_boundaries.iter().skip(*index) {
+            let snapshot_at = source_times
+                .get(&boundary.snapshot_event_id)
+                .copied()
+                .ok_or_else(|| misaligned([MissingReplayInput::RecoveryBoundary]))?;
+            if snapshot_at < source_start {
+                markets.quarantine_boundary(boundary)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies only recovery completions whose exact opaque anchor is already
+    /// fenced. An unobserved stale boundary is an invalid replay, never a
+    /// reason to retain an old ready timestamp.
+    fn apply_ready_recoveries(
+        &self,
+        at: TimestampNs,
+        index: &mut usize,
+        markets: &mut ResearchMarketState,
+        state: &mut EngineState,
+        evidence: &mut ReplayEvidence,
+    ) -> Result<(), ValidationError> {
+        while let Some(boundary) = self.recovery_boundaries.get(*index) {
+            if boundary.at() > at {
+                break;
+            }
+            if markets.recovery_fences.get(boundary.market()) != Some(boundary.event_id()) {
+                if boundary.at() < at {
+                    return Err(misaligned([MissingReplayInput::RecoveryBoundary]));
+                }
+                break;
+            }
+            self.apply_recovery_boundary(boundary, state, evidence)?;
+            markets.complete_recovery(boundary)?;
+            *index = index
+                .checked_add(1)
+                .ok_or(ValidationError::InvalidEngineOutcome)?;
+        }
+        Ok(())
+    }
+
+    fn apply_recovery_boundary(
+        &self,
+        boundary: &RecoveryBoundary,
+        state: &mut EngineState,
+        evidence: &mut ReplayEvidence,
+    ) -> Result<(), ValidationError> {
+        let was_open = state.ledger().position().is_some();
+        let prior = take_state(&self.execution, state, boundary.at())?;
+        let outcome = Engine::apply(
+            EngineEvent::MarketRecovered {
+                event_id: boundary.event_id().clone(),
+                at: boundary.at(),
+                market: boundary.market().clone(),
+            },
+            prior,
+            &EngineContext::passive(EventAdmission::New),
+        )
+        .map_err(engine_failure)?;
+        *state = evidence.consume(was_open, outcome)?;
         Ok(())
     }
 
@@ -1129,6 +1348,7 @@ fn validate_recovery_boundaries(
     let mut prior: Option<(TimestampNs, &Market, u64, &EventId)> = None;
     let mut generations = BTreeSet::new();
     let mut boundary_ids = BTreeSet::new();
+    let mut snapshot_ids = BTreeSet::new();
     for boundary in boundaries {
         let evidence = boundary.evidence.verify(replay, Some(boundary.at()));
         let snapshot = evidence.as_ref().ok().and_then(|events| {
@@ -1145,6 +1365,7 @@ fn validate_recovery_boundaries(
         if boundary.generation == 0
             || raw_ids.contains(boundary.event_id())
             || !boundary_ids.insert(boundary.event_id())
+            || !snapshot_ids.insert(&boundary.snapshot_event_id)
             || !generations.insert((boundary.market(), boundary.generation))
             || snapshot.is_none_or(|event| {
                 event.market() != boundary.market()
@@ -1334,10 +1555,12 @@ mod tests {
 
     use rust_decimal_macros::dec;
     use tempfile::TempDir;
-    use trench_core::broker::{BrokerConfig, BrokerRunContext};
-    use trench_core::domain::{Price, Quantity, RunId, Usdc};
-    use trench_core::engine::EngineRecord;
-    use trench_core::event::{BookLevel, BookSnapshot, CandleInterval, CompletedCandle};
+    use trench_core::broker::{BrokerConfig, BrokerRunContext, BrokerState, ExitReason};
+    use trench_core::domain::{EventId, Price, Quantity, RunId, Usdc};
+    use trench_core::engine::{EngineContext, EngineEvent, EngineRecord, EventAdmission};
+    use trench_core::event::{
+        BookLevel, BookSnapshot, CandleInterval, CompletedCandle, Funding, FundingRate,
+    };
     use trench_core::validation::{ReplayPhase, RuleSelection, TimeRange};
 
     use super::*;
@@ -1519,6 +1742,177 @@ mod tests {
             evidence,
             snapshot_event_id: snapshot_event.event_id().clone(),
         }
+    }
+
+    #[test]
+    fn later_gap_fences_pending_exit_until_a_post_boundary_book() {
+        const BASE_TIME_NS: i64 = 900_000_000_000;
+        let opened_at = timestamp(BASE_TIME_NS);
+        let old_book = book_event(BASE_TIME_NS + 3);
+        let recovery_anchor = book_event(BASE_TIME_NS + 4);
+        let gap_book = book_event(BASE_TIME_NS + 5);
+        let gap_funding = MarketEvent::funding(
+            timestamp(BASE_TIME_NS + 6),
+            timestamp(BASE_TIME_NS + 6),
+            market(),
+            Funding::with_mark(
+                FundingRate::new(dec!(0.001)),
+                Price::new(dec!(80)).expect("gap mark"),
+            ),
+        )
+        .expect("normalized gap funding");
+        let post_boundary_book = book_event(BASE_TIME_NS + 9);
+        let (_directory, replay) = replay(&[
+            old_book.clone(),
+            recovery_anchor.clone(),
+            gap_book.clone(),
+            gap_funding.clone(),
+            post_boundary_book.clone(),
+        ]);
+        let evidence =
+            ResearchSourceEvidence::from_replay(&replay, vec![recovery_anchor.event_id().clone()])
+                .expect("recovery anchor evidence");
+        let boundary_at = timestamp(BASE_TIME_NS + 8);
+        let boundary = RecoveryBoundary {
+            event_id: recovery_event_id(&market(), 2, boundary_at, recovery_anchor.event_id())
+                .expect("recovery identity"),
+            at: boundary_at,
+            market: market(),
+            generation: 2,
+            evidence,
+            snapshot_event_id: recovery_anchor.event_id().clone(),
+        };
+        validate_recovery_boundaries(&replay, std::slice::from_ref(&boundary))
+            .expect("opaque recovery boundary must be valid");
+
+        let mut source_books = BTreeMap::new();
+        let old_source_book = OrderBook::apply_snapshot(
+            None,
+            &old_book,
+            execution().broker_config.maximum_book_age(),
+        )
+        .expect("old source book");
+        source_books.insert(market(), old_source_book.clone());
+        let mut executable_books = BTreeMap::new();
+        executable_books.insert(market(), old_source_book);
+        let mut market_state = ResearchMarketState {
+            source_books,
+            executable_books,
+            recovered: BTreeMap::from([(market(), opened_at)]),
+            recovery_fences: BTreeMap::new(),
+        };
+
+        let pending_exit = Engine::apply(
+            EngineEvent::ExitRequested {
+                event_id: EventId::new("research-fence-pending-exit")
+                    .expect("pending exit identity"),
+                at: timestamp(BASE_TIME_NS + 2),
+                reason: ExitReason::Strategy,
+                market: market(),
+                price: Price::new(dec!(100)).expect("exit mark"),
+                event_time: timestamp(BASE_TIME_NS + 2),
+                received_at: timestamp(BASE_TIME_NS + 2),
+            },
+            trench_core::engine::test_support::opened_btc_state(opened_at),
+            &EngineContext::passive(EventAdmission::New),
+        )
+        .expect("real engine must queue the exit")
+        .into_parts()
+        .0;
+        assert_eq!(pending_exit.broker().state(), BrokerState::NormalExit);
+
+        market_state
+            .quarantine_at_anchor(&recovery_anchor, &boundary)
+            .expect("the opaque anchor must open the next recovery fence");
+        assert!(!market_state.recovered.contains_key(&market()));
+        assert!(!market_state.executable_books.contains_key(&market()));
+
+        assert!(matches!(
+            market_state
+                .observe_book(
+                    &recovery_anchor,
+                    execution().broker_config.maximum_book_age()
+                )
+                .expect("anchor source book"),
+            ReplayBookRoute::Retained
+        ));
+        assert!(matches!(
+            market_state
+                .observe_book(&gap_book, execution().broker_config.maximum_book_age())
+                .expect("gap source book"),
+            ReplayBookRoute::Retained
+        ));
+        assert!(!market_state.execution_ready(&market()));
+
+        let mandatory_exit = Engine::apply(
+            EngineEvent::MarketMark {
+                event_id: gap_funding.event_id().clone(),
+                at: gap_funding.received_at(),
+                market: market(),
+                price: Price::new(dec!(80)).expect("protective mark"),
+                event_time: gap_funding.event_time(),
+                received_at: gap_funding.received_at(),
+            },
+            pending_exit,
+            &EngineContext::passive(EventAdmission::New),
+        )
+        .expect("a recovery-fenced mark must preserve stop/liquidation priority")
+        .into_parts()
+        .0;
+        assert_eq!(mandatory_exit.broker().state(), BrokerState::MandatoryExit);
+        let retained_gap_funding =
+            source_retained(&gap_funding, gap_funding.received_at(), mandatory_exit)
+                .expect("gap funding is audit-only")
+                .into_parts()
+                .0;
+        assert_eq!(
+            retained_gap_funding.broker().state(),
+            BrokerState::MandatoryExit
+        );
+        assert!(retained_gap_funding.ledger().position().is_some());
+
+        let recovered = Engine::apply(
+            EngineEvent::MarketRecovered {
+                event_id: boundary.event_id().clone(),
+                at: boundary.at(),
+                market: market(),
+            },
+            retained_gap_funding,
+            &EngineContext::passive(EventAdmission::New),
+        )
+        .expect("only the opaque completion may restore execution readiness")
+        .into_parts()
+        .0;
+        market_state
+            .complete_recovery(&boundary)
+            .expect("matching completion releases the fence but not an old book");
+
+        let ReplayBookRoute::Executable(post_book) = market_state
+            .observe_book(
+                &post_boundary_book,
+                execution().broker_config.maximum_book_age(),
+            )
+            .expect("strictly later post-boundary book")
+        else {
+            panic!("only the post-boundary source book may become executable");
+        };
+        let settled = Engine::apply(
+            EngineEvent::ExecutableBook {
+                event_id: post_boundary_book.event_id().clone(),
+                at: post_boundary_book.received_at(),
+                book: post_book,
+            },
+            recovered,
+            &EngineContext::passive(EventAdmission::New),
+        )
+        .expect("post-boundary book must settle the pending mandatory exit")
+        .into_parts()
+        .0;
+        assert!(settled.ledger().position().is_none());
+        assert!(matches!(
+            settled.broker().state(),
+            BrokerState::Flat | BrokerState::Liquidated
+        ));
     }
 
     #[test]
