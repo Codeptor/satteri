@@ -64,7 +64,7 @@ impl Cli {
                 let loaded = load_config(&arguments.config.config)?;
                 let rules_startup = RulesStartup::resolve(&loaded);
                 app::run(
-                    &arguments.config.config,
+                    &loaded.physical_path,
                     &loaded.bytes,
                     &loaded.config,
                     rules_startup,
@@ -78,7 +78,7 @@ impl Cli {
                 let loaded = load_config(&arguments.config)?;
                 let rules_startup = RulesStartup::resolve(&loaded);
                 app::run(
-                    &arguments.config,
+                    &loaded.physical_path,
                     &loaded.bytes,
                     &loaded.config,
                     rules_startup,
@@ -91,7 +91,7 @@ impl Cli {
             Command::Replay(arguments) => {
                 let loaded = load_config(&arguments.config.config)?;
                 let report = app::replay(
-                    &arguments.config.config,
+                    &loaded.physical_path,
                     &loaded.bytes,
                     &loaded.config,
                     &arguments.manifest,
@@ -267,8 +267,7 @@ pub fn import_archive(arguments: ImportArchiveArgs) -> Result<ImportArchiveResul
     let archive = ArchiveReader::open(&arguments.source, archive_input.manifest)?.read_all()?;
     let events = GapRecovery::archive_l2_events(&archive)?;
 
-    let parquet_root =
-        resolve_configured_path(&arguments.config, loaded.config.storage().parquet_path())?;
+    let parquet_root = loaded.resolve_configured_path(loaded.config.storage().parquet_path())?;
     let provenance = DataProvenance::new(
         digest_bytes(&loaded.bytes),
         code_digest()?,
@@ -352,6 +351,14 @@ pub(crate) fn load_config(path: &Path) -> Result<LoadedConfig, CommandError> {
         bytes,
         config,
     })
+}
+
+impl LoadedConfig {
+    /// Resolves a config-relative path against the physical release containing
+    /// the validated configuration bytes, never a mutable deployment alias.
+    pub(crate) fn resolve_configured_path(&self, value: &str) -> Result<PathBuf, CommandError> {
+        resolve_configured_path(&self.physical_path, value)
+    }
 }
 
 /// Startup result for the rules-only ledger. A failed artifact leaves the
@@ -528,8 +535,7 @@ pub fn research_rules(arguments: RulesResearchArgs) -> Result<RulesResearchResul
     if plan.provenance() != &expected_provenance {
         return Err(CommandError::ReplayProvenanceMismatch);
     }
-    let parquet_root =
-        resolve_configured_path(&arguments.config, loaded.config.storage().parquet_path())?;
+    let parquet_root = loaded.resolve_configured_path(loaded.config.storage().parquet_path())?;
     let replay =
         trench_storage::replay::DeterministicReplay::open_plan(&parquet_root, plan.clone())?;
     let provenance = research_provenance(&loaded.bytes, &plan, replay.events())?;
@@ -1056,8 +1062,12 @@ struct DoctorReport {
 /// database connection, and performs no network operation.
 fn doctor(config_path: &Path) -> Result<DoctorReport, CommandError> {
     let loaded = load_config(config_path)?;
-    let sqlite_path = app::configured_path(config_path, loaded.config.storage().sqlite_path())?;
-    let parquet_path = app::configured_path(config_path, loaded.config.storage().parquet_path())?;
+    let sqlite_path =
+        app::configured_path(&loaded.physical_path, loaded.config.storage().sqlite_path())?;
+    let parquet_path = app::configured_path(
+        &loaded.physical_path,
+        loaded.config.storage().parquet_path(),
+    )?;
     let runtime_path = PathBuf::from(loaded.config.runtime().admin_socket_path());
     let mut reasons = Vec::new();
     inspect_regular_file(&sqlite_path, "sqlite_database", &mut reasons);
@@ -1531,7 +1541,7 @@ mod rules_research_tests {
 
     use super::{
         CommandError, RulesArtifactError, RulesResearchArgs, RulesStartup, code_digest,
-        digest_bytes, load_config, research_rules,
+        digest_bytes, load_config, research_rules, resolve_configured_path,
     };
 
     fn secure(path: &std::path::Path) {
@@ -1694,6 +1704,59 @@ mod rules_research_tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn loaded_config_keeps_relative_storage_bound_to_its_physical_release() {
+        let root = tempfile::tempdir().expect("fixture root");
+        secure(root.path());
+        let release_a = root.path().join("release-a");
+        let release_b = root.path().join("release-b");
+        fs::create_dir(&release_a).expect("first release directory");
+        fs::create_dir(&release_b).expect("second release directory");
+        secure(&release_a);
+        secure(&release_b);
+        for release in [&release_a, &release_b] {
+            fs::create_dir_all(release.join("data/parquet")).expect("release parquet directory");
+            fs::create_dir_all(release.join("state")).expect("release state directory");
+        }
+        let config_body = include_str!("../../../config/paper.example.toml").replace(
+            "/run/trench/trenchd.sock",
+            &root
+                .path()
+                .join("runtime/trenchd.sock")
+                .display()
+                .to_string(),
+        );
+        let release_a_config = release_a.join("paper.toml");
+        fs::write(&release_a_config, &config_body).expect("first release config");
+        fs::write(release_b.join("paper.toml"), config_body).expect("second release config");
+        let current = root.path().join("current");
+        symlink(&release_a, &current).expect("initial release alias");
+
+        let loaded = load_config(&current.join("paper.toml")).expect("load first release");
+        fs::remove_file(&current).expect("remove initial alias");
+        symlink(&release_b, &current).expect("switch release alias");
+
+        assert_eq!(
+            fs::canonicalize(
+                resolve_configured_path(&current.join("paper.toml"), "data/parquet")
+                    .expect("mutable alias resolution"),
+            )
+            .expect("mutable alias target"),
+            release_b.join("data/parquet")
+        );
+        assert_eq!(
+            loaded
+                .resolve_configured_path("data/parquet")
+                .expect("physical parquet resolution"),
+            release_a.join("data/parquet")
+        );
+        assert_eq!(
+            crate::app::configured_path(&loaded.physical_path, "state/trench.sqlite")
+                .expect("physical sqlite resolution"),
+            release_a.join("state/trench.sqlite")
+        );
     }
 
     #[test]

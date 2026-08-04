@@ -78,15 +78,15 @@ struct AuthorityState {
 /// would be allowed to subscribe. It never parses a debugging checkpoint as
 /// executable state and never recreates a prior decision from partial evidence.
 pub async fn run(
-    config_path: &Path,
+    physical_config_path: &Path,
     config_bytes: &[u8],
     config: &PaperConfig,
     rules_startup: RulesStartup,
     mode: RuntimeMode,
     duration: Option<Duration>,
 ) -> Result<(), AppError> {
-    let sqlite_path = configured_path(config_path, config.storage().sqlite_path())?;
-    let parquet_path = configured_path(config_path, config.storage().parquet_path())?;
+    let sqlite_path = configured_path(physical_config_path, config.storage().sqlite_path())?;
+    let parquet_path = configured_path(physical_config_path, config.storage().parquet_path())?;
     let admin_socket = PathBuf::from(config.runtime().admin_socket_path());
     let provenance = provenance(config_bytes)?;
     let started_at_ns = current_time_ns()?;
@@ -233,7 +233,7 @@ pub async fn run(
 
 /// Opens one explicit Task-14 replay plan without SQLite, network, or mutation.
 pub fn replay(
-    config_path: &Path,
+    physical_config_path: &Path,
     config_bytes: &[u8],
     config: &PaperConfig,
     manifest: &Path,
@@ -243,7 +243,7 @@ pub fn replay(
     if plan.provenance() != &expected {
         return Err(AppError::ReplayProvenanceMismatch);
     }
-    let parquet_path = configured_path(config_path, config.storage().parquet_path())?;
+    let parquet_path = configured_path(physical_config_path, config.storage().parquet_path())?;
     let replay = DeterministicReplay::open_plan(parquet_path, plan)?;
     Ok(ReplayReport {
         event_count: replay.events().len(),
@@ -481,8 +481,11 @@ fn provenance(config_bytes: &[u8]) -> Result<DataProvenance, AppError> {
     .map_err(Into::into)
 }
 
-pub(crate) fn configured_path(config_path: &Path, value: &str) -> Result<PathBuf, AppError> {
-    let config_path = absolute_path(config_path)?;
+pub(crate) fn configured_path(
+    physical_config_path: &Path,
+    value: &str,
+) -> Result<PathBuf, AppError> {
+    let config_path = absolute_path(physical_config_path)?;
     let value = Path::new(value);
     if value.is_absolute() {
         Ok(value.to_owned())
