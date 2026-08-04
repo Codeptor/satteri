@@ -428,6 +428,71 @@ impl RuleSelection {
     }
 }
 
+/// Frozen unoptimizable family weights and regime gates carried inside every
+/// active artifact, rather than inferred from a mutable external config file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenRuleDefinitions {
+    /// Immutable family-definition schema/version.
+    pub family_version: String,
+    /// Trend weights in family order: trend, momentum, mean reversion,
+    /// microstructure, derivatives, cross-sectional.
+    pub trend_weights: [String; 6],
+    /// Range weights in that same immutable family order.
+    pub range_weights: [String; 6],
+    /// Immutable regime-definition schema/version.
+    pub regime_version: String,
+    /// Trend requires hourly ADX at least this value.
+    pub trend_adx_floor: String,
+    /// Trend requires absolute EMA8/EMA32 distance in ATR units at least this value.
+    pub trend_ema_distance_atr_floor: String,
+    /// Range requires hourly ADX at most this value.
+    pub range_adx_ceiling: String,
+    /// High volatility spans the inclusive historic realized-volatility p80..p95 interval.
+    pub high_volatility_percentiles: [String; 2],
+    /// Realized volatility strictly above p95 is an entry-blocking extreme regime.
+    pub extreme_volatility_rule: String,
+    /// Exact cross-family score agreement magnitude.
+    pub agreement_magnitude: String,
+    /// Exact high-volatility entry-threshold surcharge.
+    pub high_volatility_threshold_surcharge: String,
+    /// Exact opposite-composite exit magnitude.
+    pub opposite_exit_magnitude: String,
+}
+
+impl FrozenRuleDefinitions {
+    fn current() -> Self {
+        Self {
+            family_version: "trench.rules.families.v1".to_owned(),
+            trend_weights: [
+                "0.30".to_owned(),
+                "0.25".to_owned(),
+                "0".to_owned(),
+                "0.20".to_owned(),
+                "0.10".to_owned(),
+                "0.15".to_owned(),
+            ],
+            range_weights: [
+                "0".to_owned(),
+                "0.10".to_owned(),
+                "0.35".to_owned(),
+                "0.25".to_owned(),
+                "0.20".to_owned(),
+                "0.10".to_owned(),
+            ],
+            regime_version: "trench.rules.regimes.v1".to_owned(),
+            trend_adx_floor: "25".to_owned(),
+            trend_ema_distance_atr_floor: "0.35".to_owned(),
+            range_adx_ceiling: "20".to_owned(),
+            high_volatility_percentiles: ["0.80".to_owned(), "0.95".to_owned()],
+            extreme_volatility_rule: "realized_volatility_20_gt_p95".to_owned(),
+            agreement_magnitude: "0.15".to_owned(),
+            high_volatility_threshold_surcharge: "0.10".to_owned(),
+            opposite_exit_magnitude: "0.25".to_owned(),
+        }
+    }
+}
+
 /// Actual fully costed outcome returned from the production engine replay path.
 ///
 /// The four stream digests commit immutable prediction, intent, actual trade,
@@ -771,6 +836,7 @@ pub enum IneligibleReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RulesArtifact {
     selection: RuleSelection,
+    definitions: FrozenRuleDefinitions,
     code_digest: String,
     feature_schema_digest: String,
     data_digest: String,
@@ -789,6 +855,7 @@ impl RulesArtifact {
         selection.to_config()?;
         let mut artifact = Self {
             selection,
+            definitions: FrozenRuleDefinitions::current(),
             code_digest: provenance.code_digest.clone(),
             feature_schema_digest: provenance.feature_schema_digest.clone(),
             data_digest: provenance.data_digest.clone(),
@@ -809,6 +876,12 @@ impl RulesArtifact {
     #[must_use]
     pub const fn selection(&self) -> &RuleSelection {
         &self.selection
+    }
+
+    /// Returns the exact immutable family/regime definitions sealed in this artifact.
+    #[must_use]
+    pub const fn definitions(&self) -> &FrozenRuleDefinitions {
+        &self.definitions
     }
 
     /// Returns the content-addressed BLAKE3 artifact identity.
@@ -842,6 +915,7 @@ impl RulesArtifact {
             .map_err(|_| ValidationError::InvalidJson)?;
         let artifact = Self {
             selection: wire.selection,
+            definitions: wire.definitions,
             code_digest: wire.code_digest,
             feature_schema_digest: wire.feature_schema_digest,
             data_digest: wire.data_digest,
@@ -850,6 +924,9 @@ impl RulesArtifact {
             digest: wire.digest,
         };
         artifact.selection.to_config()?;
+        if artifact.definitions != FrozenRuleDefinitions::current() {
+            return Err(ValidationError::UndeclaredRuleParameter);
+        }
         if artifact_digest(&artifact)? != artifact.digest {
             return Err(ValidationError::InvalidDigest);
         }
@@ -1117,12 +1194,14 @@ impl RulesValidationReport {
 
     /// Verifies the runtime-bound portions of an otherwise complete active pair.
     ///
-    /// `expected_config_digest` commits the exact physical configuration file
-    /// selected by the daemon. `expected_code_digest` comes from the embedded
-    /// workspace build commitment. Feature/data commitments are checked between
-    /// the report and artifact by [`Self::validate_active_pair`], preserving the
-    /// data cutoff selected during research without pretending that forward
-    /// market data must hash to a historical immutable input.
+    /// `expected_config_digest` commits the canonical research-relevant portion
+    /// of the physical configuration selected by the daemon. It excludes the
+    /// artifact-reference table to avoid a self-referential report-digest cycle.
+    /// `expected_code_digest` comes from the embedded workspace build commitment.
+    /// Feature/data commitments are checked between the report and artifact by
+    /// [`Self::validate_active_pair`], preserving the data cutoff selected during
+    /// research without pretending that forward market data must hash to a
+    /// historical immutable input.
     pub fn validate_for_active(
         &self,
         expected_config_digest: &str,
@@ -1422,6 +1501,7 @@ fn report_digest(report: &RulesValidationReport) -> Result<String, ValidationErr
 struct ArtifactUnsignedWire {
     version: String,
     selection: RuleSelection,
+    definitions: FrozenRuleDefinitions,
     code_digest: String,
     feature_schema_digest: String,
     data_digest: String,
@@ -1433,6 +1513,7 @@ impl From<&RulesArtifact> for ArtifactUnsignedWire {
         Self {
             version: artifact.artifact_version.clone(),
             selection: artifact.selection.clone(),
+            definitions: artifact.definitions.clone(),
             code_digest: artifact.code_digest.clone(),
             feature_schema_digest: artifact.feature_schema_digest.clone(),
             data_digest: artifact.data_digest.clone(),
@@ -1446,6 +1527,7 @@ impl From<&RulesArtifact> for ArtifactUnsignedWire {
 struct ArtifactWire {
     version: String,
     selection: RuleSelection,
+    definitions: FrozenRuleDefinitions,
     code_digest: String,
     feature_schema_digest: String,
     data_digest: String,
@@ -1459,6 +1541,7 @@ impl From<&RulesArtifact> for ArtifactWire {
         Self {
             version: unsigned.version,
             selection: unsigned.selection,
+            definitions: unsigned.definitions,
             code_digest: unsigned.code_digest,
             feature_schema_digest: unsigned.feature_schema_digest,
             data_digest: unsigned.data_digest,
@@ -1950,6 +2033,9 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
+    use crate::strategy::Strategy;
+    use crate::strategy::rules::RulesStrategy;
+
     use super::{
         AtrFloor, CandidateInnerOutcomes, EngineReplayOutcome, EntryThreshold, IneligibleReason,
         ReplayPhase, ResearchEligibility, ResearchProvenance, RuleConfig, RuleGrid, RuleReplay,
@@ -2191,8 +2277,27 @@ mod tests {
                 TakeProfitMultiple::TwoR
             )
         );
+        assert_eq!(
+            reopened.definitions().trend_weights,
+            [
+                "0.30".to_owned(),
+                "0.25".to_owned(),
+                "0".to_owned(),
+                "0.20".to_owned(),
+                "0.10".to_owned(),
+                "0.15".to_owned(),
+            ]
+        );
+        let strategy = RulesStrategy::from_artifact(&reopened).expect("frozen strategy");
+        assert_eq!(strategy.fingerprint(), reopened.strategy_fingerprint());
         let mut wire: serde_json::Value = serde_json::from_slice(&bytes).expect("artifact JSON");
         wire["selection"]["threshold"] = serde_json::Value::String("0.61".to_owned());
+        assert!(
+            RulesArtifact::from_canonical_json(&serde_json::to_vec(&wire).expect("JSON")).is_err()
+        );
+
+        let mut wire: serde_json::Value = serde_json::from_slice(&bytes).expect("artifact JSON");
+        wire["definitions"]["trend_weights"][0] = serde_json::Value::String("0.31".to_owned());
         assert!(
             RulesArtifact::from_canonical_json(&serde_json::to_vec(&wire).expect("JSON")).is_err()
         );
