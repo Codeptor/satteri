@@ -289,10 +289,17 @@ impl ContextCapture {
                 limit: MAX_CONTEXT_MARKETS,
             });
         }
-        let discovered = metadata
+        // Delisted markets are not part of this point-in-time capture.  Apply
+        // the venue lifecycle boundary before materializing any metadata,
+        // current-context, or current-funding fact so the batch cannot expose
+        // a mixed active/delisted universe.
+        let eligible_assets = metadata
             .assets()
             .iter()
             .filter(|asset| !asset.is_delisted())
+            .collect::<Vec<_>>();
+        let discovered = eligible_assets
+            .iter()
             .map(|asset| asset.market().clone())
             .collect::<BTreeSet<_>>();
         if request
@@ -309,8 +316,7 @@ impl ContextCapture {
             return Err(ContextCaptureError::DetailedMarketNotDiscovered { market });
         }
 
-        let metadata_events = metadata
-            .assets()
+        let metadata_events = eligible_assets
             .iter()
             .map(|asset| metadata_events(asset, metadata_received_at))
             .collect::<Result<Vec<_>, _>>()?
@@ -954,13 +960,23 @@ mod tests {
         partial_fifteen_minutes: bool,
         expected_calls: u64,
     ) -> (ContextCapture, MockServer) {
+        let metadata =
+            serde_json::from_str::<Value>(META_FIXTURE).expect("fixture metadata must parse");
+        mounted_capture_with_metadata(metadata, partial_fifteen_minutes, expected_calls).await
+    }
+
+    async fn mounted_capture_with_metadata(
+        metadata: Value,
+        partial_fifteen_minutes: bool,
+        expected_calls: u64,
+    ) -> (ContextCapture, MockServer) {
         let server = MockServer::start().await;
         let client = InfoClient::new_loopback_for_test(&format!("{}/info", server.uri()))
             .expect("loopback client");
         Mock::given(method("POST"))
             .and(path("/info"))
             .and(body_json(json!({"type": "metaAndAssetCtxs"})))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(META_FIXTURE, "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
             .expect(expected_calls)
             .mount(&server)
             .await;
@@ -1130,6 +1146,27 @@ mod tests {
             Err(ContextCaptureError::DetailedMarketNotDiscovered {
                 market: market("OLD"),
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_excludes_delisted_markets_from_every_materialized_event_kind() {
+        let mut metadata =
+            serde_json::from_str::<Value>(META_FIXTURE).expect("fixture metadata must parse");
+        metadata[0]["universe"][3]["isDelisted"] = json!(true);
+        let (capture, _server) = mounted_capture_with_metadata(metadata, false, 1).await;
+
+        let batch = capture
+            .capture(&request(), &FixedClock)
+            .await
+            .expect("active market context must remain complete");
+
+        assert!(
+            batch
+                .events()
+                .iter()
+                .all(|event| event.market() != &market("OLD")),
+            "a delisted market must not materialize any normalized event kind"
         );
     }
 
