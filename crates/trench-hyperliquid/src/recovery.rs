@@ -190,6 +190,43 @@ impl GapRecoveryRequest {
     }
 }
 
+/// Builds a typed recovery request from normalized source fixtures.
+///
+/// This debug-only hook is intentionally absent from release builds. Runtime
+/// requests may only originate from the bounded WebSocket state machine.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn recovery_request_from_events_for_test(
+    generation: u64,
+    predecessor: Option<&MarketEvent>,
+    snapshot: &MarketEvent,
+) -> GapRecoveryRequest {
+    let (trade_predecessor_event_time, trade_predecessor_received_at, trade_predecessor_event_id) =
+        predecessor
+            .filter(|event| matches!(event.kind(), MarketEventKind::Trade(_)))
+            .map_or((None, None, None), |event| {
+                (
+                    Some(event.event_time()),
+                    Some(event.received_at()),
+                    Some(event.event_id().clone()),
+                )
+            });
+    GapRecoveryRequest {
+        generation,
+        market: snapshot.market().clone(),
+        reason: GapReason::TransportClosed,
+        predecessor_event_time: predecessor.map(MarketEvent::event_time),
+        predecessor_received_at: predecessor.map(MarketEvent::received_at),
+        trade_predecessor_event_time,
+        trade_predecessor_received_at,
+        trade_predecessor_event_id,
+        snapshot_event_id: snapshot.event_id().clone(),
+        snapshot_event_time: snapshot.event_time(),
+        snapshot_received_at: snapshot.received_at(),
+        reconnect_attempt: 1,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct RecoveryKey {
     generation: u64,

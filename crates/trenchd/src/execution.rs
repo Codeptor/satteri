@@ -395,7 +395,7 @@ impl TypedMarketRouter {
     }
 
     #[cfg(test)]
-    fn open_gap_for_test(&mut self, market: Market) {
+    pub(crate) fn open_gap_for_test(&mut self, market: Market) {
         self.gap_generations.insert(market.clone(), 1);
         self.recovered_at.remove(&market);
         self.unavailable.remove(&market);

@@ -3263,6 +3263,7 @@ dependencies = [
  "trench-core",
  "trench-hyperliquid",
  "trench-storage",
+ "wiremock",
 ]
 
 [[package]]

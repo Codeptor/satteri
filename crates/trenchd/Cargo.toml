@@ -28,6 +28,7 @@ trench-storage = { path = "../trench-storage" }
 [dev-dependencies]
 tempfile.workspace = true
 trench-core = { path = "../trench-core", features = ["test-support"] }
+wiremock.workspace = true
 
 [build-dependencies]
 blake3.workspace = true

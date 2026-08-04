@@ -19,6 +19,9 @@ pub use normalize::{
     AssetContext, BookLevel, Candle, FundingRecord, L2Book, MetaAndAssetContexts, PerpAsset,
     SignedRate, VenueMaxLeverage,
 };
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub use recovery::recovery_request_from_events_for_test;
 pub use recovery::{
     GapRecovery, GapRecoveryRequest, MAX_OUTSTANDING_RECOVERY_REQUESTS,
     MAX_PROCESSED_RECOVERY_REQUESTS, MAX_RECOVERY_LOCAL_TRADES, MAX_RECOVERY_OFFICIAL_CANDLES,

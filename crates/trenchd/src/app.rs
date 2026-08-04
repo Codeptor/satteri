@@ -898,18 +898,118 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
 
     use rust_decimal::Decimal;
+    use serde_json::json;
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
+    use trench_core::event::{BookLevel, BookSnapshot};
+    use trench_hyperliquid::{
+        InfoClient, RecoveryStatus, RecoveryUnavailable, recovery_request_from_events_for_test,
+    };
+    use wiremock::matchers::{body_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{
-        AuthorityState, admit_market_event, configured_path, initial_engine_state,
-        maximum_book_age, recover_source_stream,
+        AuthorityState, RecoveryInput, RecoveryOutput, admit_market_event, admit_recovery_output,
+        configured_path, initial_engine_state, maximum_book_age, recover_source_stream,
+        recovery_worker,
     };
     use crate::readiness::Readiness;
     use crate::writer::EngineWriter;
     use trench_core::domain::{Market, Price, Quantity, Side};
     use trench_core::event::{MarketEvent, TimestampNs, Trade};
     use trench_storage::parquet::{DataProvenance, ParquetStore};
+
+    const BASE_MS: i64 = 1_800_000_000;
+    const BASE_NS: i64 = BASE_MS * 1_000_000;
+    const HOUR_NS: i64 = 3_600_000_000_000;
+
+    fn timestamp(value: i64) -> TimestampNs {
+        TimestampNs::new(i128::from(value)).expect("fixture timestamp")
+    }
+
+    fn btc() -> Market {
+        Market::new("BTC").expect("fixture market")
+    }
+
+    fn price(value: i64) -> Price {
+        Price::new(Decimal::from(value)).expect("fixture price")
+    }
+
+    fn quantity(value: i64) -> Quantity {
+        Quantity::new(Decimal::from(value)).expect("fixture quantity")
+    }
+
+    fn predecessor() -> MarketEvent {
+        MarketEvent::trade(
+            timestamp(BASE_NS),
+            timestamp(BASE_NS),
+            btc(),
+            Trade::new(1, Side::Buy, price(100), quantity(1)).expect("fixture trade"),
+        )
+        .expect("fixture event")
+    }
+
+    fn snapshot(at: i64, sequence: u64) -> MarketEvent {
+        MarketEvent::book_snapshot(
+            timestamp(at),
+            timestamp(at),
+            btc(),
+            BookSnapshot::new(
+                sequence,
+                vec![BookLevel::new(price(99), quantity(10))],
+                vec![BookLevel::new(price(101), quantity(10))],
+            ),
+        )
+        .expect("fixture book")
+    }
+
+    fn provenance() -> DataProvenance {
+        DataProvenance::new(
+            format!("b3:{}", "a".repeat(64)),
+            format!("b3:{}", "b".repeat(64)),
+            ParquetStore::schema_hash(),
+        )
+        .expect("fixture provenance")
+    }
+
+    fn authority(run_id: &str) -> AuthorityState {
+        AuthorityState {
+            engine_state: Some(initial_engine_state(run_id, BASE_NS).expect("fixture state")),
+            router: crate::execution::TypedMarketRouter::new(
+                maximum_book_age().expect("fixture maximum book age"),
+            ),
+            readiness: Readiness::default(),
+            reconciled: false,
+            recovery_markets: BTreeSet::new(),
+            recovery_worker_available: true,
+        }
+    }
+
+    async fn next_recovery_output(receiver: &mut mpsc::Receiver<RecoveryOutput>) -> RecoveryOutput {
+        timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("recovery worker must respond before timeout")
+            .expect("recovery worker result channel must remain open")
+    }
+
+    fn zero_candle(open: i64, interval_ms: i64) -> serde_json::Value {
+        json!({
+            "t": open,
+            "T": open + interval_ms - 1,
+            "s": "BTC",
+            "i": if interval_ms == 900_000 { "15m" } else { "1h" },
+            "o": "100",
+            "c": "100",
+            "h": "100",
+            "l": "100",
+            "v": "0",
+            "n": 0,
+        })
+    }
 
     #[test]
     fn configured_relative_storage_is_anchored_to_the_config_not_the_process() {
@@ -1002,5 +1102,230 @@ mod tests {
         );
         assert!(authority.engine_state.is_some());
         assert!(!authority.reconciled);
+    }
+
+    #[tokio::test]
+    async fn unavailable_recovery_evidence_stays_fenced_after_the_authority_drains_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let directory = tempfile::tempdir().expect("fixture root");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("private fixture root");
+        let store = ParquetStore::open(directory.path(), provenance()).expect("fixture store");
+        let mut writer = EngineWriter::open(
+            directory.path().join("trench.sqlite"),
+            "run-unavailable",
+            BASE_NS,
+        )
+        .await
+        .expect("fixture writer");
+        let mut authority = authority("run-unavailable");
+        let predecessor = predecessor();
+        let anchor = snapshot(BASE_NS + HOUR_NS, 1);
+        let request = recovery_request_from_events_for_test(1, Some(&predecessor), &anchor);
+
+        store
+            .write_events(std::slice::from_ref(&predecessor))
+            .expect("persisted predecessor");
+        admit_market_event(&mut writer, &mut authority, predecessor, None)
+            .await
+            .expect("durable predecessor admission");
+        authority.router.open_gap_for_test(btc());
+        store
+            .write_events(std::slice::from_ref(&anchor))
+            .expect("persisted recovery snapshot");
+        admit_market_event(&mut writer, &mut authority, anchor, None)
+            .await
+            .expect("durable fenced snapshot admission");
+        authority.recovery_markets.insert(btc());
+        super::admit_typed_engine_event(
+            &mut writer,
+            &mut authority,
+            crate::execution::TypedEngineEvent::recovery_requested(&request),
+        )
+        .await
+        .expect("durable recovery request record");
+        let count_before_result = writer
+            .journal_counts()
+            .await
+            .expect("journal counts")
+            .events;
+
+        let client = InfoClient::new_loopback_for_test(&format!("{}/info", server.uri()))
+            .expect("loopback recovery client");
+        let cancellation = CancellationToken::new();
+        let (input_sender, input_receiver) = mpsc::channel(4);
+        let (output_sender, mut output_receiver) = mpsc::channel(4);
+        let task = tokio::spawn(recovery_worker(
+            client,
+            input_receiver,
+            output_sender,
+            cancellation.clone(),
+        ));
+        input_sender
+            .send(RecoveryInput::Request(request))
+            .await
+            .expect("recovery request handoff");
+        let output = next_recovery_output(&mut output_receiver).await;
+        assert!(matches!(
+            &output,
+            RecoveryOutput::Result(result)
+                if matches!(
+                    result.status(),
+                    RecoveryStatus::Unavailable {
+                        reason: RecoveryUnavailable::OfficialCandleEvidenceUnavailable
+                    }
+                )
+        ));
+        admit_recovery_output(&mut writer, &mut authority, &store, output)
+            .await
+            .expect("authority must record the fenced result");
+        assert_eq!(
+            writer
+                .journal_counts()
+                .await
+                .expect("journal counts")
+                .events,
+            count_before_result,
+            "an unavailable result must not forge a market recovery transition"
+        );
+        assert!(!authority.readiness.mandatory_exit_ready(&btc()));
+        assert!(
+            authority
+                .readiness
+                .market_blockers(&btc())
+                .contains(&crate::readiness::MarketBlocker::Recovery)
+        );
+
+        cancellation.cancel();
+        drop(input_sender);
+        task.await.expect("recovery worker shutdown");
+    }
+
+    #[tokio::test]
+    async fn reconciled_recovery_requires_a_new_post_completion_book_before_execution() {
+        let server = MockServer::start().await;
+        let end_ms = BASE_MS + 3_600_000 - 1;
+        Mock::given(method("POST"))
+            .and(path("/info"))
+            .and(body_json(json!({
+                "type": "candleSnapshot",
+                "req": {
+                    "coin": "BTC",
+                    "interval": "15m",
+                    "startTime": BASE_MS,
+                    "endTime": end_ms,
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![
+                zero_candle(BASE_MS, 900_000),
+                zero_candle(BASE_MS + 900_000, 900_000),
+                zero_candle(BASE_MS + 1_800_000, 900_000),
+                zero_candle(BASE_MS + 2_700_000, 900_000),
+            ]))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/info"))
+            .and(body_json(json!({
+                "type": "candleSnapshot",
+                "req": {
+                    "coin": "BTC",
+                    "interval": "1h",
+                    "startTime": BASE_MS,
+                    "endTime": end_ms,
+                }
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(vec![zero_candle(BASE_MS, 3_600_000)]),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let directory = tempfile::tempdir().expect("fixture root");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("private fixture root");
+        let store = ParquetStore::open(directory.path(), provenance()).expect("fixture store");
+        let mut writer = EngineWriter::open(
+            directory.path().join("trench.sqlite"),
+            "run-reconciled",
+            BASE_NS,
+        )
+        .await
+        .expect("fixture writer");
+        let mut authority = authority("run-reconciled");
+        let predecessor = predecessor();
+        let anchor = snapshot(BASE_NS + HOUR_NS, 1);
+        let request = recovery_request_from_events_for_test(1, Some(&predecessor), &anchor);
+
+        store
+            .write_events(std::slice::from_ref(&predecessor))
+            .expect("persisted predecessor");
+        admit_market_event(&mut writer, &mut authority, predecessor, None)
+            .await
+            .expect("durable predecessor admission");
+        authority.router.open_gap_for_test(btc());
+        store
+            .write_events(std::slice::from_ref(&anchor))
+            .expect("persisted recovery snapshot");
+        admit_market_event(&mut writer, &mut authority, anchor.clone(), None)
+            .await
+            .expect("durable fenced snapshot admission");
+        authority.recovery_markets.insert(btc());
+        super::admit_typed_engine_event(
+            &mut writer,
+            &mut authority,
+            crate::execution::TypedEngineEvent::recovery_requested(&request),
+        )
+        .await
+        .expect("durable recovery request record");
+
+        let client = InfoClient::new_loopback_for_test(&format!("{}/info", server.uri()))
+            .expect("loopback recovery client");
+        let cancellation = CancellationToken::new();
+        let (input_sender, input_receiver) = mpsc::channel(4);
+        let (output_sender, mut output_receiver) = mpsc::channel(4);
+        let task = tokio::spawn(recovery_worker(
+            client,
+            input_receiver,
+            output_sender,
+            cancellation.clone(),
+        ));
+        input_sender
+            .send(RecoveryInput::Request(request))
+            .await
+            .expect("recovery request handoff");
+        let output = next_recovery_output(&mut output_receiver).await;
+        assert!(matches!(
+            &output,
+            RecoveryOutput::Result(result) if matches!(result.status(), RecoveryStatus::Reconciled { .. })
+        ));
+        admit_recovery_output(&mut writer, &mut authority, &store, output)
+            .await
+            .expect("authority must route reconciled recovery");
+        assert!(
+            authority
+                .readiness
+                .market_blockers(&btc())
+                .contains(&crate::readiness::MarketBlocker::ExecutableBook)
+        );
+        assert!(!authority.readiness.mandatory_exit_ready(&btc()));
+
+        let post_completion = snapshot(BASE_NS + HOUR_NS + 1, 2);
+        store
+            .write_events(std::slice::from_ref(&post_completion))
+            .expect("persisted post-completion book");
+        admit_market_event(&mut writer, &mut authority, post_completion, None)
+            .await
+            .expect("post-completion book admission");
+        assert!(authority.readiness.mandatory_exit_ready(&btc()));
+
+        cancellation.cancel();
+        drop(input_sender);
+        task.await.expect("recovery worker shutdown");
     }
 }
