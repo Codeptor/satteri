@@ -292,6 +292,7 @@ impl ContextCapture {
         let discovered = metadata
             .assets()
             .iter()
+            .filter(|asset| !asset.is_delisted())
             .map(|asset| asset.market().clone())
             .collect::<BTreeSet<_>>();
         if request
@@ -1024,6 +1025,20 @@ mod tests {
         (ContextCapture::new(client), server)
     }
 
+    async fn mounted_metadata_capture(metadata: Value) -> (ContextCapture, MockServer) {
+        let server = MockServer::start().await;
+        let client = InfoClient::new_loopback_for_test(&format!("{}/info", server.uri()))
+            .expect("loopback client");
+        Mock::given(method("POST"))
+            .and(path("/info"))
+            .and(body_json(json!({"type": "metaAndAssetCtxs"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
+            .expect(1)
+            .mount(&server)
+            .await;
+        (ContextCapture::new(client), server)
+    }
+
     #[tokio::test]
     async fn capture_materializes_complete_explicit_time_public_context() {
         let (capture, _server) = mounted_capture(false, 1).await;
@@ -1099,6 +1114,23 @@ mod tests {
                         && funding.mark_price().is_some())
             }));
         }
+    }
+
+    #[tokio::test]
+    async fn capture_excludes_delisted_markets_from_detailed_discovery() {
+        let mut metadata =
+            serde_json::from_str::<Value>(META_FIXTURE).expect("fixture metadata must parse");
+        metadata[0]["universe"][3]["isDelisted"] = json!(true);
+        let (capture, _server) = mounted_metadata_capture(metadata).await;
+        let request = ContextCaptureRequest::new(vec![market("OLD")], range(), range(), range())
+            .expect("bounded detailed request");
+
+        assert_eq!(
+            capture.capture(&request, &FixedClock).await,
+            Err(ContextCaptureError::DetailedMarketNotDiscovered {
+                market: market("OLD"),
+            })
+        );
     }
 
     #[tokio::test]

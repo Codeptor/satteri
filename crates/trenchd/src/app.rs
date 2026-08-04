@@ -16,8 +16,9 @@ use trench_core::engine::{Engine, EngineContext, EngineState};
 use trench_core::event::{DurationNs, MarketEvent, TimestampNs};
 use trench_core::ledger::LedgerState;
 use trench_hyperliquid::{
-    GapEvent, GapRecoveryRequest, InfoClient, InfoError, RecoveryEvidenceProducer,
-    RecoveryProducerError, RecoveryResult, WsClient, WsConfig, WsOutput, WsStream,
+    GapEvent, GapRecoveryRequest, InfoClient, InfoError, MetaAndAssetContexts,
+    RecoveryEvidenceProducer, RecoveryProducerError, RecoveryResult, WsClient, WsConfig, WsOutput,
+    WsStream,
 };
 use trench_storage::parquet::{DataProvenance, ParquetError, ParquetStore};
 use trench_storage::replay::{DeterministicReplay, ReplayError, ReplayPlan};
@@ -624,30 +625,7 @@ async fn open_live_stream(config: &PaperConfig, readiness: &mut Readiness) -> Op
             return None;
         }
     };
-    let limit = usize::from(config.feed().tradeable_market_count())
-        .checked_add(usize::from(config.feed().warm_buffer_market_count()))?;
-    let mut markets = metadata
-        .assets()
-        .iter()
-        .filter(|asset| {
-            asset.only_isolated()
-                && asset.max_leverage().value()
-                    >= u32::from(config.risk().minimum_leverage().value())
-                && asset.context().day_notional_volume() >= config.feed().minimum_daily_notional()
-        })
-        .map(|asset| {
-            (
-                asset.market().clone(),
-                asset.context().day_notional_volume().value(),
-            )
-        })
-        .collect::<Vec<_>>();
-    markets.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-    let markets = markets
-        .into_iter()
-        .take(limit)
-        .map(|(market, _)| market)
-        .collect::<Vec<_>>();
+    let markets = select_dynamic_markets(config, &metadata);
     if markets.is_empty() {
         tracing::warn!("no market passed the collector's conservative public liquidity prefilter");
         return None;
@@ -665,6 +643,33 @@ async fn open_live_stream(config: &PaperConfig, readiness: &mut Readiness) -> Op
             None
         }
     }
+}
+
+fn select_dynamic_markets(config: &PaperConfig, metadata: &MetaAndAssetContexts) -> Vec<Market> {
+    let limit = usize::from(config.feed().tradeable_market_count())
+        + usize::from(config.feed().warm_buffer_market_count());
+    let mut markets = metadata
+        .assets()
+        .iter()
+        .filter(|asset| {
+            !asset.is_delisted()
+                && asset.max_leverage().value()
+                    >= u32::from(config.risk().minimum_leverage().value())
+                && asset.context().day_notional_volume() >= config.feed().minimum_daily_notional()
+        })
+        .map(|asset| {
+            (
+                asset.market().clone(),
+                asset.context().day_notional_volume().value(),
+            )
+        })
+        .collect::<Vec<_>>();
+    markets.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    markets
+        .into_iter()
+        .take(limit)
+        .map(|(market, _)| market)
+        .collect()
 }
 
 fn mark_market_execution_blocked(readiness: &mut Readiness, market: trench_core::domain::Market) {
@@ -992,13 +997,15 @@ mod tests {
     use std::time::Duration;
 
     use rust_decimal::Decimal;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tokio::sync::mpsc;
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
+    use trench_core::config::PaperConfig;
     use trench_core::event::{BookLevel, BookSnapshot};
     use trench_hyperliquid::{
-        InfoClient, RecoveryStatus, RecoveryUnavailable, recovery_request_from_events_for_test,
+        InfoClient, MetaAndAssetContexts, RecoveryStatus, RecoveryUnavailable,
+        recovery_request_from_events_for_test,
     };
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1006,7 +1013,7 @@ mod tests {
     use super::{
         AuthorityState, RecoveryInput, RecoveryOutput, admit_market_event, admit_recovery_output,
         configured_path, initial_engine_state, maximum_book_age, recover_source_stream,
-        recovery_worker,
+        recovery_worker, select_dynamic_markets,
     };
     use crate::readiness::Readiness;
     use crate::writer::EngineWriter;
@@ -1017,6 +1024,8 @@ mod tests {
     const BASE_MS: i64 = 1_800_000_000;
     const BASE_NS: i64 = BASE_MS * 1_000_000;
     const HOUR_NS: i64 = 3_600_000_000_000;
+    const META_FIXTURE: &str = include_str!("../../../tests/fixtures/meta/native-perps.json");
+    const PAPER_CONFIG: &str = include_str!("../../../config/paper.example.toml");
 
     fn timestamp(value: i64) -> TimestampNs {
         TimestampNs::new(i128::from(value)).expect("fixture timestamp")
@@ -1034,6 +1043,27 @@ mod tests {
         Quantity::new(Decimal::from(value)).expect("fixture quantity")
     }
 
+    async fn metadata_with_delisted_old() -> MetaAndAssetContexts {
+        let mut fixture =
+            serde_json::from_str::<Value>(META_FIXTURE).expect("fixture metadata must parse");
+        fixture[0]["universe"][3]["isDelisted"] = json!(true);
+        fixture[1][3]["dayNtlVlm"] = json!("9999999999");
+        let server = MockServer::start().await;
+        let client = InfoClient::new_loopback_for_test(&format!("{}/info", server.uri()))
+            .expect("loopback metadata client");
+        Mock::given(method("POST"))
+            .and(path("/info"))
+            .and(body_json(json!({"type": "metaAndAssetCtxs"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture))
+            .expect(1)
+            .mount(&server)
+            .await;
+        client
+            .meta_and_asset_contexts()
+            .await
+            .expect("fixture metadata must normalize")
+    }
+
     fn predecessor() -> MarketEvent {
         MarketEvent::trade(
             timestamp(BASE_NS),
@@ -1042,6 +1072,21 @@ mod tests {
             Trade::new(1, Side::Buy, price(100), quantity(1)).expect("fixture trade"),
         )
         .expect("fixture event")
+    }
+
+    #[tokio::test]
+    async fn dynamic_selection_includes_non_isolated_native_perps_and_excludes_delisted() {
+        let config = PaperConfig::from_toml(PAPER_CONFIG).expect("fixture config");
+        let metadata = metadata_with_delisted_old().await;
+
+        assert_eq!(
+            select_dynamic_markets(&config, &metadata),
+            vec![
+                Market::new("BTC").expect("fixture market"),
+                Market::new("ETH").expect("fixture market"),
+                Market::new("SOL").expect("fixture market"),
+            ]
+        );
     }
 
     fn snapshot(at: i64, sequence: u64) -> MarketEvent {
