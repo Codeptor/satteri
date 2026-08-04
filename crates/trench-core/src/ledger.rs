@@ -60,18 +60,77 @@ impl EntryFill {
     }
 }
 
-/// One complete close fill for the sole isolated position.
+/// One actual reduce-only fill for the sole isolated position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExitFill {
+    quantity: Quantity,
     price: Price,
     fee: Usdc,
 }
 
 impl ExitFill {
-    /// Creates a complete close fill from validated units.
+    /// Creates an actual positive executed quantity from validated units.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero and negative executed quantity.
+    pub fn new(quantity: Decimal, price: Price, fee: Usdc) -> Result<Self, LedgerError> {
+        let quantity = Quantity::new(quantity)?;
+        if quantity.value().is_zero() {
+            return Err(LedgerError::ZeroPositionSize);
+        }
+        Ok(Self {
+            quantity,
+            price,
+            fee,
+        })
+    }
+
+    /// Returns the actual reduce-only executed quantity.
     #[must_use]
-    pub const fn new(price: Price, fee: Usdc) -> Self {
-        Self { price, fee }
+    pub const fn quantity(self) -> Quantity {
+        self.quantity
+    }
+
+    /// Returns the actual execution price.
+    #[must_use]
+    pub const fn price(self) -> Price {
+        self.price
+    }
+
+    /// Returns the fee charged on the actual fill only.
+    #[must_use]
+    pub const fn fee(self) -> Usdc {
+        self.fee
+    }
+}
+
+/// Exact signed funding cashflow. Positive values debit an isolated ledger;
+/// negative values credit it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FundingCashflow(Decimal);
+
+impl FundingCashflow {
+    /// Creates an exact funding debit.
+    #[must_use]
+    pub const fn debit(amount: Usdc) -> Self {
+        Self(amount.value())
+    }
+
+    /// Creates an exact funding receipt.
+    pub fn credit(amount: Usdc) -> Result<Self, LedgerError> {
+        Decimal::ZERO
+            .checked_sub(amount.value())
+            .map(Self)
+            .ok_or(LedgerError::Arithmetic {
+                operation: "funding receipt sign",
+            })
+    }
+
+    /// Returns the signed cashflow where positive is a debit.
+    #[must_use]
+    pub const fn value(self) -> Decimal {
+        self.0
     }
 }
 
@@ -201,9 +260,7 @@ pub struct Position {
     quantity: Quantity,
     entry_price: Price,
     leverage: Leverage,
-    isolated_margin: Usdc,
-    entry_fee: Usdc,
-    funding_debits: Usdc,
+    trade_cashflow: Decimal,
 }
 
 impl Position {
@@ -235,12 +292,6 @@ impl Position {
     #[must_use]
     pub const fn leverage(&self) -> Leverage {
         self.leverage
-    }
-
-    /// Returns the margin isolated to this position only.
-    #[must_use]
-    pub const fn isolated_margin(&self) -> Usdc {
-        self.isolated_margin
     }
 }
 
@@ -291,10 +342,14 @@ pub enum LedgerTransitionKind {
     },
     /// The sole isolated position was opened.
     PositionOpened,
-    /// Funding was debited from cash and the isolated position.
-    FundingDebited,
-    /// The sole isolated position was completely closed.
+    /// Signed funding was applied to cash and the isolated position.
+    FundingApplied,
+    /// The sole isolated position was partially reduced.
+    PositionReduced,
+    /// The sole isolated position was fully closed.
     PositionClosed,
+    /// A broker-reported gap loss forfeited isolated collateral only.
+    PositionLiquidated,
     /// UTC-period state was reset only after explicit reconciliation.
     Reconciled,
 }
@@ -366,6 +421,15 @@ pub enum LedgerError {
     /// A mark would produce an invalid negative equity state.
     #[error("mark would produce negative synthetic equity")]
     NegativeEquity,
+    /// A partial reduction exceeded the actual open quantity.
+    #[error("reduce-only fill exceeds the isolated position quantity")]
+    ReduceExceedsPosition,
+    /// A broker liquidation forfeit exceeded live isolated collateral.
+    #[error("broker liquidation forfeit exceeds live isolated collateral")]
+    InvalidLiquidationForfeit,
+    /// An actual exit exhausted collateral and must be paired with broker evidence.
+    #[error("exit exhausted isolated collateral and requires a paired liquidation record")]
+    CappedLiquidationRequired,
     /// Checked decimal arithmetic failed.
     #[error("checked arithmetic failed while calculating {operation}")]
     Arithmetic {
@@ -379,12 +443,13 @@ pub enum LedgerError {
 pub struct LedgerState {
     ledger_id: LedgerId,
     cash: Usdc,
-    isolated_margin: Usdc,
+    isolated_collateral: Decimal,
     position: Option<Position>,
     realized_pnl: Decimal,
     unrealized_pnl: Decimal,
     fees_paid: Usdc,
     funding_paid: Usdc,
+    funding_received: Usdc,
     equity: Usdc,
     breakers: BreakerState,
     last_executable_mark: Option<ExecutableMark>,
@@ -404,12 +469,13 @@ impl LedgerState {
         Ok(Self {
             ledger_id,
             cash,
-            isolated_margin: Usdc::zero(),
+            isolated_collateral: Decimal::ZERO,
             position: None,
             realized_pnl: Decimal::ZERO,
             unrealized_pnl: Decimal::ZERO,
             fees_paid: Usdc::zero(),
             funding_paid: Usdc::zero(),
+            funding_received: Usdc::zero(),
             equity: cash,
             breakers: BreakerState::new(opened_at, cash)?,
             last_executable_mark: None,
@@ -437,10 +503,15 @@ impl LedgerState {
         self.cash
     }
 
-    /// Returns the margin reserved to the sole isolated position.
+    /// Returns the live collateral held inside the isolated position.
+    ///
+    /// Funding and realized losses change this balance before they can affect
+    /// free cash. A broker may temporarily carry a negative reference balance
+    /// until its mandatory liquidation transition, so this is signed decimal
+    /// accounting rather than a nonnegative [`Usdc`] amount.
     #[must_use]
-    pub const fn isolated_margin(&self) -> Usdc {
-        self.isolated_margin
+    pub const fn isolated_collateral(&self) -> Decimal {
+        self.isolated_collateral
     }
 
     /// Returns the sole open isolated position, if any.
@@ -473,7 +544,13 @@ impl LedgerState {
         self.funding_paid
     }
 
-    /// Returns executable equity: cash plus isolated margin plus marked adjustment.
+    /// Returns all funding receipts credited to isolated collateral.
+    #[must_use]
+    pub const fn funding_received(&self) -> Usdc {
+        self.funding_received
+    }
+
+    /// Returns executable equity: free cash plus live collateral and marked adjustment.
     #[must_use]
     pub const fn equity(&self) -> Usdc {
         self.equity
@@ -595,7 +672,8 @@ impl LedgerState {
             }
             let mark = executable_mark(position, book, costs)?;
             state.unrealized_pnl = marked_pnl(position, mark.exit_value, costs)?;
-            state.equity = equity_from(state.cash, state.isolated_margin, state.unrealized_pnl)?;
+            state.equity =
+                equity_from(state.cash, state.isolated_collateral, state.unrealized_pnl)?;
             state.breakers = self.breakers.record_equity(at, state.equity)?;
             state.last_executable_mark = Some(mark);
             state.liquidity_incomplete = mark.liquidity_incomplete;
@@ -650,26 +728,28 @@ impl LedgerState {
             .ok_or(LedgerError::Arithmetic {
                 operation: "isolated margin",
             })?;
-        let isolated_margin = Usdc::new(margin_value)?;
-        let required = checked_add_usdc(isolated_margin, entry.fee, "entry cash requirement")?;
+        let isolated_collateral = Usdc::new(margin_value)?;
+        let required = checked_add_usdc(isolated_collateral, entry.fee, "entry cash requirement")?;
         let cash = checked_debit(self.cash, required)?;
 
         let mut state = self.clone();
         state.cash = cash;
-        state.isolated_margin = isolated_margin;
+        state.isolated_collateral = isolated_collateral.value();
         state.position = Some(Position {
             market: entry.market,
             side: entry.side,
             quantity: entry.quantity,
             entry_price: entry.price,
             leverage: entry.leverage,
-            isolated_margin,
-            entry_fee: entry.fee,
-            funding_debits: Usdc::zero(),
+            trade_cashflow: Decimal::ZERO.checked_sub(required.value()).ok_or(
+                LedgerError::Arithmetic {
+                    operation: "entry trade cashflow",
+                },
+            )?,
         });
         state.unrealized_pnl = Decimal::ZERO;
         state.fees_paid = checked_add_usdc(self.fees_paid, entry.fee, "entry fee total")?;
-        state.equity = equity_from(state.cash, state.isolated_margin, state.unrealized_pnl)?;
+        state.equity = equity_from(state.cash, state.isolated_collateral, state.unrealized_pnl)?;
         state.breakers = self
             .breakers
             .record_entry(at)?
@@ -683,91 +763,277 @@ impl LedgerState {
         ))
     }
 
-    /// Debits realized funding from cash and the sole isolated position.
+    /// Applies signed realized funding to the sole isolated collateral balance.
     ///
     /// # Errors
     ///
-    /// Rejects a flat ledger, backward time, insufficient cash, and arithmetic
+    /// Rejects a flat ledger, backward time, and checked arithmetic
     /// failures.
+    pub fn apply_funding(
+        &self,
+        at: TimestampNs,
+        cashflow: FundingCashflow,
+    ) -> Result<LedgerTransition, LedgerError> {
+        self.position.as_ref().ok_or(LedgerError::NoOpenPosition)?;
+        let mut state = self.clone();
+        let amount = cashflow.value();
+        if amount >= Decimal::ZERO {
+            let debit = Usdc::new(amount)?;
+            state.funding_paid = checked_add_usdc(self.funding_paid, debit, "funding debit total")?;
+        } else {
+            let credit = Usdc::new(Decimal::ZERO.checked_sub(amount).ok_or(
+                LedgerError::Arithmetic {
+                    operation: "funding receipt",
+                },
+            )?)?;
+            state.funding_received =
+                checked_add_usdc(self.funding_received, credit, "funding receipt total")?;
+        }
+        state.isolated_collateral =
+            self.isolated_collateral
+                .checked_sub(amount)
+                .ok_or(LedgerError::Arithmetic {
+                    operation: "funding isolated collateral",
+                })?;
+        state.equity = equity_from(state.cash, state.isolated_collateral, state.unrealized_pnl)?;
+        state.breakers = self.breakers.record_equity(at, state.equity)?;
+        Ok(Self::transition(
+            at,
+            LedgerTransitionKind::FundingApplied,
+            state,
+        ))
+    }
+
+    /// Applies a nonnegative funding debit through the signed funding transition.
+    ///
+    /// This remains a narrow convenience for deterministic callers that have
+    /// already established a debit direction.
     pub fn apply_funding_debit(
         &self,
         at: TimestampNs,
         amount: Usdc,
     ) -> Result<LedgerTransition, LedgerError> {
-        let position = self.position.as_ref().ok_or(LedgerError::NoOpenPosition)?;
-        let mut state = self.clone();
-        state.cash = checked_debit(self.cash, amount)?;
-        state.funding_paid = checked_add_usdc(self.funding_paid, amount, "funding total")?;
-        let mut updated_position = position.clone();
-        updated_position.funding_debits =
-            checked_add_usdc(position.funding_debits, amount, "position funding total")?;
-        state.position = Some(updated_position);
-        state.equity = equity_from(state.cash, state.isolated_margin, state.unrealized_pnl)?;
-        state.breakers = self.breakers.record_equity(at, state.equity)?;
-        Ok(Self::transition(
-            at,
-            LedgerTransitionKind::FundingDebited,
-            state,
-        ))
+        self.apply_funding(at, FundingCashflow::debit(amount))
     }
 
-    /// Applies a complete close fill and returns all isolated margin to cash.
+    /// Applies one actual reduce-only fill without a broker liquidation cap.
     ///
     /// # Errors
     ///
-    /// Rejects a flat ledger, backward time, insufficient cash, and arithmetic
-    /// failures. Partial closes are intentionally absent: this ledger owns at
-    /// most one complete isolated position.
-    pub fn close_position(
+    /// Rejects a flat ledger, an oversized reduction, a fill that requires a
+    /// broker-reported collateral cap, insufficient fee cash, and checked
+    /// arithmetic failures.
+    pub fn reduce_position(
         &self,
         at: TimestampNs,
         exit: ExitFill,
     ) -> Result<LedgerTransition, LedgerError> {
+        self.settle_exit(at, exit, None)
+    }
+
+    /// Atomically settles one actual exit fill with its broker-reported cap.
+    ///
+    /// A capped gap fill consumes the current isolated collateral, never free
+    /// cash.  The forfeit must equal the live collateral immediately before the
+    /// fill; this is the same quantity the broker reports in its paired
+    /// `LiquidationLoss` record.
+    pub fn settle_liquidated_exit(
+        &self,
+        at: TimestampNs,
+        exit: ExitFill,
+        forfeited_isolated_equity: Usdc,
+    ) -> Result<LedgerTransition, LedgerError> {
+        self.settle_exit(at, exit, Some(forfeited_isolated_equity))
+    }
+
+    fn settle_exit(
+        &self,
+        at: TimestampNs,
+        exit: ExitFill,
+        liquidation_forfeit: Option<Usdc>,
+    ) -> Result<LedgerTransition, LedgerError> {
         let position = self.position.as_ref().ok_or(LedgerError::NoOpenPosition)?;
-        let exit_value = exit.price.checked_notional(position.quantity)?;
-        let gross_pnl = gross_pnl(position, exit_value)?;
-        let credited = self
+        if exit.quantity > position.quantity {
+            return Err(LedgerError::ReduceExceedsPosition);
+        }
+        let exit_value = exit.price.checked_notional(exit.quantity)?;
+        let gross_pnl = gross_pnl_for(position, exit_value, exit.quantity)?;
+        let fraction = exit
+            .quantity
+            .value()
+            .checked_div(position.quantity.value())
+            .ok_or(LedgerError::Arithmetic {
+                operation: "partial reduction fraction",
+            })?;
+        let allocated_collateral =
+            self.isolated_collateral
+                .checked_mul(fraction)
+                .ok_or(LedgerError::Arithmetic {
+                    operation: "allocated isolated collateral",
+                })?;
+        let settlement =
+            allocated_collateral
+                .checked_add(gross_pnl)
+                .ok_or(LedgerError::Arithmetic {
+                    operation: "partial exit settlement",
+                })?;
+        let residual_collateral = self
+            .isolated_collateral
+            .checked_sub(allocated_collateral)
+            .and_then(|value| value.checked_add(settlement.min(Decimal::ZERO)))
+            .ok_or(LedgerError::Arithmetic {
+                operation: "remaining isolated collateral",
+            })?;
+        let requires_liquidation = residual_collateral < Decimal::ZERO;
+        match (requires_liquidation, liquidation_forfeit) {
+            (true, None) => return Err(LedgerError::CappedLiquidationRequired),
+            (false, Some(_)) => return Err(LedgerError::InvalidLiquidationForfeit),
+            (true, Some(forfeited)) => {
+                let expected = Usdc::new(self.isolated_collateral.max(Decimal::ZERO))?;
+                if forfeited != expected {
+                    return Err(LedgerError::InvalidLiquidationForfeit);
+                }
+            }
+            (false, None) => {}
+        }
+        let released_settlement = settlement.max(Decimal::ZERO);
+        let cash_value = self
             .cash
             .value()
-            .checked_add(position.isolated_margin.value())
-            .and_then(|value| value.checked_add(gross_pnl))
+            .checked_add(released_settlement)
             .and_then(|value| value.checked_sub(exit.fee.value()))
             .filter(|value| *value >= Decimal::ZERO)
             .ok_or(LedgerError::InsufficientCash)?;
-        let cash = Usdc::new(credited)?;
+        let cash = Usdc::new(cash_value)?;
         let fees_paid = checked_add_usdc(self.fees_paid, exit.fee, "exit fee total")?;
-        let net_trade_pnl = gross_pnl
-            .checked_sub(position.entry_fee.value())
-            .and_then(|value| value.checked_sub(position.funding_debits.value()))
+        let trade_cashflow = position
+            .trade_cashflow
+            .checked_add(released_settlement)
             .and_then(|value| value.checked_sub(exit.fee.value()))
             .ok_or(LedgerError::Arithmetic {
-                operation: "net realized trade PnL",
+                operation: "trade cashflow",
             })?;
-
+        let remaining_quantity = Quantity::new(
+            position
+                .quantity
+                .value()
+                .checked_sub(exit.quantity.value())
+                .ok_or(LedgerError::Arithmetic {
+                    operation: "remaining position quantity",
+                })?,
+        )?;
         let mut state = self.clone();
         state.cash = cash;
-        state.isolated_margin = Usdc::zero();
-        state.position = None;
+        state.isolated_collateral = if requires_liquidation {
+            Decimal::ZERO
+        } else {
+            residual_collateral
+        };
         state.realized_pnl =
             self.realized_pnl
                 .checked_add(gross_pnl)
                 .ok_or(LedgerError::Arithmetic {
                     operation: "realized PnL total",
                 })?;
+        // The execution book has consumed its actual visible levels. Do not
+        // reuse that liquidity to mark the residual; a later fresh book owns
+        // the next executable valuation.
         state.unrealized_pnl = Decimal::ZERO;
         state.fees_paid = fees_paid;
-        state.equity = cash;
-        state.breakers = self
-            .breakers
-            .record_closed_trade(at, net_trade_pnl)?
-            .record_equity(at, state.equity)?;
+        state.equity = equity_from(state.cash, state.isolated_collateral, state.unrealized_pnl)?;
         state.last_executable_mark = None;
         state.liquidity_incomplete = false;
+        if remaining_quantity.value().is_zero() {
+            state.isolated_collateral = Decimal::ZERO;
+            state.position = None;
+            state.equity = state.cash;
+            state.breakers = self
+                .breakers
+                .record_closed_trade(at, trade_cashflow)?
+                .record_equity(at, state.equity)?;
+            Ok(Self::transition(
+                at,
+                if requires_liquidation {
+                    LedgerTransitionKind::PositionLiquidated
+                } else {
+                    LedgerTransitionKind::PositionClosed
+                },
+                state,
+            ))
+        } else {
+            state.position = Some(Position {
+                quantity: remaining_quantity,
+                trade_cashflow,
+                ..position.clone()
+            });
+            state.fresh_book_market = None;
+            state.book_freshness = BookFreshnessStatus::Stale {
+                source: None,
+                max_age: DurationNs::new(0).map_err(|_| LedgerError::Arithmetic {
+                    operation: "residual mark freshness",
+                })?,
+                reason: BookStaleReason::Missing,
+            };
+            state.breakers = self.breakers.record_equity(at, state.equity)?;
+            Ok(Self::transition(
+                at,
+                LedgerTransitionKind::PositionReduced,
+                state,
+            ))
+        }
+    }
+
+    /// Applies a broker-reported capped liquidation without debiting free cash.
+    ///
+    /// The broker may report a gap loss beyond isolated collateral. That excess
+    /// remains an auditable broker loss, never a synthetic-cash debit.
+    pub fn settle_capped_liquidation(
+        &self,
+        at: TimestampNs,
+        forfeited_isolated_equity: Usdc,
+    ) -> Result<LedgerTransition, LedgerError> {
+        let position = self.position.as_ref().ok_or(LedgerError::NoOpenPosition)?;
+        let maximum_forfeit = Usdc::new(self.isolated_collateral.max(Decimal::ZERO))?;
+        if forfeited_isolated_equity > maximum_forfeit {
+            return Err(LedgerError::InvalidLiquidationForfeit);
+        }
+        let mut state = self.clone();
+        state.isolated_collateral = Decimal::ZERO;
+        state.position = None;
+        state.unrealized_pnl = Decimal::ZERO;
+        state.equity = state.cash;
+        state.last_executable_mark = None;
+        state.fresh_book_market = None;
+        state.liquidity_incomplete = false;
+        state.book_freshness = BookFreshnessStatus::Stale {
+            source: None,
+            max_age: DurationNs::new(0).map_err(|_| LedgerError::Arithmetic {
+                operation: "liquidation mark freshness",
+            })?,
+            reason: BookStaleReason::Missing,
+        };
+        state.breakers = self
+            .breakers
+            .record_closed_trade(at, position.trade_cashflow)?
+            .record_equity(at, state.equity)?;
         Ok(Self::transition(
             at,
-            LedgerTransitionKind::PositionClosed,
+            LedgerTransitionKind::PositionLiquidated,
             state,
         ))
+    }
+
+    /// Applies an actual complete exit through the reduction transition.
+    pub fn close_position(
+        &self,
+        at: TimestampNs,
+        exit: ExitFill,
+    ) -> Result<LedgerTransition, LedgerError> {
+        let position = self.position.as_ref().ok_or(LedgerError::NoOpenPosition)?;
+        if exit.quantity != position.quantity {
+            return Err(LedgerError::ReduceExceedsPosition);
+        }
+        self.reduce_position(at, exit)
     }
 
     /// Reconciles elapsed UTC day/week anchors without implicitly reading a clock.
@@ -927,7 +1193,15 @@ fn marked_pnl(
 }
 
 fn gross_pnl(position: &Position, exit_value: Usdc) -> Result<Decimal, LedgerError> {
-    let entry_value = position.entry_price.checked_notional(position.quantity)?;
+    gross_pnl_for(position, exit_value, position.quantity)
+}
+
+fn gross_pnl_for(
+    position: &Position,
+    exit_value: Usdc,
+    quantity: Quantity,
+) -> Result<Decimal, LedgerError> {
+    let entry_value = position.entry_price.checked_notional(quantity)?;
     match position.side {
         PositionSide::Long => exit_value.value().checked_sub(entry_value.value()),
         PositionSide::Short => entry_value.value().checked_sub(exit_value.value()),
@@ -939,11 +1213,11 @@ fn gross_pnl(position: &Position, exit_value: Usdc) -> Result<Decimal, LedgerErr
 
 fn equity_from(
     cash: Usdc,
-    isolated_margin: Usdc,
+    isolated_collateral: Decimal,
     adjustment: Decimal,
 ) -> Result<Usdc, LedgerError> {
     cash.value()
-        .checked_add(isolated_margin.value())
+        .checked_add(isolated_collateral)
         .and_then(|value| value.checked_add(adjustment))
         .filter(|value| *value >= Decimal::ZERO)
         .ok_or(LedgerError::NegativeEquity)

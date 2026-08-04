@@ -4,8 +4,8 @@ use trench_core::book::OrderBook;
 use trench_core::domain::{DomainError, LedgerId, Leverage, Market, Price, Usdc};
 use trench_core::event::{BookLevel, BookSnapshot, DurationNs, MarketEvent, TimestampNs};
 use trench_core::ledger::{
-    BookFreshness, BookFreshnessStatus, BookStaleReason, EntryFill, ExitFill, LedgerError,
-    LedgerState, MarkCosts, PositionSide,
+    BookFreshness, BookFreshnessStatus, BookStaleReason, EntryFill, ExitFill, FundingCashflow,
+    LedgerError, LedgerState, MarkCosts, PositionSide,
 };
 
 fn timestamp(value: i128) -> TimestampNs {
@@ -317,17 +317,20 @@ fn accounting_conserves_cash_margin_and_marked_value_across_fees_and_funding() {
         .expect("mark must apply")
         .into_state();
 
-    assert_eq!(open.cash(), usdc(dec!(79.725)));
-    assert_eq!(open.isolated_margin(), usdc(dec!(20)));
+    assert_eq!(open.cash(), usdc(dec!(79.925)));
+    assert_eq!(open.isolated_collateral(), dec!(19.8));
     assert_eq!(open.unrealized_pnl(), dec!(-1.10));
     assert_eq!(open.equity(), usdc(dec!(98.625)));
     assert_eq!(
-        open.cash().value() + open.isolated_margin().value() + open.unrealized_pnl(),
+        open.cash().value() + open.isolated_collateral() + open.unrealized_pnl(),
         open.equity().value()
     );
 
     let closed = open
-        .close_position(at, ExitFill::new(price(dec!(99)), usdc(dec!(0.10))))
+        .close_position(
+            at,
+            ExitFill::new(dec!(1), price(dec!(99)), usdc(dec!(0.10))).expect("complete exit fill"),
+        )
         .expect("complete close must apply")
         .into_state();
     assert!(closed.position().is_none());
@@ -336,7 +339,7 @@ fn accounting_conserves_cash_margin_and_marked_value_across_fees_and_funding() {
     assert_eq!(closed.fees_paid(), usdc(dec!(0.175)));
     assert_eq!(closed.funding_paid(), usdc(dec!(0.20)));
     assert_eq!(
-        closed.cash().value() + closed.isolated_margin().value() + closed.unrealized_pnl(),
+        closed.cash().value() + closed.isolated_collateral() + closed.unrealized_pnl(),
         closed.equity().value()
     );
 }
@@ -426,7 +429,10 @@ fn stale_long_source_book_preserves_valuation_and_blocks_a_later_entry() {
     ));
 
     let flat = stale
-        .close_position(stale_at, ExitFill::new(price(dec!(99)), usdc(dec!(0))))
+        .close_position(
+            stale_at,
+            ExitFill::new(dec!(1), price(dec!(99)), usdc(dec!(0))).expect("complete exit fill"),
+        )
         .expect("reduce-only close should remain possible")
         .into_state();
     assert!(matches!(
@@ -531,4 +537,191 @@ fn entry_cannot_reuse_a_source_book_after_its_explicit_age_bound_expires() {
         marked.open_position(entry_at, long_entry(), usdc(dec!(0.50))),
         Err(LedgerError::StaleExecutableMark)
     ));
+}
+
+#[test]
+fn signed_funding_and_partial_exits_conserve_the_isolated_ledger() {
+    let at = timestamp(1_785_715_200_000_000_000);
+    let executable_book = book(
+        at,
+        vec![level(dec!(99), dec!(2))],
+        vec![level(dec!(101), dec!(2))],
+    );
+    let open = LedgerState::new(LedgerId::RulesOnly, at)
+        .expect("ledger must initialize")
+        .mark_to_book(at, Some(&executable_book), freshness(), MarkCosts::none())
+        .expect("fresh book must be recorded")
+        .into_state()
+        .open_position(at, long_entry(), usdc(dec!(0.50)))
+        .expect("entry must open")
+        .into_state()
+        .apply_funding(
+            at,
+            FundingCashflow::credit(usdc(dec!(0.20))).expect("funding receipt"),
+        )
+        .expect("funding receipt must credit isolated ledger")
+        .into_state();
+
+    let reduced = open
+        .reduce_position(
+            at,
+            ExitFill::new(dec!(0.4), price(dec!(99)), usdc(dec!(0.03))).expect("partial exit fill"),
+        )
+        .expect("partial exit must retain its residual")
+        .into_state();
+    assert_eq!(
+        reduced
+            .position()
+            .expect("residual position")
+            .quantity()
+            .value(),
+        dec!(0.6)
+    );
+    assert_eq!(reduced.isolated_collateral(), dec!(12.12));
+    assert_eq!(reduced.cash(), usdc(dec!(87.575)));
+    assert_eq!(reduced.funding_received(), usdc(dec!(0.20)));
+
+    let flat = reduced
+        .reduce_position(
+            at,
+            ExitFill::new(dec!(0.6), price(dec!(101)), usdc(dec!(0.045))).expect("final exit fill"),
+        )
+        .expect("final partial exit must close")
+        .into_state();
+    assert!(flat.position().is_none());
+    assert_eq!(flat.cash(), usdc(dec!(100.25)));
+    assert_eq!(flat.equity(), usdc(dec!(100.25)));
+    assert_eq!(flat.funding_paid(), Usdc::zero());
+    assert_eq!(flat.funding_received(), usdc(dec!(0.20)));
+    assert_eq!(flat.realized_pnl(), dec!(0.2));
+}
+
+#[test]
+fn capped_liquidation_never_debits_cash_outside_isolation() {
+    let at = timestamp(1_785_715_200_000_000_000);
+    let executable_book = book(
+        at,
+        vec![level(dec!(99), dec!(2))],
+        vec![level(dec!(101), dec!(2))],
+    );
+    let open = LedgerState::new(LedgerId::RulesOnly, at)
+        .expect("ledger must initialize")
+        .mark_to_book(at, Some(&executable_book), freshness(), MarkCosts::none())
+        .expect("fresh book must be recorded")
+        .into_state()
+        .open_position(at, long_entry(), usdc(dec!(0.50)))
+        .expect("entry must open")
+        .into_state();
+
+    let cash_before = open.cash();
+    let liquidated = open
+        .settle_capped_liquidation(at, usdc(dec!(20)))
+        .expect("the broker-forfeited collateral must settle atomically")
+        .into_state();
+
+    assert!(liquidated.position().is_none());
+    assert_eq!(liquidated.cash(), cash_before);
+    assert_eq!(liquidated.isolated_collateral(), dec!(0));
+    assert_eq!(liquidated.equity(), cash_before);
+    assert_eq!(liquidated.consecutive_losses(), 1);
+}
+
+#[test]
+fn funding_and_partial_losses_reduce_live_isolated_collateral_before_free_cash() {
+    let at = timestamp(1_785_715_200_000_000_000);
+    let executable_book = book(
+        at,
+        vec![level(dec!(99), dec!(2))],
+        vec![level(dec!(101), dec!(2))],
+    );
+    let funded = LedgerState::new(LedgerId::RulesOnly, at)
+        .expect("ledger must initialize")
+        .mark_to_book(at, Some(&executable_book), freshness(), MarkCosts::none())
+        .expect("fresh book must be recorded")
+        .into_state()
+        .open_position(at, long_entry(), usdc(dec!(0.50)))
+        .expect("entry must open")
+        .into_state()
+        .apply_funding_debit(at, usdc(dec!(0.20)))
+        .expect("funding must debit collateral")
+        .into_state();
+
+    assert_eq!(funded.cash(), usdc(dec!(79.925)));
+    assert_eq!(funded.isolated_collateral(), dec!(19.8));
+
+    let reduced = funded
+        .reduce_position(
+            at,
+            ExitFill::new(dec!(0.4), price(dec!(75)), usdc(dec!(0))).expect("partial fill"),
+        )
+        .expect("partial loss must settle inside collateral")
+        .into_state();
+    assert_eq!(reduced.cash(), funded.cash());
+    assert_eq!(reduced.isolated_collateral(), dec!(9.8));
+    assert_eq!(reduced.equity(), usdc(dec!(89.725)));
+    assert!(matches!(
+        reduced.settle_capped_liquidation(at, usdc(dec!(9.81))),
+        Err(LedgerError::InvalidLiquidationForfeit)
+    ));
+
+    let liquidated = reduced
+        .settle_capped_liquidation(at, usdc(dec!(9.8)))
+        .expect("current broker forfeit must settle even after a partial exit")
+        .into_state();
+    assert_eq!(liquidated.cash(), funded.cash());
+    assert_eq!(liquidated.isolated_collateral(), dec!(0));
+}
+
+#[test]
+fn capped_gap_fill_consumes_the_actual_fill_and_current_collateral_atomically() {
+    let at = timestamp(1_785_715_200_000_000_000);
+    let executable_book = book(
+        at,
+        vec![level(dec!(99), dec!(2))],
+        vec![level(dec!(101), dec!(2))],
+    );
+    let open = LedgerState::new(LedgerId::RulesOnly, at)
+        .expect("ledger must initialize")
+        .mark_to_book(at, Some(&executable_book), freshness(), MarkCosts::none())
+        .expect("fresh book must be recorded")
+        .into_state()
+        .open_position(at, long_entry(), usdc(dec!(0.50)))
+        .expect("entry must open")
+        .into_state();
+    let gap_fill = ExitFill::new(dec!(0.4), price(dec!(25)), usdc(dec!(0))).expect("gap fill");
+
+    assert!(matches!(
+        open.reduce_position(at, gap_fill),
+        Err(LedgerError::CappedLiquidationRequired)
+    ));
+    assert!(matches!(
+        open.settle_liquidated_exit(at, gap_fill, usdc(dec!(19.9))),
+        Err(LedgerError::InvalidLiquidationForfeit)
+    ));
+
+    let capped = open
+        .settle_liquidated_exit(at, gap_fill, usdc(dec!(20)))
+        .expect("paired broker loss cap must settle atomically")
+        .into_state();
+    assert_eq!(capped.cash(), open.cash());
+    assert_eq!(capped.isolated_collateral(), dec!(0));
+    assert_eq!(
+        capped
+            .position()
+            .expect("broker retains the unfilled residual")
+            .quantity()
+            .value(),
+        dec!(0.6)
+    );
+
+    let flat = capped
+        .reduce_position(
+            at,
+            ExitFill::new(dec!(0.6), price(dec!(100)), usdc(dec!(0))).expect("residual fill"),
+        )
+        .expect("zero-collateral residual can close without free-cash loss")
+        .into_state();
+    assert_eq!(flat.cash(), open.cash());
+    assert_eq!(flat.isolated_collateral(), dec!(0));
+    assert_eq!(flat.consecutive_losses(), 1);
 }
