@@ -17,9 +17,8 @@ use trench_core::event::{DurationNs, MarketEvent, MarketEventKind, TimestampNs};
 use trench_core::ledger::LedgerState;
 use trench_hyperliquid::{
     ContextCapture, ContextCaptureBatch, ContextCaptureError, ContextCaptureRequest, GapEvent,
-    GapRecoveryRequest, InfoClient, InfoError, MetaAndAssetContexts, ReceiptClock,
-    RecoveryEvidenceProducer, RecoveryProducerError, RecoveryResult, WsClient, WsConfig, WsOutput,
-    WsStream,
+    GapRecoveryRequest, InfoClient, InfoError, ReceiptClock, RecoveryEvidenceProducer,
+    RecoveryProducerError, RecoveryResult, WsClient, WsConfig, WsOutput, WsStream,
 };
 use trench_storage::parquet::{DataProvenance, ParquetError, ParquetStore};
 use trench_storage::replay::{DeterministicReplay, ReplayError, ReplayPlan};
@@ -79,6 +78,7 @@ struct AuthorityState {
     engine_state: Option<EngineState>,
     router: TypedMarketRouter,
     readiness: Readiness,
+    live: LiveSubscription,
     reconciled: bool,
     recovery_markets: BTreeSet<Market>,
     recovery_pending: VecDeque<RecoveryInput>,
@@ -131,9 +131,134 @@ impl ReceiptClock for SystemReceiptClock {
     }
 }
 
+const STREAM_RESTART_MIN_DELAY: Duration = Duration::from_secs(1);
+const STREAM_RESTART_MAX_DELAY: Duration = Duration::from_secs(30);
+
+/// One daemon-owned public-stream lifecycle. Its scope is replaced only from
+/// a complete capture after that capture has crossed the durable authority
+/// path. A stream epoch is not healthy until every scoped market has supplied
+/// a live L2 snapshot.
 struct LiveSubscription {
     stream: Option<WsStream>,
-    markets: Vec<Market>,
+    scope: Vec<Market>,
+    observed_l2: BTreeSet<Market>,
+    active_epoch: bool,
+    epoch: u64,
+    restart_attempt: u8,
+    restart_at: Option<tokio::time::Instant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StreamScopeAction {
+    None,
+    Stop,
+    Start {
+        scope: Vec<Market>,
+        epoch: u64,
+        shutdown_prior: bool,
+    },
+}
+
+impl LiveSubscription {
+    fn new() -> Self {
+        Self {
+            stream: None,
+            scope: Vec::new(),
+            observed_l2: BTreeSet::new(),
+            active_epoch: false,
+            epoch: 0,
+            restart_attempt: 0,
+            restart_at: None,
+        }
+    }
+
+    /// Applies only a scope derived from a successfully persisted capture.
+    fn replace_persisted_scope(&mut self, mut scope: Vec<Market>) -> StreamScopeAction {
+        scope.sort();
+        scope.dedup();
+        if scope.is_empty() {
+            let running = self.active_epoch;
+            self.scope.clear();
+            self.observed_l2.clear();
+            self.active_epoch = false;
+            self.restart_attempt = 0;
+            self.restart_at = None;
+            return if running {
+                StreamScopeAction::Stop
+            } else {
+                StreamScopeAction::None
+            };
+        }
+
+        if self.scope == scope && self.active_epoch {
+            return StreamScopeAction::None;
+        }
+
+        let shutdown_prior = self.active_epoch;
+        self.scope = scope.clone();
+        self.observed_l2.clear();
+        self.restart_attempt = 0;
+        self.restart_at = None;
+        self.epoch = self.epoch.saturating_add(1);
+        StreamScopeAction::Start {
+            scope,
+            epoch: self.epoch,
+            shutdown_prior,
+        }
+    }
+
+    /// Ends one terminal epoch and returns a bounded restart delay for the
+    /// most recently persisted nonempty scope.
+    fn end_epoch(&mut self) -> Option<Duration> {
+        self.observed_l2.clear();
+        self.active_epoch = false;
+        if self.scope.is_empty() {
+            self.restart_at = None;
+            return None;
+        }
+        self.restart_attempt = self.restart_attempt.saturating_add(1).min(6);
+        let shift = u32::from(self.restart_attempt.saturating_sub(1));
+        let seconds = STREAM_RESTART_MIN_DELAY
+            .as_secs()
+            .checked_shl(shift)
+            .unwrap_or(u64::MAX);
+        Some(Duration::from_secs(
+            seconds.min(STREAM_RESTART_MAX_DELAY.as_secs()),
+        ))
+    }
+
+    /// Opens a fresh epoch after the terminal delay elapsed.
+    fn restart_due(&mut self) -> StreamScopeAction {
+        if self.scope.is_empty() || self.active_epoch {
+            return StreamScopeAction::None;
+        }
+        self.restart_at = None;
+        self.observed_l2.clear();
+        self.epoch = self.epoch.saturating_add(1);
+        StreamScopeAction::Start {
+            scope: self.scope.clone(),
+            epoch: self.epoch,
+            shutdown_prior: false,
+        }
+    }
+
+    /// Records an L2 fact only from the current stream epoch and returns
+    /// whether the complete subscribed scope has now produced L2.
+    fn observe_l2(&mut self, market: &Market) -> bool {
+        if !self.active_epoch || !self.scope.contains(market) {
+            return false;
+        }
+        self.observed_l2.insert(market.clone());
+        self.observed_l2.len() == self.scope.len()
+    }
+
+    fn mark_epoch_started(&mut self) {
+        self.active_epoch = true;
+    }
+
+    fn mark_epoch_start_failed(&mut self) {
+        self.active_epoch = false;
+    }
 }
 
 /// Starts the paper-only daemon and waits for a bounded duration or Ctrl-C.
@@ -168,6 +293,7 @@ pub async fn run(
         engine_state: Some(initial_engine_state(writer.run_id(), initial_at_ns)?),
         router: TypedMarketRouter::new(maximum_book_age()?),
         readiness: Readiness::default(),
+        live: LiveSubscription::new(),
         reconciled: false,
         recovery_markets: BTreeSet::new(),
         recovery_pending: VecDeque::new(),
@@ -225,10 +351,8 @@ pub async fn run(
     }
 
     let parquet_store = ParquetStore::open(&parquet_path, provenance)?;
-    let LiveSubscription {
-        mut stream,
-        markets,
-    } = open_live_stream(config, &mut authority.readiness).await;
+    // The initial capture is intentionally metadata-only. A WebSocket scope
+    // may be constructed only after that capture is durable and admitted.
     let capture_client = ContextCapture::new(InfoClient::new(config.endpoints().info_url())?);
     let (capture_sender, capture_receiver) = mpsc::channel(CAPTURE_CHANNEL_CAPACITY);
     let (capture_result_sender, mut capture_result_receiver) =
@@ -239,11 +363,9 @@ pub async fn run(
         capture_result_sender,
         cancellation.clone(),
     ));
-    let mut capture_scheduler = CaptureScheduler::new(markets);
-    if !capture_scheduler.has_detailed_markets() {
-        authority.readiness.set_context_capture_current(false);
-        tracing::warn!("public context capture is waiting for a dynamic universe");
-    }
+    let mut capture_scheduler = CaptureScheduler::new(Vec::new());
+    authority.readiness.set_context_capture_current(false);
+    tracing::info!("public context capture is bootstrapping the dynamic universe");
     let server = AdminServer::bind(&admin_socket).await?;
     let (authority_sender, mut authority_receiver) = authority_channel();
     let admin_cancellation = cancellation.clone();
@@ -259,12 +381,13 @@ pub async fn run(
     );
     recovery_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut capture_clock = tokio::time::interval_at(
-        tokio::time::Instant::now() + cadence(config.feed().universe_refresh_seconds()),
+        tokio::time::Instant::now(),
         cadence(config.feed().universe_refresh_seconds()),
     );
     capture_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         flush_recovery_inputs(&recovery_sender, &mut authority);
+        let restart_at = authority.live.restart_at;
         tokio::select! {
             result = &mut stop => {
                 result?;
@@ -289,7 +412,7 @@ pub async fn run(
             output = capture_result_receiver.recv(), if capture_results_open => {
                 match output {
                     Some(output) => {
-                        admit_capture_output(
+                        let stream_action = admit_capture_output(
                             &parquet_store,
                             &mut writer,
                             &mut authority,
@@ -298,6 +421,11 @@ pub async fn run(
                             config,
                             Some(&recovery_sender),
                         ).await?;
+                        apply_stream_scope_action(
+                            &mut authority.live,
+                            stream_action,
+                            &mut authority.readiness,
+                        ).await;
                     }
                     None => {
                         capture_results_open = false;
@@ -309,16 +437,22 @@ pub async fn run(
                     }
                 }
             }
-            output = receive_live(&mut stream) => {
+            output = receive_live(&mut authority.live.stream) => {
                 match output {
                     Some(WsOutput::MarketEvent(event)) => {
                         parquet_store.write_events(std::slice::from_ref(&event))?;
                         admit_market_event(
                             &mut writer,
                             &mut authority,
-                            event,
+                            event.clone(),
                             Some(&recovery_sender),
                         ).await?;
+                        if matches!(event.kind(), MarketEventKind::BookSnapshot(_))
+                            && authority.live.observe_l2(event.market())
+                        {
+                            authority.readiness.set_stream_connected(true);
+                            authority.live.restart_attempt = 0;
+                        }
                     }
                     Some(WsOutput::Gap(gap)) => {
                         authority.router.open_gap(&gap);
@@ -342,10 +476,17 @@ pub async fn run(
                     }
                     Some(WsOutput::Rejected(_)) => {}
                     Some(WsOutput::Terminal(_)) | None => {
-                        authority.readiness.set_stream_connected(false);
-                        stream = None;
+                        end_live_epoch(&mut authority.live, &mut authority.readiness).await;
                     }
                 }
+            }
+            _ = wait_for_stream_restart(restart_at), if restart_at.is_some() => {
+                let stream_action = authority.live.restart_due();
+                apply_stream_scope_action(
+                    &mut authority.live,
+                    stream_action,
+                    &mut authority.readiness,
+                ).await;
             }
             output = recovery_result_receiver.recv(), if recovery_results_open => {
                 match output {
@@ -419,7 +560,7 @@ pub async fn run(
     cancellation.cancel();
     drop(capture_sender);
     drop(recovery_sender);
-    if let Some(stream) = stream {
+    if let Some(stream) = authority.live.stream.take() {
         stream.shutdown().await;
     }
     capture_task.await.map_err(AppError::CaptureTaskJoin)?;
@@ -544,7 +685,7 @@ async fn admit_capture_output(
     scheduler: &mut CaptureScheduler,
     config: &PaperConfig,
     recovery_sender: Option<&mpsc::Sender<RecoveryInput>>,
-) -> Result<(), AppError> {
+) -> Result<StreamScopeAction, AppError> {
     match output {
         CaptureOutput::Captured(batch) => {
             parquet_store.write_events(batch.events())?;
@@ -559,15 +700,17 @@ async fn admit_capture_output(
             }
             authority
                 .readiness
-                .set_fresh_book_markets(markets.into_iter().collect());
+                .set_fresh_book_markets(markets.iter().cloned().collect());
             authority.readiness.set_metadata_current(true);
             authority.readiness.set_context_capture_current(true);
+            let stream_action = authority.live.replace_persisted_scope(markets);
             tracing::info!(
                 events = batch.events().len(),
                 captured_at_ns = batch.captured_at().value(),
                 source_digest = %batch.source_digest(),
                 "persisted and admitted complete public context capture"
             );
+            Ok(stream_action)
         }
         CaptureOutput::Rejected(error) => {
             scheduler.complete(false);
@@ -576,9 +719,9 @@ async fn admit_capture_output(
                 error = %error,
                 "public context capture rejected atomically; entries remain fail-closed"
             );
+            Ok(StreamScopeAction::None)
         }
     }
-    Ok(())
 }
 
 /// Runs the bounded, read-only recovery producer outside the authority loop.
@@ -814,81 +957,87 @@ async fn receive_live(stream: &mut Option<WsStream>) -> Option<WsOutput> {
     }
 }
 
-async fn open_live_stream(config: &PaperConfig, readiness: &mut Readiness) -> LiveSubscription {
-    let client = match InfoClient::new(config.endpoints().info_url()) {
-        Ok(client) => client,
-        Err(error) => {
-            tracing::warn!(error = %error, "public metadata client is unavailable; stream remains unready");
-            return LiveSubscription {
-                stream: None,
-                markets: Vec::new(),
-            };
+/// Realizes a scope action only after [`admit_capture_output`] accepted the
+/// complete capture. Replacing a scope always joins the old task before a new
+/// subscription epoch is started, so stale receiver output cannot bleed into
+/// the newly persisted universe.
+async fn apply_stream_scope_action(
+    live: &mut LiveSubscription,
+    action: StreamScopeAction,
+    readiness: &mut Readiness,
+) {
+    match action {
+        StreamScopeAction::None => {}
+        StreamScopeAction::Stop => {
+            readiness.set_stream_connected(false);
+            live.mark_epoch_start_failed();
+            if let Some(stream) = live.stream.take() {
+                stream.shutdown().await;
+            }
         }
-    };
-    let metadata = match client.meta_and_asset_contexts().await {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            tracing::warn!(error = %error, "public metadata fetch failed; stream remains unready");
-            return LiveSubscription {
-                stream: None,
-                markets: Vec::new(),
-            };
-        }
-    };
-    let markets = select_dynamic_markets(config, &metadata);
-    if markets.is_empty() {
-        tracing::warn!("no market passed the collector's conservative public liquidity prefilter");
-        return LiveSubscription {
-            stream: None,
-            markets,
-        };
-    }
-    let fresh_book_markets = markets.iter().cloned().collect();
-    for market in &markets {
-        readiness.register_market(market.clone());
-    }
-    readiness.set_fresh_book_markets(fresh_book_markets);
-    readiness.set_metadata_current(true);
-    match WsConfig::new(markets) {
-        Ok(config) => LiveSubscription {
-            markets: config.markets().to_vec(),
-            stream: Some(WsClient::new(config).start()),
-        },
-        Err(error) => {
-            tracing::warn!(error = %error, "public WebSocket configuration rejected dynamic universe");
-            LiveSubscription {
-                stream: None,
-                markets: Vec::new(),
+        StreamScopeAction::Start {
+            scope,
+            epoch,
+            shutdown_prior,
+        } => {
+            readiness.set_stream_connected(false);
+            if shutdown_prior && let Some(stream) = live.stream.take() {
+                stream.shutdown().await;
+            }
+            match WsConfig::new(scope) {
+                Ok(config) => {
+                    tracing::info!(
+                        epoch,
+                        markets = ?config.markets(),
+                        "starting public WebSocket epoch from persisted capture scope"
+                    );
+                    live.stream = Some(WsClient::new(config).start());
+                    live.mark_epoch_started();
+                }
+                Err(error) => {
+                    // This is unreachable for a validated native-perpetual
+                    // capture selection, but retaining no stream is safer
+                    // than constructing any substituted scope.
+                    live.stream = None;
+                    live.mark_epoch_start_failed();
+                    tracing::error!(
+                        error = %error,
+                        epoch,
+                        "persisted capture scope cannot form a WebSocket epoch; stream remains unready"
+                    );
+                }
             }
         }
     }
 }
 
-fn select_dynamic_markets(config: &PaperConfig, metadata: &MetaAndAssetContexts) -> Vec<Market> {
-    let limit = usize::from(config.feed().tradeable_market_count())
-        + usize::from(config.feed().warm_buffer_market_count());
-    let mut markets = metadata
-        .assets()
-        .iter()
-        .filter(|asset| {
-            !asset.is_delisted()
-                && asset.max_leverage().value()
-                    >= u32::from(config.risk().minimum_leverage().value())
-                && asset.context().day_notional_volume() >= config.feed().minimum_daily_notional()
-        })
-        .map(|asset| {
-            (
-                asset.market().clone(),
-                asset.context().day_notional_volume().value(),
-            )
-        })
-        .collect::<Vec<_>>();
-    markets.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-    markets
-        .into_iter()
-        .take(limit)
-        .map(|(market, _)| market)
-        .collect()
+/// Terminates the active receiver before the next bounded retry. The retry
+/// uses only the last successfully persisted capture scope.
+async fn end_live_epoch(live: &mut LiveSubscription, readiness: &mut Readiness) {
+    readiness.set_stream_connected(false);
+    if let Some(stream) = live.stream.take() {
+        stream.shutdown().await;
+    }
+    live.restart_at = live
+        .end_epoch()
+        .and_then(|delay| tokio::time::Instant::now().checked_add(delay));
+    if let Some(restart_at) = live.restart_at {
+        tracing::warn!(
+            epoch = live.epoch,
+            scope = ?live.scope,
+            delay_ms = restart_at
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_millis(),
+            "public WebSocket epoch ended; scheduling a fresh bounded retry"
+        );
+    }
+}
+
+async fn wait_for_stream_restart(restart_at: Option<tokio::time::Instant>) {
+    match restart_at {
+        Some(restart_at) => tokio::time::sleep_until(restart_at).await,
+        None => future::pending::<()>().await,
+    }
 }
 
 /// Selects the next detailed scope from an already-persisted complete capture.
@@ -949,7 +1098,6 @@ fn mark_market_execution_blocked(readiness: &mut Readiness, market: trench_core:
 }
 
 fn update_readiness_from_typed_event(readiness: &mut Readiness, event: &TypedEngineEvent) {
-    readiness.set_stream_connected(true);
     readiness.register_market(event.market().clone());
     if let Some(gates) = readiness.market_gates_mut(event.market()) {
         gates.set_data_quality_valid(true);
@@ -1273,17 +1421,17 @@ mod tests {
     use trench_core::config::PaperConfig;
     use trench_core::event::{BookLevel, BookSnapshot};
     use trench_hyperliquid::{
-        ContextCapture, ContextCaptureError, InfoClient, MetaAndAssetContexts, RecoveryStatus,
-        RecoveryUnavailable, recovery_request_from_events_for_test,
+        ContextCapture, ContextCaptureError, InfoClient, RecoveryStatus, RecoveryUnavailable,
+        recovery_request_from_events_for_test,
     };
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     use super::{
-        AuthorityState, CaptureOutput, RecoveryInput, RecoveryOutput, SystemReceiptClock,
-        admit_capture_output, admit_market_event, admit_recovery_output, capture_worker,
-        configured_path, current_time_ns, initial_engine_state, maximum_book_age,
-        recover_source_stream, recovery_worker, select_dynamic_markets,
+        AuthorityState, CaptureOutput, LiveSubscription, RecoveryInput, RecoveryOutput,
+        StreamScopeAction, SystemReceiptClock, admit_capture_output, admit_market_event,
+        admit_recovery_output, capture_worker, configured_path, current_time_ns,
+        initial_engine_state, maximum_book_age, recover_source_stream, recovery_worker,
     };
     use crate::capture_scheduler::CaptureScheduler;
     use crate::readiness::Readiness;
@@ -1314,27 +1462,6 @@ mod tests {
         Quantity::new(Decimal::from(value)).expect("fixture quantity")
     }
 
-    async fn metadata_with_delisted_old() -> MetaAndAssetContexts {
-        let mut fixture =
-            serde_json::from_str::<Value>(META_FIXTURE).expect("fixture metadata must parse");
-        fixture[0]["universe"][3]["isDelisted"] = json!(true);
-        fixture[1][3]["dayNtlVlm"] = json!("9999999999");
-        let server = MockServer::start().await;
-        let client = InfoClient::new_loopback_for_test(&format!("{}/info", server.uri()))
-            .expect("loopback metadata client");
-        Mock::given(method("POST"))
-            .and(path("/info"))
-            .and(body_json(json!({"type": "metaAndAssetCtxs"})))
-            .respond_with(ResponseTemplate::new(200).set_body_json(fixture))
-            .expect(1)
-            .mount(&server)
-            .await;
-        client
-            .meta_and_asset_contexts()
-            .await
-            .expect("fixture metadata must normalize")
-    }
-
     fn predecessor() -> MarketEvent {
         MarketEvent::trade(
             timestamp(BASE_NS),
@@ -1343,21 +1470,6 @@ mod tests {
             Trade::new(1, Side::Buy, price(100), quantity(1)).expect("fixture trade"),
         )
         .expect("fixture event")
-    }
-
-    #[tokio::test]
-    async fn dynamic_selection_includes_non_isolated_native_perps_and_excludes_delisted() {
-        let config = PaperConfig::from_toml(PAPER_CONFIG).expect("fixture config");
-        let metadata = metadata_with_delisted_old().await;
-
-        assert_eq!(
-            select_dynamic_markets(&config, &metadata),
-            vec![
-                Market::new("BTC").expect("fixture market"),
-                Market::new("ETH").expect("fixture market"),
-                Market::new("SOL").expect("fixture market"),
-            ]
-        );
     }
 
     fn snapshot(at: i64, sequence: u64) -> MarketEvent {
@@ -1400,6 +1512,7 @@ mod tests {
                 maximum_book_age().expect("fixture maximum book age"),
             ),
             readiness: Readiness::default(),
+            live: LiveSubscription::new(),
             reconciled: false,
             recovery_markets: BTreeSet::new(),
             recovery_pending: VecDeque::new(),
@@ -1409,6 +1522,87 @@ mod tests {
 
     fn current_timestamp() -> TimestampNs {
         TimestampNs::new(i128::from(current_time_ns().expect("UTC clock"))).expect("UTC timestamp")
+    }
+
+    #[test]
+    fn initial_empty_scope_opens_only_after_a_persisted_capture_scope() {
+        let mut live = LiveSubscription::new();
+
+        assert_eq!(
+            live.replace_persisted_scope(Vec::new()),
+            StreamScopeAction::None
+        );
+        assert_eq!(live.epoch, 0);
+        assert!(live.scope.is_empty());
+
+        assert_eq!(
+            live.replace_persisted_scope(vec![btc()]),
+            StreamScopeAction::Start {
+                scope: vec![btc()],
+                epoch: 1,
+                shutdown_prior: false,
+            }
+        );
+        assert!(
+            !live.active_epoch,
+            "the actual stream task starts after this action"
+        );
+        assert!(
+            !live.observe_l2(&btc()),
+            "an action is not an L2 observation"
+        );
+    }
+
+    #[test]
+    fn changed_persisted_scope_replaces_the_prior_subscription_epoch() {
+        let mut live = LiveSubscription::new();
+        let first = live.replace_persisted_scope(vec![btc()]);
+        assert!(matches!(first, StreamScopeAction::Start { epoch: 1, .. }));
+        live.mark_epoch_started();
+
+        let eth = Market::new("ETH").expect("fixture market");
+        assert_eq!(
+            live.replace_persisted_scope(vec![eth.clone()]),
+            StreamScopeAction::Start {
+                scope: vec![eth],
+                epoch: 2,
+                shutdown_prior: true,
+            },
+            "a changed persisted universe must join the old task before resubscribing"
+        );
+        assert!(live.observed_l2.is_empty());
+        assert!(
+            !live.observe_l2(&btc()),
+            "prior-scope L2 cannot ready the new epoch"
+        );
+    }
+
+    #[test]
+    fn terminal_epoch_restarts_from_the_latest_persisted_scope_with_bounded_backoff() {
+        let mut live = LiveSubscription::new();
+        let _ = live.replace_persisted_scope(vec![btc()]);
+        live.mark_epoch_started();
+
+        assert_eq!(live.end_epoch(), Some(Duration::from_secs(1)));
+        assert!(!live.active_epoch);
+        assert_eq!(
+            live.restart_due(),
+            StreamScopeAction::Start {
+                scope: vec![btc()],
+                epoch: 2,
+                shutdown_prior: false,
+            }
+        );
+        live.mark_epoch_started();
+        assert_eq!(live.end_epoch(), Some(Duration::from_secs(2)));
+        for _ in 0..8 {
+            let _ = live.restart_due();
+            live.mark_epoch_started();
+            assert!(
+                live.end_epoch()
+                    .is_some_and(|delay| delay <= Duration::from_secs(30))
+            );
+        }
     }
 
     async fn mounted_context_capture(
@@ -1602,6 +1796,7 @@ mod tests {
                 maximum_book_age().expect("fixture maximum book age"),
             ),
             readiness: Readiness::default(),
+            live: LiveSubscription::new(),
             reconciled: false,
             recovery_markets: BTreeSet::new(),
             recovery_pending: VecDeque::new(),
@@ -1675,7 +1870,7 @@ mod tests {
             .expect("capture schedule")
             .expect("in-flight capture");
 
-        admit_capture_output(
+        let stream_action = admit_capture_output(
             &store,
             &mut writer,
             &mut authority,
@@ -1691,6 +1886,7 @@ mod tests {
         .expect("rejected capture is a handled readiness transition");
 
         assert!(!scheduler.in_flight());
+        assert_eq!(stream_action, StreamScopeAction::None);
         assert!(
             authority
                 .readiness
@@ -1798,7 +1994,7 @@ mod tests {
             .expect("capture schedule")
             .expect("in-flight capture");
 
-        admit_capture_output(
+        let stream_action = admit_capture_output(
             &store,
             &mut writer,
             &mut authority,
@@ -1811,6 +2007,21 @@ mod tests {
         .expect("complete batch must persist and route");
 
         assert!(!scheduler.in_flight());
+        assert!(matches!(
+            stream_action,
+            StreamScopeAction::Start {
+                shutdown_prior: false,
+                ..
+            }
+        ));
+        assert!(
+            !authority.live.active_epoch,
+            "only the authority loop starts the returned persisted-capture epoch"
+        );
+        assert!(
+            !authority.live.scope.is_empty(),
+            "the capture-derived dynamic scope is retained for the fresh epoch"
+        );
         assert!(
             !authority
                 .readiness

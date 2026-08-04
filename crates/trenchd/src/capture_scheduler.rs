@@ -42,12 +42,6 @@ impl CaptureScheduler {
         }
     }
 
-    /// Returns whether a completed capture can include detailed market facts.
-    #[must_use]
-    pub(crate) fn has_detailed_markets(&self) -> bool {
-        !self.markets.is_empty()
-    }
-
     /// Replaces the rotating detail scope only after an immutable capture
     /// provides a fresh dynamic-universe observation.
     pub(crate) fn replace_markets(&mut self, mut markets: Vec<Market>) {
