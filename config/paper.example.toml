@@ -7,6 +7,9 @@ archive_url = "https://hyperliquid-archive.s3.amazonaws.com/"
 sqlite_path = "state/trench.sqlite"
 parquet_path = "data/parquet"
 
+[runtime]
+admin_socket_path = "/run/trench/trenchd.sock"
+
 [feeds]
 universe_refresh_seconds = 3600
 required_history_days = 30

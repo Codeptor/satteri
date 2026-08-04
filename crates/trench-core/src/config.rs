@@ -98,6 +98,24 @@ pub struct StorageConfig {
     parquet_path: String,
 }
 
+/// Validated local daemon control endpoint.
+///
+/// This is a Unix-domain socket path only; it never describes a public TCP
+/// listener or an account/action endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RuntimeConfig {
+    admin_socket_path: String,
+}
+
+impl RuntimeConfig {
+    /// Returns the configured local Unix admin-socket path.
+    #[must_use]
+    pub fn admin_socket_path(&self) -> &str {
+        &self.admin_socket_path
+    }
+}
+
 impl StorageConfig {
     /// Returns the configured local SQLite path.
     ///
@@ -365,6 +383,7 @@ impl ActiveRulesConfig {
 pub struct PaperConfig {
     endpoints: EndpointsConfig,
     storage: StorageConfig,
+    runtime: RuntimeConfig,
     feed: FeedConfig,
     risk: RiskConfig,
     margin_mode: MarginMode,
@@ -382,6 +401,12 @@ impl PaperConfig {
     #[must_use]
     pub const fn storage(&self) -> &StorageConfig {
         &self.storage
+    }
+
+    /// Returns the validated daemon-local runtime endpoint.
+    #[must_use]
+    pub const fn runtime(&self) -> &RuntimeConfig {
+        &self.runtime
     }
 
     /// Returns the frozen feed and universe gates.
@@ -444,6 +469,7 @@ impl PaperConfig {
         )?;
         validate_local_path(&self.storage.sqlite_path, "storage.sqlite_path")?;
         validate_local_path(&self.storage.parquet_path, "storage.parquet_path")?;
+        validate_unix_socket_path(&self.runtime.admin_socket_path, "runtime.admin_socket_path")?;
         validate_feed(&self.feed)?;
         validate_risk(&self.risk)?;
         validate_rules(&self.rules)?;
@@ -456,6 +482,7 @@ impl PaperConfig {
 struct RawPaperConfig {
     endpoints: RawEndpointsConfig,
     storage: RawStorageConfig,
+    runtime: RawRuntimeConfig,
     feeds: RawFeedConfig,
     risk: RawRiskConfig,
     rules: RawRulesConfig,
@@ -474,6 +501,12 @@ struct RawEndpointsConfig {
 struct RawStorageConfig {
     sqlite_path: String,
     parquet_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRuntimeConfig {
+    admin_socket_path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -582,6 +615,9 @@ impl TryFrom<RawPaperConfig> for PaperConfig {
             storage: StorageConfig {
                 sqlite_path: raw.storage.sqlite_path,
                 parquet_path: raw.storage.parquet_path,
+            },
+            runtime: RuntimeConfig {
+                admin_socket_path: raw.runtime.admin_socket_path,
             },
             feed: FeedConfig {
                 universe_refresh_seconds: raw.feeds.universe_refresh_seconds,
@@ -921,6 +957,22 @@ fn validate_local_path(value: &str, field: &'static str) -> Result<(), ConfigErr
     Ok(())
 }
 
+fn validate_unix_socket_path(value: &str, field: &'static str) -> Result<(), ConfigError> {
+    validate_local_path(value, field)?;
+    let path = Path::new(value);
+    if !path.is_absolute()
+        || path.file_name().is_none()
+        || !value.ends_with(".sock")
+        || value.len() > 107
+    {
+        return Err(invalid(
+            field,
+            "must be an absolute Unix socket path ending in .sock and fitting sockaddr_un",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -1000,7 +1052,29 @@ mod tests {
         assert_eq!(cfg.margin_mode(), MarginMode::Isolated);
         assert_eq!(cfg.rules().mode(), RulesMode::CollectOnly);
         assert!(cfg.rules().active().is_none());
+        assert_eq!(
+            cfg.runtime().admin_socket_path(),
+            "/run/trench/trenchd.sock"
+        );
         Ok(())
+    }
+
+    #[test]
+    fn runtime_admin_socket_must_be_a_bounded_absolute_unix_path() {
+        let cases = vec![
+            "runtime/trenchd.sock".to_owned(),
+            "/run/trench/trenchd".to_owned(),
+            "/run/trench/../trenchd.sock".to_owned(),
+            "/run/trench/\u{0}trenchd.sock".to_owned(),
+            format!("/run/{}.sock", "a".repeat(108)),
+        ];
+        for socket in cases {
+            let input = replace_once(EXAMPLE, "/run/trench/trenchd.sock", &socket);
+            assert!(
+                PaperConfig::from_toml(&input).is_err(),
+                "accepted {socket:?}"
+            );
+        }
     }
 
     #[test]
