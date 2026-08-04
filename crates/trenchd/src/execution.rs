@@ -8,7 +8,9 @@ use trench_core::book::{BookError, OrderBook};
 use trench_core::domain::{EventId, Market, Price};
 use trench_core::engine::EngineEvent;
 use trench_core::event::{DurationNs, FundingRate, MarketEvent, MarketEventKind, TimestampNs};
-use trench_hyperliquid::{GapEvent, RecoveryResult, RecoveryStatus, RecoveryUnavailable};
+use trench_hyperliquid::{
+    GapEvent, GapRecoveryRequest, RecoveryResult, RecoveryStatus, RecoveryUnavailable,
+};
 
 /// Why a source fact cannot reach an executable engine path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +54,23 @@ pub(crate) enum TypedEngineEvent {
     AdvanceTime {
         /// Immutable normalized source fact.
         source: MarketEvent,
+    },
+    /// A durable record that one fresh L2 snapshot opened a recovery fence.
+    ///
+    /// This is deliberately only a source-clock transition. It cannot restore
+    /// execution; only independently reconciled evidence may produce
+    /// [`Self::MarketRecovered`].
+    RecoveryRequested {
+        /// Deterministic recovery-request identity.
+        event_id: EventId,
+        /// Fresh snapshot time at which the request was emitted.
+        at: TimestampNs,
+        /// Affected market.
+        market: Market,
+        /// Monotonic gap generation scoped to the market.
+        generation: u64,
+        /// Immutable identity of the fresh L2 snapshot that anchors recovery.
+        snapshot_event_id: EventId,
     },
     /// A verified recovery boundary completed for one market.
     MarketRecovered {
@@ -98,7 +117,9 @@ impl TypedEngineEvent {
             | Self::ExecutableBook { source, .. }
             | Self::MarketMark { source, .. }
             | Self::FundingObserved { source, .. } => source.event_id(),
-            Self::MarketRecovered { event_id, .. } => event_id,
+            Self::RecoveryRequested { event_id, .. } | Self::MarketRecovered { event_id, .. } => {
+                event_id
+            }
         }
     }
 
@@ -110,7 +131,7 @@ impl TypedEngineEvent {
             | Self::ExecutableBook { source, .. }
             | Self::MarketMark { source, .. }
             | Self::FundingObserved { source, .. } => source.event_time(),
-            Self::MarketRecovered { at, .. } => *at,
+            Self::RecoveryRequested { at, .. } | Self::MarketRecovered { at, .. } => *at,
         }
     }
 
@@ -122,7 +143,7 @@ impl TypedEngineEvent {
             | Self::ExecutableBook { source, .. }
             | Self::MarketMark { source, .. }
             | Self::FundingObserved { source, .. } => source.market(),
-            Self::MarketRecovered { market, .. } => market,
+            Self::RecoveryRequested { market, .. } | Self::MarketRecovered { market, .. } => market,
         }
     }
 
@@ -131,6 +152,7 @@ impl TypedEngineEvent {
     pub(crate) const fn source_kind(&self) -> &'static str {
         match self {
             Self::AdvanceTime { .. } => "source_clock",
+            Self::RecoveryRequested { .. } => "recovery_request",
             Self::MarketRecovered { .. } => "market_recovered",
             Self::ExecutableBook { .. } => "executable_book",
             Self::MarketMark { .. } => "market_mark",
@@ -148,6 +170,21 @@ impl TypedEngineEvent {
                 "event_time_ns": source.event_time().value(),
                 "received_at_ns": source.received_at().value(),
                 "kind": "source_clock",
+            }),
+            Self::RecoveryRequested {
+                event_id,
+                at,
+                market,
+                generation,
+                snapshot_event_id,
+            } => serde_json::json!({
+                "schema_version": 1,
+                "event_id": event_id.as_str(),
+                "market": market.as_str(),
+                "event_time_ns": at.value(),
+                "kind": "recovery_request",
+                "generation": generation,
+                "snapshot_event_id": snapshot_event_id.as_str(),
             }),
             Self::MarketRecovered {
                 event_id,
@@ -206,6 +243,9 @@ impl TypedEngineEvent {
                 event_id: source.event_id().clone(),
                 at: source.event_time(),
             },
+            Self::RecoveryRequested { event_id, at, .. } => {
+                EngineEvent::AdvanceTime { event_id, at }
+            }
             Self::MarketRecovered {
                 event_id,
                 at,
@@ -244,6 +284,20 @@ impl TypedEngineEvent {
             },
         }
     }
+
+    /// Builds the only daemon-owned durable request record for a WebSocket
+    /// recovery handoff. The request itself remains execution-fenced.
+    #[must_use]
+    pub(crate) fn recovery_requested(request: &GapRecoveryRequest) -> Self {
+        let event_id = recovery_request_event_id(request);
+        Self::RecoveryRequested {
+            event_id,
+            at: request.snapshot_event_time(),
+            market: request.market().clone(),
+            generation: request.generation(),
+            snapshot_event_id: request.snapshot_event_id().clone(),
+        }
+    }
 }
 
 /// Verified recovery evidence reduced to the daemon's execution boundary.
@@ -257,10 +311,6 @@ pub(crate) struct RecoveryCompletion {
 }
 
 impl RecoveryCompletion {
-    #[allow(
-        dead_code,
-        reason = "the current public WebSocket source has no RecoveryResult producer; callers remain fail-closed until independent evidence is supplied"
-    )]
     fn from_result(result: &RecoveryResult) -> Result<Self, RoutingError> {
         let RecoveryStatus::Reconciled { .. } = result.status() else {
             return Err(RoutingError::RecoveryUnavailable {
@@ -275,9 +325,7 @@ impl RecoveryCompletion {
         Ok(Self {
             market: request.market().clone(),
             generation: request.generation(),
-            boundary_at: request
-                .predecessor_event_time()
-                .unwrap_or(TimestampNs::new(0).expect("zero timestamp is valid")),
+            boundary_at: result.completed_through(),
             snapshot_event_id: request.snapshot_event_id().clone(),
             backfill_events: result.backfill_events().to_vec(),
         })
@@ -296,7 +344,7 @@ impl RecoveryCompletion {
 }
 
 /// Stateful typed router owned only by the daemon authority loop.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct TypedMarketRouter {
     maximum_book_age: DurationNs,
     books: BTreeMap<Market, OrderBook>,
@@ -304,6 +352,20 @@ pub(crate) struct TypedMarketRouter {
     gap_generations: BTreeMap<Market, u64>,
     recovered_at: BTreeMap<Market, TimestampNs>,
     unavailable: BTreeMap<Market, RecoveryUnavailable>,
+}
+
+fn recovery_request_event_id(request: &GapRecoveryRequest) -> EventId {
+    let mut hasher = Hasher::new_derive_key("trench.daemon-recovery-request.v1");
+    for component in [
+        request.market().as_str(),
+        &request.generation().to_string(),
+        request.snapshot_event_id().as_str(),
+    ] {
+        hasher.update(&(component.len() as u64).to_be_bytes());
+        hasher.update(component.as_bytes());
+    }
+    EventId::new(format!("b3:{}", hasher.finalize().to_hex()))
+        .expect("BLAKE3 recovery-request identity is a valid event ID")
 }
 
 impl TypedMarketRouter {
@@ -389,10 +451,6 @@ impl TypedMarketRouter {
     }
 
     /// Turns independently reconciled recovery evidence into the only recovery boundary.
-    #[allow(
-        dead_code,
-        reason = "the current public WebSocket source has no RecoveryResult producer; callers remain fail-closed until independent evidence is supplied"
-    )]
     pub(crate) fn route_recovery_result(
         &mut self,
         result: &RecoveryResult,
@@ -449,12 +507,11 @@ impl TypedMarketRouter {
                 actual: source.event_id().clone(),
             });
         }
-        let (source, book) =
-            self.deferred_books
-                .remove(&market)
-                .ok_or(RoutingError::MissingRecoverySnapshot {
-                    market: market.clone(),
-                })?;
+        self.deferred_books
+            .remove(&market)
+            .ok_or(RoutingError::MissingRecoverySnapshot {
+                market: market.clone(),
+            })?;
         let event_id = recovery_event_id(&completion);
         let RecoveryCompletion {
             market,
@@ -473,11 +530,11 @@ impl TypedMarketRouter {
             market: market.clone(),
             snapshot_event_id,
         });
-        events.push(TypedEngineEvent::ExecutableBook {
-            source,
-            book: book.clone(),
-        });
-        self.books.insert(market.clone(), book);
+        // The immutable snapshot proves this recovery request, but evidence
+        // may complete at a later UTC boundary. It must never become a book
+        // for execution when it predates that boundary; wait for a new full L2
+        // source fact after `MarketRecovered` instead.
+        self.books.remove(&market);
         self.recovered_at.insert(market.clone(), boundary_at);
         self.gap_generations.remove(&market);
         self.unavailable.remove(&market);
@@ -626,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn book_is_fenced_until_a_verified_recovery_completion() {
+    fn book_is_fenced_until_recovery_then_requires_a_post_boundary_snapshot() {
         let mut router =
             TypedMarketRouter::new(DurationNs::new(1_000_000_000).expect("fixture maximum age"));
         let book = snapshot(20, 1);
@@ -654,17 +711,22 @@ mod tests {
             super::TypedEngineEvent::MarketRecovered { .. }
         ));
         assert!(matches!(
-            events[1],
-            super::TypedEngineEvent::ExecutableBook { .. }
+            router
+                .route_market_event(snapshot(21, 2), None)
+                .expect("post-recovery source route")
+                .events()
+                .expect("post-recovery book route"),
+            [super::TypedEngineEvent::ExecutableBook { .. }]
         ));
     }
 
     #[test]
-    fn recovery_uses_its_first_fresh_snapshot_after_later_books_arrive() {
+    fn recovery_preserves_its_first_snapshot_as_proof_but_never_executes_it() {
         let mut router =
             TypedMarketRouter::new(DurationNs::new(1_000_000_000).expect("fixture maximum age"));
         let anchor = snapshot(20, 1);
         let later = snapshot(21, 2);
+        let post_boundary = snapshot(30, 3);
 
         router.open_gap_for_test(market());
         let _ = router
@@ -683,10 +745,18 @@ mod tests {
             .expect("anchored recovery completion")
             .into_iter()
             .collect::<Vec<_>>();
-        let TypedEngineEvent::ExecutableBook { source, .. } = &events[1] else {
-            panic!("recovery must release its executable anchor book");
+        assert!(matches!(
+            events.as_slice(),
+            [TypedEngineEvent::MarketRecovered { .. }]
+        ));
+        let route = router
+            .route_market_event(post_boundary.clone(), None)
+            .expect("post-boundary book route");
+        let Some([TypedEngineEvent::ExecutableBook { source, .. }]) = route.events() else {
+            panic!("new post-boundary snapshot must be the only executable book");
         };
-        assert_eq!(source.event_id(), anchor.event_id());
+        assert_eq!(source.event_id(), post_boundary.event_id());
+        assert_ne!(source.event_id(), anchor.event_id());
     }
 
     #[test]
@@ -888,10 +958,7 @@ mod tests {
             .expect("verified recovery completion");
         assert!(matches!(
             recovery_events.as_slice(),
-            [
-                TypedEngineEvent::MarketRecovered { .. },
-                TypedEngineEvent::ExecutableBook { .. }
-            ]
+            [TypedEngineEvent::MarketRecovered { .. }]
         ));
         for event in recovery_events {
             state = Engine::apply(
@@ -900,6 +967,34 @@ mod tests {
                 &EngineContext::passive(trench_core::engine::EventAdmission::New),
             )
             .expect("recovery route must apply")
+            .into_parts()
+            .0;
+        }
+        assert_eq!(
+            state.broker().state(),
+            trench_core::broker::BrokerState::MandatoryExit
+        );
+        let post_recovery_book = snapshot_for(
+            Market::new("BTC").expect("fixture market"),
+            900_000_000_013,
+            3,
+        );
+        let MarketRoute::Engine(events) = router
+            .route_market_event(
+                post_recovery_book,
+                Some(&Market::new("BTC").expect("fixture market")),
+            )
+            .expect("post-recovery book route")
+        else {
+            panic!("post-recovery book must become executable");
+        };
+        for event in events {
+            state = Engine::apply(
+                event.into_engine_event(),
+                state,
+                &EngineContext::passive(trench_core::engine::EventAdmission::New),
+            )
+            .expect("post-recovery book must settle the mandatory exit")
             .into_parts()
             .0;
         }

@@ -1,6 +1,6 @@
 //! Bounded daemon lifecycle and startup recovery orchestration.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -9,12 +9,16 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use trench_core::broker::{BrokerConfig, BrokerRunContext, PaperBroker};
+use trench_core::candle::CandleAggregator;
 use trench_core::config::PaperConfig;
-use trench_core::domain::{LedgerId, RunId, Usdc};
+use trench_core::domain::{LedgerId, Market, RunId, Usdc};
 use trench_core::engine::{Engine, EngineContext, EngineState};
 use trench_core::event::{DurationNs, MarketEvent, TimestampNs};
 use trench_core::ledger::LedgerState;
-use trench_hyperliquid::{GapEvent, InfoClient, WsClient, WsConfig, WsOutput, WsStream};
+use trench_hyperliquid::{
+    GapEvent, GapRecoveryRequest, InfoClient, InfoError, RecoveryEvidenceProducer,
+    RecoveryProducerError, RecoveryResult, WsClient, WsConfig, WsOutput, WsStream,
+};
 use trench_storage::parquet::{DataProvenance, ParquetError, ParquetStore};
 use trench_storage::replay::{DeterministicReplay, ReplayError, ReplayPlan};
 
@@ -27,6 +31,7 @@ use crate::readiness::Readiness;
 use crate::writer::{EngineWriter, SourceEvent, WriterError};
 
 const SOURCE_CHANNEL_CAPACITY: usize = 128;
+const RECOVERY_CHANNEL_CAPACITY: usize = 16;
 const MAXIMUM_BOOK_AGE_NS: i64 = 1_000_000_000;
 
 /// One requested daemon lifecycle mode.
@@ -69,6 +74,33 @@ struct AuthorityState {
     router: TypedMarketRouter,
     readiness: Readiness,
     reconciled: bool,
+    recovery_markets: BTreeSet<Market>,
+    recovery_worker_available: bool,
+}
+
+/// One authority-approved handoff to the read-only evidence producer.
+#[derive(Debug)]
+enum RecoveryInput {
+    /// A normalized source fact accepted by the sole SQLite writer.
+    CommittedSource(MarketEvent),
+    /// An immutable WebSocket gap request, already recorded and fenced.
+    Request(GapRecoveryRequest),
+    /// An explicit source-time watermark for a quiet recovering market.
+    AdvanceTime { market: Market, at: TimestampNs },
+}
+
+/// One bounded recovery-worker outcome returned to the authority loop.
+#[derive(Debug)]
+enum RecoveryOutput {
+    /// A final reconciled or unavailable recovery conclusion.
+    Result(RecoveryResult),
+    /// The producer could not safely retain or reconcile its queue head.
+    Failed {
+        /// Market that remains execution-fenced.
+        market: Market,
+        /// Exact conservative producer failure.
+        error: RecoveryProducerError,
+    },
 }
 
 /// Starts the paper-only daemon and waits for a bounded duration or Ctrl-C.
@@ -104,6 +136,8 @@ pub async fn run(
         router: TypedMarketRouter::new(maximum_book_age()?),
         readiness: Readiness::default(),
         reconciled: false,
+        recovery_markets: BTreeSet::new(),
+        recovery_worker_available: true,
     };
     authority.readiness.set_storage_writable(true);
     authority
@@ -122,6 +156,16 @@ pub async fn run(
         "entry reactor is sealed collection-only; missing recovery evidence keeps execution fenced"
     );
     let cancellation = CancellationToken::new();
+    let recovery_client = InfoClient::new(config.endpoints().info_url())?;
+    let (recovery_sender, recovery_receiver) = mpsc::channel(RECOVERY_CHANNEL_CAPACITY);
+    let (recovery_result_sender, mut recovery_result_receiver) =
+        mpsc::channel(RECOVERY_CHANNEL_CAPACITY);
+    let recovery_task = tokio::spawn(recovery_worker(
+        recovery_client,
+        recovery_receiver,
+        recovery_result_sender,
+        cancellation.clone(),
+    ));
     let (source_sender, mut source_receiver) = mpsc::channel(SOURCE_CHANNEL_CAPACITY);
     let replay_task = tokio::spawn(replay_producer(
         recovery
@@ -131,7 +175,7 @@ pub async fn run(
         cancellation.clone(),
     ));
     while let Some(event) = source_receiver.recv().await {
-        admit_market_event(&mut writer, &mut authority, event).await?;
+        admit_market_event(&mut writer, &mut authority, event, Some(&recovery_sender)).await?;
     }
     replay_task.await.map_err(AppError::ReplayProducerJoin)?;
     authority.reconciled = true;
@@ -155,6 +199,12 @@ pub async fn run(
 
     let stop = stop_signal(duration);
     tokio::pin!(stop);
+    let mut recovery_results_open = true;
+    let mut recovery_clock = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+    recovery_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             result = &mut stop => {
@@ -181,7 +231,12 @@ pub async fn run(
                 match output {
                     Some(WsOutput::MarketEvent(event)) => {
                         parquet_store.write_events(std::slice::from_ref(&event))?;
-                        admit_market_event(&mut writer, &mut authority, event).await?;
+                        admit_market_event(
+                            &mut writer,
+                            &mut authority,
+                            event,
+                            Some(&recovery_sender),
+                        ).await?;
                     }
                     Some(WsOutput::Gap(gap)) => {
                         authority.router.open_gap(&gap);
@@ -191,11 +246,17 @@ pub async fn run(
                     Some(WsOutput::RecoveryRequest(request)) => {
                         let market = request.market().clone();
                         mark_market_execution_blocked(&mut authority.readiness, market);
-                        tracing::warn!(
-                            market = request.market().as_str(),
-                            generation = request.generation(),
-                            "recovery evidence is unavailable; market remains execution-fenced"
-                        );
+                        admit_typed_engine_event(
+                            &mut writer,
+                            &mut authority,
+                            TypedEngineEvent::recovery_requested(&request),
+                        ).await?;
+                        authority.recovery_markets.insert(request.market().clone());
+                        authority.recovery_worker_available = submit_recovery_request(
+                            &recovery_sender,
+                            &mut authority.readiness,
+                            request,
+                        ).await;
                     }
                     Some(WsOutput::Rejected(_)) => {}
                     Some(WsOutput::Terminal(_)) | None => {
@@ -204,12 +265,46 @@ pub async fn run(
                     }
                 }
             }
+            output = recovery_result_receiver.recv(), if recovery_results_open => {
+                match output {
+                    Some(output) => {
+                        admit_recovery_output(
+                            &mut writer,
+                            &mut authority,
+                            &parquet_store,
+                            output,
+                        ).await?;
+                    }
+                    None => {
+                        recovery_results_open = false;
+                        authority.recovery_worker_available = false;
+                        tracing::error!(
+                            "recovery producer stopped; subsequent markets remain execution-fenced"
+                        );
+                    }
+                }
+            }
+            _ = recovery_clock.tick(), if authority.recovery_worker_available && !authority.recovery_markets.is_empty() => {
+                let at = TimestampNs::new(i128::from(current_time_ns()?))
+                    .map_err(|_| AppError::SystemTime)?;
+                for market in authority.recovery_markets.clone() {
+                    if !advance_recovery_clock(&recovery_sender, market, at).await {
+                        authority.recovery_worker_available = false;
+                        break;
+                    }
+                }
+            }
         }
     }
 
     cancellation.cancel();
+    drop(recovery_sender);
     if let Some(stream) = live_stream {
         stream.shutdown().await;
+    }
+    recovery_task.await.map_err(AppError::RecoveryTaskJoin)?;
+    while let Ok(output) = recovery_result_receiver.try_recv() {
+        admit_recovery_output(&mut writer, &mut authority, &parquet_store, output).await?;
     }
     admin_task.await.map_err(AppError::AdminTaskJoin)??;
     let counts = writer.journal_counts().await?;
@@ -276,6 +371,174 @@ async fn replay_producer(
             }
         }
     }
+}
+
+/// Runs the bounded, read-only recovery producer outside the authority loop.
+///
+/// It owns no SQLite handle, Parquet store, router, or readiness state. Every
+/// input is supplied by the authority after durable admission, and every final
+/// result is returned over a bounded channel for that same authority to route.
+async fn recovery_worker(
+    client: InfoClient,
+    mut input: mpsc::Receiver<RecoveryInput>,
+    output: mpsc::Sender<RecoveryOutput>,
+    cancellation: CancellationToken,
+) {
+    let mut producer = RecoveryEvidenceProducer::new(client);
+    let mut candles = CandleAggregator::new();
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return,
+            next = input.recv() => next,
+        };
+        let Some(next) = next else {
+            return;
+        };
+
+        let market = match &next {
+            RecoveryInput::CommittedSource(event) => event.market().clone(),
+            RecoveryInput::Request(request) => request.market().clone(),
+            RecoveryInput::AdvanceTime { market, .. } => market.clone(),
+        };
+        let input_result = match next {
+            RecoveryInput::CommittedSource(event) => producer.retain_committed_source_event(&event),
+            RecoveryInput::Request(request) => producer.enqueue(request).map_err(Into::into),
+            RecoveryInput::AdvanceTime { market, at } => {
+                producer.advance_time(&market, at);
+                Ok(())
+            }
+        };
+        let (result, terminal) = match input_result {
+            Err(error) => (RecoveryOutput::Failed { market, error }, true),
+            Ok(()) => match producer.process_next(&mut candles, &cancellation).await {
+                Ok(Some(result)) => (RecoveryOutput::Result(result), false),
+                Ok(None) => continue,
+                Err(RecoveryProducerError::Cancelled) => return,
+                Err(error) => (RecoveryOutput::Failed { market, error }, true),
+            },
+        };
+        let delivered = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => false,
+            delivered = output.send(result) => delivered.is_ok(),
+        };
+        if terminal || !delivered {
+            return;
+        }
+    }
+}
+
+/// Sends a source fact only after the authority's atomic engine append.
+async fn retain_recovery_source(
+    sender: &mpsc::Sender<RecoveryInput>,
+    readiness: &mut Readiness,
+    event: MarketEvent,
+) -> bool {
+    let market = event.market().clone();
+    if sender
+        .send(RecoveryInput::CommittedSource(event))
+        .await
+        .is_err()
+    {
+        mark_market_execution_blocked(readiness, market.clone());
+        tracing::error!(
+            market = market.as_str(),
+            "recovery producer is unavailable; retained source evidence cannot be extended"
+        );
+        return false;
+    }
+    true
+}
+
+/// Hands an already-recorded recovery request to the bounded evidence worker.
+async fn submit_recovery_request(
+    sender: &mpsc::Sender<RecoveryInput>,
+    readiness: &mut Readiness,
+    request: GapRecoveryRequest,
+) -> bool {
+    let market = request.market().clone();
+    let generation = request.generation();
+    if sender.send(RecoveryInput::Request(request)).await.is_err() {
+        mark_market_execution_blocked(readiness, market.clone());
+        tracing::error!(
+            market = market.as_str(),
+            generation,
+            "recovery producer is unavailable; market remains execution-fenced"
+        );
+        return false;
+    }
+    true
+}
+
+/// Advances only recovery evidence watermarks from the daemon's explicit UTC
+/// clock. It never reaches the engine, broker, SQLite, or Parquet directly.
+async fn advance_recovery_clock(
+    sender: &mpsc::Sender<RecoveryInput>,
+    market: Market,
+    at: TimestampNs,
+) -> bool {
+    sender
+        .send(RecoveryInput::AdvanceTime { market, at })
+        .await
+        .is_ok()
+}
+
+/// Applies only authority-owned recovery output through Parquet, routing, and
+/// the sole SQLite writer.
+async fn admit_recovery_output(
+    writer: &mut EngineWriter,
+    authority: &mut AuthorityState,
+    parquet_store: &ParquetStore,
+    output: RecoveryOutput,
+) -> Result<(), AppError> {
+    match output {
+        RecoveryOutput::Result(result) => {
+            let market = result.request().market().clone();
+            admit_recovery_result(writer, authority, parquet_store, result).await?;
+            authority.recovery_markets.remove(&market);
+            Ok(())
+        }
+        RecoveryOutput::Failed { market, error } => {
+            mark_market_execution_blocked(&mut authority.readiness, market.clone());
+            authority.recovery_markets.remove(&market);
+            authority.recovery_worker_available = false;
+            tracing::error!(
+                market = market.as_str(),
+                error = %error,
+                "recovery producer failed; market remains execution-fenced"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Persists replayable recovery facts before accepting typed recovery routes.
+async fn admit_recovery_result(
+    writer: &mut EngineWriter,
+    authority: &mut AuthorityState,
+    parquet_store: &ParquetStore,
+    result: RecoveryResult,
+) -> Result<(), AppError> {
+    parquet_store.write_events(result.backfill_events())?;
+    let mut candidate_router = authority.router.clone();
+    match candidate_router.route_recovery_result(&result)? {
+        MarketRoute::Engine(events) => {
+            for event in events {
+                admit_typed_engine_event(writer, authority, event).await?;
+            }
+        }
+        MarketRoute::Blocked { market, reason } => {
+            mark_market_execution_blocked(&mut authority.readiness, market.clone());
+            tracing::warn!(
+                market = market.as_str(),
+                reason = ?reason,
+                "recovery result remains execution-fenced"
+            );
+        }
+    }
+    authority.router = candidate_router;
+    Ok(())
 }
 
 async fn receive_live(stream: &mut Option<WsStream>) -> Option<WsOutput> {
@@ -360,6 +623,10 @@ fn update_readiness_from_typed_event(readiness: &mut Readiness, event: &TypedEng
         gates.set_data_quality_valid(true);
         gates.set_common_features_warm(false);
         match event {
+            TypedEngineEvent::RecoveryRequested { .. } => {
+                gates.set_recovered(false);
+                gates.set_executable_book(false);
+            }
             TypedEngineEvent::MarketRecovered { .. } => {
                 gates.set_recovered(true);
                 gates.set_executable_book(false);
@@ -389,7 +656,9 @@ async fn admit_market_event(
     writer: &mut EngineWriter,
     authority: &mut AuthorityState,
     event: MarketEvent,
+    recovery_sender: Option<&mpsc::Sender<RecoveryInput>>,
 ) -> Result<(), AppError> {
+    let committed_source = event.clone();
     let open_position_market = authority.engine_state.as_ref().and_then(|state| {
         state
             .broker()
@@ -406,6 +675,14 @@ async fn admit_market_event(
             }
         }
         MarketRoute::Blocked { market, reason } => {
+            admit_typed_engine_event(
+                writer,
+                authority,
+                TypedEngineEvent::AdvanceTime {
+                    source: committed_source.clone(),
+                },
+            )
+            .await?;
             mark_market_execution_blocked(&mut authority.readiness, market.clone());
             tracing::debug!(
                 market = market.as_str(),
@@ -413,6 +690,12 @@ async fn admit_market_event(
                 "normalized source fact is retained but execution-fenced"
             );
         }
+    }
+    if let Some(sender) = recovery_sender
+        && authority.recovery_worker_available
+    {
+        authority.recovery_worker_available =
+            retain_recovery_source(sender, &mut authority.readiness, committed_source).await;
     }
     Ok(())
 }
@@ -572,6 +855,12 @@ pub enum AppError {
     /// The bounded source-replay producer task did not complete normally.
     #[error("source replay producer task join failed")]
     ReplayProducerJoin(#[source] tokio::task::JoinError),
+    /// The read-only public recovery client could not be constructed.
+    #[error(transparent)]
+    Info(#[from] InfoError),
+    /// The bounded public recovery worker did not complete normally.
+    #[error("recovery producer task join failed")]
+    RecoveryTaskJoin(#[source] tokio::task::JoinError),
     /// Engine state was consumed by a failed authority transition.
     #[error("authority engine state is unavailable after a failed transition")]
     MissingEngineState,
@@ -606,6 +895,7 @@ pub enum AppError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -694,9 +984,11 @@ mod tests {
             ),
             readiness: Readiness::default(),
             reconciled: false,
+            recovery_markets: BTreeSet::new(),
+            recovery_worker_available: false,
         };
         for event in recovered.events {
-            admit_market_event(&mut writer, &mut authority, event)
+            admit_market_event(&mut writer, &mut authority, event, None)
                 .await
                 .expect("authority admission");
         }
