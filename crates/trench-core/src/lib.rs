@@ -12,3 +12,4 @@ pub mod ledger;
 pub mod risk;
 pub mod strategy;
 pub mod universe;
+pub mod validation;
