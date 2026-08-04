@@ -30,6 +30,7 @@ const OPEN_INTEREST_WEIGHT: Decimal = Decimal::from_parts(20, 0, 0, false, 2);
 const INVERSE_SPREAD_WEIGHT: Decimal = Decimal::from_parts(30, 0, 0, false, 2);
 const DEPTH_WEIGHT: Decimal = Decimal::from_parts(15, 0, 0, false, 2);
 const CONTINUITY_WEIGHT: Decimal = Decimal::from_parts(5, 0, 0, false, 2);
+const UNIVERSE_ACTIVATION_COMMITMENT_DIGEST_DOMAIN: &str = "trench.universe-activation.v1";
 
 /// Invalid immutable tradeable-universe input.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -736,6 +737,29 @@ impl UniverseActivation {
     #[must_use]
     pub fn snapshot_digest(&self) -> &str {
         &self.snapshot_digest
+    }
+
+    /// Returns a canonical commitment over the activation's frozen provenance and validity range.
+    #[must_use]
+    pub fn commitment_digest(&self) -> String {
+        let mut hasher = Hasher::new_derive_key(UNIVERSE_ACTIVATION_COMMITMENT_DIGEST_DOMAIN);
+        let snapshot_digest = self.snapshot_digest();
+        hasher.update(&(snapshot_digest.len() as u64).to_be_bytes());
+        hasher.update(snapshot_digest.as_bytes());
+        match self.universe() {
+            Some(universe) => {
+                hasher.update(&[1]);
+                let universe_digest = universe.digest();
+                hasher.update(&(universe_digest.len() as u64).to_be_bytes());
+                hasher.update(universe_digest.as_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+        hasher.update(&self.effective_from.value().to_be_bytes());
+        hasher.update(&self.effective_until.value().to_be_bytes());
+        hasher.finalize().to_hex().to_string()
     }
 
     /// Returns the active rank-1-to-20 membership, if any remains after hard removals.
@@ -2432,6 +2456,46 @@ mod tests {
             Err(UniverseError::PriorSnapshotDigestMismatch { snapshot_time })
                 if snapshot_time == prior_snapshot.as_of_time()
         ));
+    }
+
+    #[test]
+    fn activation_commitment_digest_is_deterministic() {
+        let snapshot = UniverseSelector::select(timestamp(HOUR_NS), [candidate("BTC", 0)])
+            .expect("selection must be valid");
+        let first =
+            UniverseSelector::activate(&snapshot, None, timestamp(HOUR_NS + FIFTEEN_MINUTES_NS))
+                .expect("first activation must be valid");
+        let second =
+            UniverseSelector::activate(&snapshot, None, timestamp(HOUR_NS + FIFTEEN_MINUTES_NS))
+                .expect("second activation must be valid");
+
+        assert_eq!(first.commitment_digest(), second.commitment_digest());
+    }
+
+    #[test]
+    fn activation_commitment_digest_distinguishes_committed_fields() {
+        let snapshot = UniverseSelector::select(timestamp(HOUR_NS), [candidate("BTC", 0)])
+            .expect("selection must be valid");
+        let activation =
+            UniverseSelector::activate(&snapshot, None, timestamp(HOUR_NS + FIFTEEN_MINUTES_NS))
+                .expect("activation must be valid");
+        let commitment = activation.commitment_digest();
+
+        let mut changed_snapshot = activation.clone();
+        changed_snapshot.snapshot_digest.push('x');
+        assert_ne!(commitment, changed_snapshot.commitment_digest());
+
+        let mut changed_universe = activation.clone();
+        changed_universe.universe = None;
+        assert_ne!(commitment, changed_universe.commitment_digest());
+
+        let mut changed_effective_from = activation.clone();
+        changed_effective_from.effective_from = timestamp(HOUR_NS);
+        assert_ne!(commitment, changed_effective_from.commitment_digest());
+
+        let mut changed_effective_until = activation;
+        changed_effective_until.effective_until = timestamp(HOUR_NS + 3 * FIFTEEN_MINUTES_NS);
+        assert_ne!(commitment, changed_effective_until.commitment_digest());
     }
 
     #[test]
