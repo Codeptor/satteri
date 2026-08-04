@@ -1,4 +1,4 @@
-"""Strict, non-secret ML configuration parsing."""
+"""Strict ML configuration parsing without credentials."""
 
 from __future__ import annotations
 

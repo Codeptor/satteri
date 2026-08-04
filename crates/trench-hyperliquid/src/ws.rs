@@ -1474,8 +1474,10 @@ struct ReconnectBackoff {
 }
 
 impl ReconnectBackoff {
-    const fn new(seed: u64) -> Self {
-        Self { state: seed }
+    const fn new(initial_state: u64) -> Self {
+        Self {
+            state: initial_state,
+        }
     }
 
     fn delay(&mut self, attempt: u32, limits: WsLimits) -> Duration {

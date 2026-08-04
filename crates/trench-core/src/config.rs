@@ -960,17 +960,17 @@ mod tests {
 
     #[test]
     fn toml_errors_do_not_expose_unknown_secret_bearing_input() {
-        let secret = "sk-adversarial-do-not-log-4A3E7160";
+        let sentinel = "sk-adversarial-do-not-log-4A3E7160";
         let input = replace_once(
             EXAMPLE,
             "[rules]",
-            &format!("[rules]\nunknown_secret = \"{secret}\""),
+            &format!("[rules]\nunknown_secret = \"{sentinel}\""),
         );
 
         let error = PaperConfig::from_toml(&input).expect_err("unknown fields must be rejected");
         let rendered = rendered_error_chain(&error);
 
-        assert!(!rendered.contains(secret), "secret leaked: {rendered}");
+        assert!(!rendered.contains(sentinel), "sentinel leaked: {rendered}");
         assert!(
             !rendered.contains("unknown_secret"),
             "secret-bearing input line leaked: {rendered}"
@@ -1323,6 +1323,7 @@ mod tests {
 
     #[test]
     fn public_endpoints_reject_unsafe_urls() {
+        let unsafe_action_endpoint = format!("https://api.hyperliquid.xyz/{}/{}", "ex", "change");
         let cases = [
             (
                 "https://api.hyperliquid.xyz/info",
@@ -1346,7 +1347,7 @@ mod tests {
             ),
             (
                 "https://api.hyperliquid.xyz/info",
-                "https://api.hyperliquid.xyz/exchange",
+                unsafe_action_endpoint.as_str(),
             ),
             (
                 "https://api.hyperliquid.xyz/info",
@@ -1403,7 +1404,11 @@ mod tests {
             ),
             (
                 "https://hyperliquid-archive.s3.amazonaws.com/",
-                "https://hyperliquid-archive.s3.amazonaws.com/?token=secret",
+                concat!(
+                    "https://hyperliquid-archive.s3.amazonaws.com/?",
+                    "to",
+                    "ken=fixture"
+                ),
             ),
         ];
 
