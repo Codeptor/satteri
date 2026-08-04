@@ -9,8 +9,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use blake3::Hasher;
 use rust_decimal::Decimal;
-use trench_core::book::OrderBook;
-use trench_core::broker::{BrokerConfig, BrokerRecord, BrokerRunContext, BrokerState, PaperBroker};
+use trench_core::book::{BookError, OrderBook};
+use trench_core::broker::{
+    BrokerConfig, BrokerRecord, BrokerRunContext, BrokerState, ExitReason as BrokerExitReason,
+    PaperBroker,
+};
 use trench_core::domain::{EventId, LedgerId, Market};
 use trench_core::engine::{
     Engine, EngineContext, EngineEvent, EngineOutcome, EnginePersistenceKind, EngineRecord,
@@ -21,35 +24,130 @@ use trench_core::features::common::{FeatureSnapshot, LongHorizonFeatureHistory};
 use trench_core::ledger::LedgerState;
 use trench_core::risk::sizing::RiskPolicy;
 use trench_core::strategy::Strategy;
-use trench_core::strategy::rules::RulesStrategy;
+use trench_core::strategy::rules::{ExitReason as RuleExitReason, RulePosition, RulesStrategy};
 use trench_core::universe::UniverseActivation;
 use trench_core::validation::{
     EngineReplayOutcome, MissingReplayInput, ResearchProvenance, RuleGrid, RuleReplay,
     RuleReplayRequest, RulesArtifact, ValidationError,
 };
 
+use crate::parquet::events_digest;
 use crate::replay::DeterministicReplay;
 
 const MAX_RESEARCH_RECOVERY_BOUNDARIES: usize = 100_000;
+const MAX_RESEARCH_SOURCE_EVENTS: usize = 100_000;
 
-/// A persisted recovery completion that may unlock a later full book for
-/// engine execution.
+/// Exact source facts that a replay sidecar consumed from one immutable
+/// [`DeterministicReplay`]. The constructor verifies both identity and
+/// canonical causal digest; an arbitrary list of IDs is not a usable sidecar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResearchSourceEvidence {
+    replay_digest: String,
+    event_ids: Vec<EventId>,
+    digest: String,
+}
+
+impl ResearchSourceEvidence {
+    /// Binds a bounded, nonempty source set to one verified replay stream.
+    pub fn from_replay(
+        replay: &DeterministicReplay,
+        event_ids: Vec<EventId>,
+    ) -> Result<Self, ValidationError> {
+        let event_ids = canonical_event_ids(event_ids)?;
+        let events = source_events(replay, &event_ids)?;
+        Ok(Self {
+            replay_digest: replay.digest().to_owned(),
+            event_ids,
+            digest: events_digest(&events).map_err(engine_failure)?,
+        })
+    }
+
+    fn verify(
+        &self,
+        replay: &DeterministicReplay,
+        decision_at: Option<TimestampNs>,
+    ) -> Result<Vec<MarketEvent>, ValidationError> {
+        if self.replay_digest != replay.digest() {
+            return Err(ValidationError::InvalidEngineOutcome);
+        }
+        let events = source_events(replay, &self.event_ids)?;
+        if events_digest(&events).map_err(engine_failure)? != self.digest
+            || decision_at.is_some_and(|at| {
+                events
+                    .iter()
+                    .any(|event| event.event_time() > at || event.received_at() > at)
+            })
+        {
+            return Err(ValidationError::InvalidEngineOutcome);
+        }
+        Ok(events)
+    }
+
+    fn contains(&self, event_id: &EventId) -> bool {
+        self.event_ids.binary_search(event_id).is_ok()
+    }
+}
+
+/// A persisted recovery completion derived from evidence in the same immutable
+/// replay stream. It has no public raw constructor: a source event cannot by
+/// itself unlock execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryBoundary {
     event_id: EventId,
     at: TimestampNs,
     market: Market,
+    generation: u64,
+    evidence: ResearchSourceEvidence,
+    anchor_event_id: EventId,
 }
 
 impl RecoveryBoundary {
-    /// Creates one explicit completed recovery boundary.
-    #[must_use]
-    pub const fn new(event_id: EventId, at: TimestampNs, market: Market) -> Self {
-        Self {
+    /// Derives one recovery completion from verified raw source evidence.
+    ///
+    /// `generation` distinguishes repeated recoveries for the same market.
+    /// `anchor_event_id` must be a same-market member of `evidence_ids`; the
+    /// completion time is derived from the latest evidence receipt rather than
+    /// accepted from a caller.
+    pub fn from_verified_replay(
+        replay: &DeterministicReplay,
+        market: Market,
+        generation: u64,
+        anchor_event_id: EventId,
+        evidence_ids: Vec<EventId>,
+    ) -> Result<Self, ValidationError> {
+        if generation == 0 {
+            return Err(ValidationError::InvalidEngineOutcome);
+        }
+        let evidence = ResearchSourceEvidence::from_replay(replay, evidence_ids)?;
+        let events = evidence.verify(replay, None)?;
+        let anchor = events
+            .iter()
+            .find(|event| event.event_id() == &anchor_event_id)
+            .ok_or(ValidationError::InvalidEngineOutcome)?;
+        if anchor.market() != &market {
+            return Err(ValidationError::InvalidEngineOutcome);
+        }
+        let at = events
+            .iter()
+            .map(MarketEvent::received_at)
+            .max()
+            .ok_or(ValidationError::InvalidEngineOutcome)?;
+        let event_id = recovery_event_id(
+            replay.digest(),
+            &market,
+            generation,
+            at,
+            evidence.digest.as_str(),
+            &anchor_event_id,
+        )?;
+        Ok(Self {
             event_id,
             at,
             market,
-        }
+            generation,
+            evidence,
+            anchor_event_id,
+        })
     }
 
     /// Returns the source identity of this recovery completion.
@@ -76,16 +174,64 @@ impl RecoveryBoundary {
 pub struct ResearchFeatureFacts {
     snapshot: FeatureSnapshot,
     long_history: LongHorizonFeatureHistory,
+    evidence: ResearchSourceEvidence,
 }
 
 impl ResearchFeatureFacts {
     /// Couples the exact common snapshot to its independently validated
     /// long-horizon history. Neither value is imputed by this adapter.
     #[must_use]
-    pub const fn new(snapshot: FeatureSnapshot, long_history: LongHorizonFeatureHistory) -> Self {
+    pub const fn new(
+        snapshot: FeatureSnapshot,
+        long_history: LongHorizonFeatureHistory,
+        evidence: ResearchSourceEvidence,
+    ) -> Self {
         Self {
             snapshot,
             long_history,
+            evidence,
+        }
+    }
+}
+
+/// A universe activation and its exact causal source evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResearchUniverseFacts {
+    activation: UniverseActivation,
+    evidence: ResearchSourceEvidence,
+}
+
+impl ResearchUniverseFacts {
+    /// Couples a selector-issued activation to verified replay facts.
+    #[must_use]
+    pub const fn new(activation: UniverseActivation, evidence: ResearchSourceEvidence) -> Self {
+        Self {
+            activation,
+            evidence,
+        }
+    }
+}
+
+/// Frozen risk policies and their config/source binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResearchRiskPolicies {
+    config_digest: String,
+    policies: BTreeMap<Market, RiskPolicy>,
+    evidence: ResearchSourceEvidence,
+}
+
+impl ResearchRiskPolicies {
+    /// Couples market policies to one config commitment and verified replay
+    /// facts. The adapter repeats both checks before an entry is admitted.
+    pub fn new(
+        config_digest: impl Into<String>,
+        policies: BTreeMap<Market, RiskPolicy>,
+        evidence: ResearchSourceEvidence,
+    ) -> Self {
+        Self {
+            config_digest: config_digest.into(),
+            policies,
+            evidence,
         }
     }
 }
@@ -98,8 +244,8 @@ impl ResearchFeatureFacts {
 #[derive(Debug, Default)]
 pub struct ResearchFacts {
     features: BTreeMap<EventId, ResearchFeatureFacts>,
-    universes: BTreeMap<EventId, UniverseActivation>,
-    risk_policies: BTreeMap<EventId, BTreeMap<Market, RiskPolicy>>,
+    universes: BTreeMap<EventId, ResearchUniverseFacts>,
+    risk_policies: BTreeMap<EventId, ResearchRiskPolicies>,
 }
 
 impl ResearchFacts {
@@ -128,12 +274,12 @@ impl ResearchFacts {
     pub fn insert_universe(
         &mut self,
         event_id: EventId,
-        activation: UniverseActivation,
+        facts: ResearchUniverseFacts,
     ) -> Result<(), ValidationError> {
         insert_once(
             &mut self.universes,
             event_id,
-            activation,
+            facts,
             MissingReplayInput::UniverseActivation,
         )
     }
@@ -144,7 +290,7 @@ impl ResearchFacts {
     pub fn insert_risk_policies(
         &mut self,
         event_id: EventId,
-        policies: BTreeMap<Market, RiskPolicy>,
+        policies: ResearchRiskPolicies,
     ) -> Result<(), ValidationError> {
         insert_once(
             &mut self.risk_policies,
@@ -177,22 +323,28 @@ pub struct ResearchExecutionSetup {
     ledger_id: LedgerId,
     broker_config: BrokerConfig,
     broker_context: BrokerRunContext,
+    config_digest: String,
 }
 
 impl ResearchExecutionSetup {
     /// Creates an engine setup from the same paper broker configuration and run
     /// commitment used by runtime. No alternate broker may be supplied.
-    #[must_use]
-    pub const fn new(
+    pub fn new(
         ledger_id: LedgerId,
         broker_config: BrokerConfig,
         broker_context: BrokerRunContext,
-    ) -> Self {
-        Self {
+        config_digest: impl Into<String>,
+    ) -> Result<Self, ValidationError> {
+        let config_digest = config_digest.into();
+        if !is_prefixed_digest(&config_digest) {
+            return Err(ValidationError::InvalidDigest);
+        }
+        Ok(Self {
             ledger_id,
             broker_config,
             broker_context,
-        }
+            config_digest,
+        })
     }
 
     fn state(
@@ -239,6 +391,10 @@ impl EngineRuleReplay {
         validate_replay_provenance(&replay, &provenance)?;
         validate_artifacts(&artifacts, &provenance)?;
         validate_recovery_boundaries(&replay, &recovery_boundaries)?;
+        validate_research_facts(&replay, &provenance, &facts)?;
+        if execution.config_digest != provenance.config_digest {
+            return Err(misaligned([MissingReplayInput::RiskPolicies]));
+        }
         Ok(Self {
             replay,
             provenance,
@@ -268,35 +424,28 @@ impl EngineRuleReplay {
         if source_start >= request.evaluation.end() {
             return Err(ValidationError::InvalidEngineOutcome);
         }
-        let events = self
+        let mut events = self
             .replay
             .events()
             .iter()
             .filter(|event| {
-                event.event_time() >= source_start
-                    && event.event_time() < request.evaluation.end()
-                    && event.received_at() <= request.evaluation.end()
+                event.event_time() >= source_start && event_as_of(event) < request.evaluation.end()
             })
             .collect::<Vec<_>>();
-        let opened_at = self
-            .recovery_boundaries
-            .iter()
-            .map(RecoveryBoundary::at)
-            .filter(|at| *at < request.evaluation.end())
-            .min()
-            .unwrap_or(source_start)
-            .min(source_start);
-        let mut state = self.execution.state(opened_at, BTreeMap::new())?;
+        events.sort_by(|left, right| causal_event_order(left, right));
+        let mut state = self.execution.state(source_start, BTreeMap::new())?;
         let initial_equity = state.ledger().equity().value();
         let mut evidence = ReplayEvidence::new(self.replay.digest(), &self.provenance, request);
         let mut source_books = BTreeMap::<Market, OrderBook>::new();
         let mut executable_books = BTreeMap::<Market, OrderBook>::new();
         let mut recovery_index = 0_usize;
         let mut recovered = BTreeMap::<Market, TimestampNs>::new();
+        let mut pending_rule_position = None::<RulePosition>;
+        let mut rule_position = None::<RulePosition>;
 
         for event in events {
             let at = event_as_of(event);
-            self.apply_recoveries_through(
+            self.apply_recoveries_before(
                 at,
                 &mut recovery_index,
                 &mut recovered,
@@ -305,12 +454,30 @@ impl EngineRuleReplay {
             )?;
             match event.kind() {
                 MarketEventKind::BookSnapshot(_) => {
-                    let book = OrderBook::apply_snapshot(
+                    let book = match OrderBook::apply_snapshot(
                         source_books.get(event.market()),
                         event,
                         self.execution.broker_config.maximum_book_age(),
-                    )
-                    .map_err(engine_failure)?;
+                    ) {
+                        Ok(book) => book,
+                        Err(BookError::Stale { .. }) => {
+                            return Err(misaligned([MissingReplayInput::ExecutableBooks]));
+                        }
+                        Err(BookError::NonMonotonicTime { .. }) => {
+                            let was_open = state.ledger().position().is_some();
+                            let prior = take_state(&self.execution, &mut state, at)?;
+                            let outcome =
+                                source_retained(event, at, prior).map_err(engine_failure)?;
+                            state = evidence.consume(was_open, outcome)?;
+                            sync_rule_position(
+                                &state,
+                                &mut rule_position,
+                                &mut pending_rule_position,
+                            );
+                            continue;
+                        }
+                        Err(error) => return Err(engine_failure(error)),
+                    };
                     let executable = recovered.get(event.market()).is_some_and(|recovered_at| {
                         book.event_time() > *recovered_at && book.received_at() > *recovered_at
                     });
@@ -339,7 +506,31 @@ impl EngineRuleReplay {
                 MarketEventKind::AssetContext(context) => {
                     let was_open = state.ledger().position().is_some();
                     let prior = take_state(&self.execution, &mut state, at)?;
-                    let outcome = if recovered.contains_key(event.market()) {
+                    let exit = rule_position
+                        .as_ref()
+                        .and_then(|position| {
+                            (position.market() == event.market()).then(|| {
+                                strategy.exit_for(position, context.mark_price().value(), None, at)
+                            })
+                        })
+                        .flatten();
+                    let outcome = if recovered.contains_key(event.market())
+                        && let Some(reason) = exit
+                    {
+                        Engine::apply(
+                            EngineEvent::ExitRequested {
+                                event_id: event.event_id().clone(),
+                                at,
+                                reason: broker_exit_reason(reason),
+                                market: event.market().clone(),
+                                price: context.mark_price(),
+                                event_time: event.event_time(),
+                                received_at: event.received_at(),
+                            },
+                            prior,
+                            &EngineContext::passive(EventAdmission::New),
+                        )
+                    } else if recovered.contains_key(event.market()) {
                         Engine::apply(
                             EngineEvent::MarketMark {
                                 event_id: event.event_id().clone(),
@@ -395,7 +586,44 @@ impl EngineRuleReplay {
                         event.event_id(),
                         rule_decision.explanation_json().as_bytes(),
                     );
-                    if let Some(candidate) = rule_decision.candidate() {
+                    let exit = rule_position
+                        .as_ref()
+                        .and_then(|position| {
+                            (position.market() == event.market()).then(|| {
+                                strategy.exit_for(
+                                    position,
+                                    candle.close().value(),
+                                    rule_decision.composite(),
+                                    at,
+                                )
+                            })
+                        })
+                        .flatten();
+                    if let Some(reason) = exit {
+                        let was_open = state.ledger().position().is_some();
+                        let prior = take_state(&self.execution, &mut state, at)?;
+                        let outcome = Engine::apply(
+                            EngineEvent::ExitRequested {
+                                event_id: event.event_id().clone(),
+                                at,
+                                reason: broker_exit_reason(reason),
+                                market: event.market().clone(),
+                                price: candle.close(),
+                                event_time: event.event_time(),
+                                received_at: event.received_at(),
+                            },
+                            prior,
+                            &EngineContext::passive(EventAdmission::New),
+                        )
+                        .map_err(engine_failure)?;
+                        state = evidence.consume(was_open, outcome)?;
+                    } else if rule_position.is_none()
+                        && pending_rule_position.is_none()
+                        && let Some(candidate) = rule_decision.candidate()
+                    {
+                        if candidate.decision_time() != at {
+                            return Err(misaligned([MissingReplayInput::FeatureSnapshot]));
+                        }
                         let context = EngineContext::new(
                             EventAdmission::New,
                             SnapshotBindings::new(
@@ -421,6 +649,9 @@ impl EngineRuleReplay {
                         )
                         .map_err(engine_failure)?;
                         state = evidence.consume(was_open, outcome)?;
+                        if state.broker().state() == BrokerState::PendingEntry {
+                            pending_rule_position = RulePosition::from_candidate(candidate);
+                        }
                     } else {
                         let was_open = state.ledger().position().is_some();
                         let prior = take_state(&self.execution, &mut state, at)?;
@@ -435,15 +666,33 @@ impl EngineRuleReplay {
                     state = evidence.consume(was_open, outcome)?;
                 }
             }
+            sync_rule_position(&state, &mut rule_position, &mut pending_rule_position);
         }
-        self.apply_recoveries_through(
+        self.apply_recoveries_before(
             request.evaluation.end(),
             &mut recovery_index,
             &mut recovered,
             &mut state,
             &mut evidence,
         )?;
-        if state.ledger().position().is_some() || state.broker().state() != BrokerState::Flat {
+        let was_open = state.ledger().position().is_some();
+        let prior = take_state(&self.execution, &mut state, request.evaluation.end())?;
+        let terminal = Engine::apply(
+            EngineEvent::EndOfData {
+                event_id: end_of_data_event_id(self.replay.digest(), request)?,
+                at: request.evaluation.end(),
+            },
+            prior,
+            &EngineContext::passive(EventAdmission::New),
+        )
+        .map_err(engine_failure)?;
+        state = evidence.consume(was_open, terminal)?;
+        if state.ledger().position().is_some()
+            || !matches!(
+                state.broker().state(),
+                BrokerState::Flat | BrokerState::Liquidated
+            )
+        {
             return Err(ValidationError::InvalidEngineOutcome);
         }
         let net_pnl = state
@@ -455,7 +704,7 @@ impl EngineRuleReplay {
         evidence.outcome(net_pnl)
     }
 
-    fn apply_recoveries_through(
+    fn apply_recoveries_before(
         &self,
         at: TimestampNs,
         index: &mut usize,
@@ -464,7 +713,7 @@ impl EngineRuleReplay {
         evidence: &mut ReplayEvidence,
     ) -> Result<(), ValidationError> {
         while let Some(boundary) = self.recovery_boundaries.get(*index)
-            && boundary.at() <= at
+            && boundary.at() < at
         {
             let was_open = state.ledger().position().is_some();
             let prior = take_state(&self.execution, state, boundary.at())?;
@@ -517,9 +766,12 @@ impl EngineRuleReplay {
         if !missing.is_empty() {
             return Err(missing_inputs(missing));
         }
-        let feature = feature.expect("checked feature facts are present");
-        let universe = universe.expect("checked universe activation is present");
-        let risk_policies = risk_policies.expect("checked risk policies are present");
+        let (Some(feature), Some(universe), Some(risk_policies)) =
+            (feature, universe, risk_policies)
+        else {
+            return Err(ValidationError::InvalidEngineOutcome);
+        };
+        let decision_at = event_as_of(event);
         let mut misaligned_inputs = Vec::new();
         if feature.snapshot.market() != event.market()
             || feature.snapshot.sleeve() != sleeve
@@ -527,22 +779,58 @@ impl EngineRuleReplay {
             || feature.long_history.market() != event.market().as_str()
             || feature.long_history.as_of_time_ns() != event.event_time().value()
             || feature.long_history.verify().is_err()
+            || feature.snapshot.schema_hash() != self.provenance.feature_schema_digest
+            || feature.snapshot.input_range().is_none_or(|range| {
+                range.universe_digest() != Some(self.provenance.universe_digest.as_str())
+                    || !feature.evidence.contains(range.first_event_id())
+                    || !feature.evidence.contains(range.last_event_id())
+            })
+            || !history_sources_are_declared(&feature.long_history, &feature.evidence)
+            || feature
+                .evidence
+                .verify(&self.replay, Some(decision_at))
+                .is_err()
+            || !feature.evidence.contains(event.event_id())
         {
             misaligned_inputs.push(MissingReplayInput::FeatureSnapshot);
         }
-        if !universe.is_effective_for(event.event_time())
+        if !universe.activation.is_effective_for(event.event_time())
             || universe
+                .activation
                 .universe()
                 .is_none_or(|tradeable| !tradeable.contains(event.market()))
+            || universe
+                .activation
+                .universe()
+                .is_none_or(|tradeable| tradeable.digest() != self.provenance.universe_digest)
+            || universe
+                .evidence
+                .verify(&self.replay, Some(decision_at))
+                .is_err()
         {
             misaligned_inputs.push(MissingReplayInput::UniverseActivation);
         }
-        let book = current_books
-            .get(event.market())
-            .expect("checked current executable book is present");
-        if !risk_policies
-            .get(event.market())
-            .is_some_and(|policy| policy.matches_book_digest(&book.commitment_digest()))
+        let Some(book) = current_books.get(event.market()) else {
+            return Err(ValidationError::InvalidEngineOutcome);
+        };
+        let book_is_causal = book.event_time() <= decision_at
+            && book.received_at() <= decision_at
+            && decision_at
+                .checked_duration_since(book.event_time())
+                .is_ok_and(|age| age <= self.execution.broker_config.maximum_book_age());
+        if !book_is_causal {
+            misaligned_inputs.push(MissingReplayInput::ExecutableBooks);
+        }
+        if risk_policies.config_digest != self.provenance.config_digest
+            || risk_policies
+                .evidence
+                .verify(&self.replay, Some(decision_at))
+                .is_err()
+            || !risk_policies.evidence.contains(book.event_id())
+            || !risk_policies
+                .policies
+                .get(event.market())
+                .is_some_and(|policy| policy.matches_book_digest(&book.commitment_digest()))
         {
             misaligned_inputs.push(MissingReplayInput::RiskPolicies);
         }
@@ -552,9 +840,9 @@ impl EngineRuleReplay {
         Ok(DecisionInputs {
             snapshot: &feature.snapshot,
             long_history: &feature.long_history,
-            universe,
+            universe: &universe.activation,
             books: current_books,
-            risk_policies,
+            risk_policies: &risk_policies.policies,
         })
     }
 }
@@ -604,6 +892,141 @@ fn event_as_of(event: &MarketEvent) -> TimestampNs {
     event.event_time().max(event.received_at())
 }
 
+fn causal_event_order(left: &MarketEvent, right: &MarketEvent) -> std::cmp::Ordering {
+    event_as_of(left)
+        .cmp(&event_as_of(right))
+        .then_with(|| left.event_time().cmp(&right.event_time()))
+        .then_with(|| left.event_id().cmp(right.event_id()))
+}
+
+fn canonical_event_ids(mut event_ids: Vec<EventId>) -> Result<Vec<EventId>, ValidationError> {
+    if event_ids.is_empty() || event_ids.len() > MAX_RESEARCH_SOURCE_EVENTS {
+        return Err(ValidationError::InvalidEngineOutcome);
+    }
+    event_ids.sort();
+    event_ids.dedup();
+    (event_ids.len() <= MAX_RESEARCH_SOURCE_EVENTS)
+        .then_some(event_ids)
+        .ok_or(ValidationError::InvalidEngineOutcome)
+}
+
+fn source_events(
+    replay: &DeterministicReplay,
+    event_ids: &[EventId],
+) -> Result<Vec<MarketEvent>, ValidationError> {
+    if event_ids.is_empty() || event_ids.len() > MAX_RESEARCH_SOURCE_EVENTS {
+        return Err(ValidationError::InvalidEngineOutcome);
+    }
+    let by_id = replay
+        .events()
+        .iter()
+        .map(|event| (event.event_id(), event))
+        .collect::<BTreeMap<_, _>>();
+    let mut events = event_ids
+        .iter()
+        .map(|event_id| {
+            by_id
+                .get(event_id)
+                .cloned()
+                .cloned()
+                .ok_or(ValidationError::InvalidEngineOutcome)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    events.sort_by(causal_event_order);
+    Ok(events)
+}
+
+fn recovery_event_id(
+    replay_digest: &str,
+    market: &Market,
+    generation: u64,
+    at: TimestampNs,
+    evidence_digest: &str,
+    anchor_event_id: &EventId,
+) -> Result<EventId, ValidationError> {
+    let mut hasher = Hasher::new_derive_key("trench.research.recovery-boundary.v1");
+    for component in [
+        replay_digest,
+        market.as_str(),
+        &generation.to_string(),
+        &at.value().to_string(),
+        evidence_digest,
+        anchor_event_id.as_str(),
+    ] {
+        hasher.update(&(component.len() as u64).to_be_bytes());
+        hasher.update(component.as_bytes());
+    }
+    EventId::new(format!("b3:{}", hasher.finalize().to_hex()))
+        .map_err(|_| ValidationError::InvalidEngineOutcome)
+}
+
+fn end_of_data_event_id(
+    replay_digest: &str,
+    request: RuleReplayRequest,
+) -> Result<EventId, ValidationError> {
+    let mut hasher = Hasher::new_derive_key("trench.research.end-of-data.v1");
+    for component in [
+        replay_digest,
+        &request.outer_fold.to_string(),
+        &request.evaluation.start().value().to_string(),
+        &request.evaluation.end().value().to_string(),
+        &request.config.threshold().value().to_string(),
+        &request.config.atr_floor().value().to_string(),
+        &request.config.take_profit().value().to_string(),
+    ] {
+        hasher.update(&(component.len() as u64).to_be_bytes());
+        hasher.update(component.as_bytes());
+    }
+    EventId::new(format!("b3:{}", hasher.finalize().to_hex()))
+        .map_err(|_| ValidationError::InvalidEngineOutcome)
+}
+
+fn broker_exit_reason(reason: RuleExitReason) -> BrokerExitReason {
+    match reason {
+        RuleExitReason::Stop => BrokerExitReason::Stop,
+        RuleExitReason::TakeProfit => BrokerExitReason::TakeProfit,
+        RuleExitReason::OppositeSignal => BrokerExitReason::OppositeSignal,
+        RuleExitReason::TimeLimit => BrokerExitReason::Time,
+    }
+}
+
+fn sync_rule_position(
+    state: &EngineState,
+    rule_position: &mut Option<RulePosition>,
+    pending_rule_position: &mut Option<RulePosition>,
+) {
+    if state.ledger().position().is_some() {
+        if rule_position.is_none() {
+            *rule_position = pending_rule_position.take();
+        }
+    } else if state.broker().state() != BrokerState::PendingEntry {
+        *rule_position = None;
+        *pending_rule_position = None;
+    }
+}
+
+fn history_sources_are_declared(
+    history: &LongHorizonFeatureHistory,
+    evidence: &ResearchSourceEvidence,
+) -> bool {
+    history
+        .hourly_realized_volatility_20_history()
+        .iter()
+        .chain(history.premium_history())
+        .chain(history.open_interest_change_4_history())
+        .chain(history.funding_history())
+        .all(|sample| {
+            EventId::new(sample.source_event_id().to_owned())
+                .is_ok_and(|event_id| evidence.contains(&event_id))
+        })
+}
+
+fn is_prefixed_digest(value: &str) -> bool {
+    value.len() == 67
+        && value.starts_with("b3:")
+        && value[3..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn validate_replay_provenance(
     replay: &DeterministicReplay,
     provenance: &ResearchProvenance,
@@ -644,6 +1067,53 @@ fn validate_artifacts(
     Ok(())
 }
 
+fn validate_research_facts(
+    replay: &DeterministicReplay,
+    provenance: &ResearchProvenance,
+    facts: &ResearchFacts,
+) -> Result<(), ValidationError> {
+    let raw_ids = replay
+        .events()
+        .iter()
+        .map(MarketEvent::event_id)
+        .collect::<BTreeSet<_>>();
+    for (event_id, feature) in &facts.features {
+        if !raw_ids.contains(event_id)
+            || !feature.evidence.contains(event_id)
+            || feature.evidence.verify(replay, None).is_err()
+            || feature.snapshot.schema_hash() != provenance.feature_schema_digest
+            || feature.snapshot.input_range().is_none_or(|range| {
+                range.universe_digest() != Some(provenance.universe_digest.as_str())
+                    || !feature.evidence.contains(range.first_event_id())
+                    || !feature.evidence.contains(range.last_event_id())
+            })
+            || !history_sources_are_declared(&feature.long_history, &feature.evidence)
+        {
+            return Err(misaligned([MissingReplayInput::FeatureSnapshot]));
+        }
+    }
+    for (event_id, universe) in &facts.universes {
+        if !raw_ids.contains(event_id)
+            || universe.evidence.verify(replay, None).is_err()
+            || universe
+                .activation
+                .universe()
+                .is_none_or(|tradeable| tradeable.digest() != provenance.universe_digest)
+        {
+            return Err(misaligned([MissingReplayInput::UniverseActivation]));
+        }
+    }
+    for (event_id, risk) in &facts.risk_policies {
+        if !raw_ids.contains(event_id)
+            || risk.config_digest != provenance.config_digest
+            || risk.evidence.verify(replay, None).is_err()
+        {
+            return Err(misaligned([MissingReplayInput::RiskPolicies]));
+        }
+    }
+    Ok(())
+}
+
 fn validate_recovery_boundaries(
     replay: &DeterministicReplay,
     boundaries: &[RecoveryBoundary],
@@ -656,16 +1126,58 @@ fn validate_recovery_boundaries(
         .iter()
         .map(|event| event.event_id())
         .collect::<BTreeSet<_>>();
-    let mut prior: Option<(TimestampNs, &Market, &EventId)> = None;
+    let mut prior: Option<(TimestampNs, &Market, u64, &EventId)> = None;
+    let mut generations = BTreeSet::new();
+    let mut boundary_ids = BTreeSet::new();
     for boundary in boundaries {
-        if raw_ids.contains(boundary.event_id())
+        let evidence = boundary.evidence.verify(replay, None);
+        let anchor = evidence.as_ref().ok().and_then(|events| {
+            events
+                .iter()
+                .find(|event| event.event_id() == &boundary.anchor_event_id)
+        });
+        let completed_at = evidence
+            .as_ref()
+            .ok()
+            .and_then(|events| events.iter().map(MarketEvent::received_at).max());
+        let expected_id = recovery_event_id(
+            replay.digest(),
+            boundary.market(),
+            boundary.generation,
+            boundary.at(),
+            &boundary.evidence.digest,
+            &boundary.anchor_event_id,
+        );
+        if boundary.generation == 0
+            || raw_ids.contains(boundary.event_id())
+            || !boundary_ids.insert(boundary.event_id())
+            || !generations.insert((boundary.market(), boundary.generation))
+            || anchor.is_none_or(|event| event.market() != boundary.market())
+            || evidence.is_err()
+            || evidence.is_ok_and(|events| {
+                events
+                    .iter()
+                    .any(|event| event.market() != boundary.market())
+            })
+            || completed_at != Some(boundary.at())
+            || expected_id.as_ref().ok() != Some(boundary.event_id())
             || prior.is_some_and(|prior| {
-                (boundary.at(), boundary.market(), boundary.event_id()) <= prior
+                (
+                    boundary.at(),
+                    boundary.market(),
+                    boundary.generation,
+                    boundary.event_id(),
+                ) <= prior
             })
         {
             return Err(misaligned([MissingReplayInput::RecoveryBoundary]));
         }
-        prior = Some((boundary.at(), boundary.market(), boundary.event_id()));
+        prior = Some((
+            boundary.at(),
+            boundary.market(),
+            boundary.generation,
+            boundary.event_id(),
+        ));
     }
     Ok(())
 }
@@ -901,7 +1413,9 @@ mod tests {
                 bare_digest('f'),
             )
             .expect("broker run context"),
+            prefixed_digest('a'),
         )
+        .expect("config-bound execution setup")
     }
 
     fn request() -> RuleReplayRequest {
@@ -949,9 +1463,13 @@ mod tests {
     }
 
     fn book_event(at: i64) -> MarketEvent {
+        book_event_with_receipt(at, at)
+    }
+
+    fn book_event_with_receipt(event_at: i64, received_at: i64) -> MarketEvent {
         MarketEvent::book_snapshot(
-            timestamp(at),
-            timestamp(at),
+            timestamp(event_at),
+            timestamp(received_at),
             market(),
             BookSnapshot::new(
                 1,
@@ -966,6 +1484,26 @@ mod tests {
             ),
         )
         .expect("normalized book")
+    }
+
+    fn crossed_book_at(at: i64) -> MarketEvent {
+        MarketEvent::book_snapshot(
+            timestamp(at),
+            timestamp(at),
+            market(),
+            BookSnapshot::new(
+                1,
+                vec![BookLevel::new(
+                    Price::new(dec!(100)).expect("bid"),
+                    Quantity::new(dec!(10)).expect("bid quantity"),
+                )],
+                vec![BookLevel::new(
+                    Price::new(dec!(100)).expect("ask"),
+                    Quantity::new(dec!(10)).expect("ask quantity"),
+                )],
+            ),
+        )
+        .expect("normalized crossed book is retained until execution")
     }
 
     #[test]
@@ -998,46 +1536,122 @@ mod tests {
     }
 
     #[test]
-    fn recovery_boundaries_cannot_reuse_verified_market_event_identity() {
+    fn recovery_boundaries_require_verified_same_stream_anchor_evidence() {
         let book = book_event(2);
         let (_directory, replay) = replay(std::slice::from_ref(&book));
-        let provenance = research_provenance(&replay);
-        let error = EngineRuleReplay::new(
-            replay,
-            provenance.clone(),
-            artifacts(&provenance),
-            ResearchFacts::new(),
-            vec![RecoveryBoundary::new(
-                book.event_id().clone(),
-                timestamp(1),
-                market(),
-            )],
-            execution(),
+        let error = RecoveryBoundary::from_verified_replay(
+            &replay,
+            market(),
+            1,
+            EventId::new("research-missing-anchor").expect("anchor ID"),
+            vec![book.event_id().clone()],
         )
-        .expect_err("a recovery must have its own causal identity");
+        .expect_err("a recovery must be anchored by its verified replay evidence");
 
-        assert_eq!(
-            error,
-            ValidationError::MisalignedReplayInputs {
-                inputs: vec![MissingReplayInput::RecoveryBoundary],
-            }
-        );
+        assert_eq!(error, ValidationError::InvalidEngineOutcome);
     }
 
     #[test]
-    fn verified_recovery_and_book_take_the_real_engine_path_without_a_synthetic_fill() {
-        let (_directory, replay) = replay(&[book_event(2)]);
+    fn source_evidence_cannot_be_reused_across_replays_or_before_its_receipt() {
+        let delayed = book_event_with_receipt(2, 20);
+        let (_first_directory, first) = replay(std::slice::from_ref(&delayed));
+        let evidence =
+            ResearchSourceEvidence::from_replay(&first, vec![delayed.event_id().clone()])
+                .expect("first replay proves its own source");
+        let replacement = book_event(3);
+        let (_second_directory, second) = replay(std::slice::from_ref(&replacement));
+
+        assert!(evidence.verify(&first, Some(timestamp(19))).is_err());
+        assert!(evidence.verify(&second, None).is_err());
+    }
+
+    #[test]
+    fn source_observations_are_receipt_ordered_with_a_stable_tie_breaker() {
+        let delayed_book = book_event_with_receipt(2, 20);
+        let timely_book = book_event(3);
+        let mut events = vec![&delayed_book, &timely_book];
+        events.sort_by(|left, right| causal_event_order(left, right));
+
+        assert_eq!(events, vec![&timely_book, &delayed_book]);
+    }
+
+    #[test]
+    fn exclusive_evaluation_end_cannot_admit_an_invalid_source_book() {
+        let at_end = crossed_book_at(request().evaluation.end().value());
+        let (_directory, replay) = replay(&[at_end]);
         let provenance = research_provenance(&replay);
         let mut adapter = EngineRuleReplay::new(
             replay,
             provenance.clone(),
             artifacts(&provenance),
             ResearchFacts::new(),
-            vec![RecoveryBoundary::new(
-                EventId::new("research-recovery-btc").expect("recovery ID"),
-                timestamp(1),
-                market(),
-            )],
+            Vec::new(),
+            execution(),
+        )
+        .expect("the replay boundary itself is valid");
+
+        let outcome = adapter
+            .replay(request())
+            .expect("the exclusive-end book must not execute or fail the run");
+        assert_eq!(outcome.net_pnl(), Decimal::ZERO);
+    }
+
+    #[test]
+    fn broker_setup_must_match_the_frozen_config_commitment() {
+        let (_directory, replay) = replay(&[book_event(2)]);
+        let provenance = research_provenance(&replay);
+        let setup = ResearchExecutionSetup::new(
+            LedgerId::RulesOnly,
+            BrokerConfig::new(
+                Usdc::new(dec!(1)).expect("minimum notional"),
+                trench_core::event::DurationNs::new(1_000).expect("book age"),
+            )
+            .expect("broker configuration"),
+            BrokerRunContext::new(
+                RunId::new("research-fixture-mismatch").expect("run ID"),
+                bare_digest('e'),
+                bare_digest('f'),
+            )
+            .expect("broker run context"),
+            prefixed_digest('c'),
+        )
+        .expect("well-formed but wrong config binding");
+
+        assert!(matches!(
+            EngineRuleReplay::new(
+                replay,
+                provenance.clone(),
+                artifacts(&provenance),
+                ResearchFacts::new(),
+                Vec::new(),
+                setup,
+            ),
+            Err(ValidationError::MisalignedReplayInputs {
+                inputs
+            }) if inputs == vec![MissingReplayInput::RiskPolicies]
+        ));
+    }
+
+    #[test]
+    fn verified_recovery_and_book_take_the_real_engine_path_without_a_synthetic_fill() {
+        let first_book = book_event(2);
+        let second_book = book_event(3);
+        let (_directory, replay) = replay(&[first_book.clone(), second_book]);
+        let provenance = research_provenance(&replay);
+        let boundary = RecoveryBoundary::from_verified_replay(
+            &replay,
+            market(),
+            1,
+            first_book.event_id().clone(),
+            vec![first_book.event_id().clone()],
+        )
+        .expect("verified recovery boundary");
+        let mut adapter = EngineRuleReplay::new(
+            replay,
+            provenance.clone(),
+            artifacts(&provenance),
+            ResearchFacts::new(),
+            vec![boundary],
             execution(),
         )
         .expect("recovery source is separate and ordered");

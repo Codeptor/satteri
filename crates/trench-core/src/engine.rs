@@ -1544,11 +1544,24 @@ impl Engine {
             state.broker.maximum_book_age(),
             &readiness,
         )?;
-        let transition = state.broker.request_exit(reason, &mark)?;
-        batch.push(EngineRecord::BrokerApplied {
-            transition: transition.clone(),
-        });
-        apply_broker_transition(&mut state, &mut batch, &transition)?;
+        // A strategy exit is still a real mark. Observe it before accepting
+        // the discretionary cause so liquidation, stop, and target priority
+        // remain broker-owned and cannot be bypassed by an adapter.
+        if let Some(transition) = state.broker.observe_mark(&mark)? {
+            batch.push(EngineRecord::BrokerApplied {
+                transition: transition.clone(),
+            });
+            apply_broker_transition(&mut state, &mut batch, &transition)?;
+        }
+        if state.broker.state() == BrokerState::Open {
+            let transition = state
+                .broker
+                .request_exit_after_observed_mark(reason, &mark)?;
+            batch.push(EngineRecord::BrokerApplied {
+                transition: transition.clone(),
+            });
+            apply_broker_transition(&mut state, &mut batch, &transition)?;
+        }
         Ok(EngineOutcome { state, batch })
     }
 

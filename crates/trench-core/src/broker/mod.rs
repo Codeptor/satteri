@@ -1398,6 +1398,27 @@ impl PaperBroker {
         reason: ExitReason,
         observation: &ExecutableMark,
     ) -> Result<BrokerTransition, BrokerError> {
+        self.request_exit_inner(reason, observation, true)
+    }
+
+    /// Requests an exit after the engine has already admitted this exact mark
+    /// through [`Self::observe_mark`]. Keeping this separate avoids treating a
+    /// strategy-owned cause as a duplicate market observation while retaining
+    /// broker-owned liquidation/stop/target priority.
+    pub(crate) fn request_exit_after_observed_mark(
+        &mut self,
+        reason: ExitReason,
+        observation: &ExecutableMark,
+    ) -> Result<BrokerTransition, BrokerError> {
+        self.request_exit_inner(reason, observation, false)
+    }
+
+    fn request_exit_inner(
+        &mut self,
+        reason: ExitReason,
+        observation: &ExecutableMark,
+        admit_observation: bool,
+    ) -> Result<BrokerTransition, BrokerError> {
         self.ensure_market_input_allowed()?;
         let at = observation.received_at();
         let mark_price = observation.price();
@@ -1412,7 +1433,9 @@ impl PaperBroker {
         ) {
             return Err(BrokerError::ExitUnavailable { state: previous });
         }
-        self.admit_market_observation(observation)?;
+        if admit_observation {
+            self.admit_market_observation(observation)?;
+        }
         if reason.mandatory() {
             self.start_mandatory(ExitRequest {
                 reason,

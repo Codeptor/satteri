@@ -210,6 +210,7 @@ impl RuleRejection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleDecision {
     candidate: Option<SignalCandidate>,
+    composite: Option<Decimal>,
     rejections: Vec<RuleRejection>,
     explanation_json: String,
 }
@@ -219,6 +220,15 @@ impl RuleDecision {
     #[must_use]
     pub const fn candidate(&self) -> Option<&SignalCandidate> {
         self.candidate.as_ref()
+    }
+
+    /// Returns the exact completed-bar composite when the frozen feature frame
+    /// was scoreable. Exit handling consumes this value only through
+    /// [`RulesStrategy::exit_for_composite`]; it never derives a replacement
+    /// score from a research-only model.
+    #[must_use]
+    pub const fn composite(&self) -> Option<Decimal> {
+        self.composite
     }
 
     /// Checks for a stable machine-readable rejection code in this decision.
@@ -466,6 +476,7 @@ impl RulesStrategy {
         match candidate {
             Ok(candidate) => RuleDecision {
                 candidate: Some(candidate),
+                composite: Some(composite),
                 rejections: Vec::new(),
                 explanation_json,
             },
@@ -505,6 +516,7 @@ impl RulesStrategy {
         );
         RuleDecision {
             candidate: None,
+            composite,
             rejections,
             explanation_json,
         }
@@ -517,6 +529,22 @@ impl RulesStrategy {
         position: &RulePosition,
         executable_price: Decimal,
         composite: Decimal,
+        at: TimestampNs,
+    ) -> Option<ExitReason> {
+        self.exit_for(position, executable_price, Some(composite), at)
+    }
+
+    /// Evaluates the canonical rule exit stack from an executable price, an
+    /// optional score from the just-completed bar, and an explicit boundary.
+    ///
+    /// A scoreless but otherwise verified bar may still enforce stop, target,
+    /// and time exits. It can never invent an opposite signal.
+    #[must_use]
+    pub fn exit_for(
+        &self,
+        position: &RulePosition,
+        executable_price: Decimal,
+        composite: Option<Decimal>,
         at: TimestampNs,
     ) -> Option<ExitReason> {
         let candidate = &position.candidate;
@@ -534,10 +562,10 @@ impl RulesStrategy {
         if hit_target {
             return Some(ExitReason::TakeProfit);
         }
-        let opposite = match candidate.side() {
+        let opposite = composite.is_some_and(|composite| match candidate.side() {
             Side::Buy => composite <= -OPPOSITE_EXIT_MAGNITUDE,
             Side::Sell => composite >= OPPOSITE_EXIT_MAGNITUDE,
-        };
+        });
         if opposite {
             return Some(ExitReason::OppositeSignal);
         }
@@ -591,6 +619,12 @@ impl RulePosition {
         (candidate.strategy() == StrategyKind::RulesOnly).then(|| Self {
             candidate: candidate.clone(),
         })
+    }
+
+    /// Returns the market whose frozen exit plan this state owns.
+    #[must_use]
+    pub const fn market(&self) -> &Market {
+        &self.candidate.market
     }
 }
 
