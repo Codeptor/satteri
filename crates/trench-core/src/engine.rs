@@ -374,6 +374,29 @@ impl EngineState {
         &self.broker
     }
 
+    /// Rebinds the frozen market risk-policy set at a completed replay
+    /// boundary before the next entry arbitration.
+    ///
+    /// The private approval cache must be empty: changing policy inputs while
+    /// an approval is outstanding would detach an opaque quote from the policy
+    /// that created it. Runtime and research both use this only between fully
+    /// resolved engine applications.
+    pub fn with_risk_policies(
+        mut self,
+        risk_policies: BTreeMap<Market, RiskPolicy>,
+    ) -> Result<Self, EngineError> {
+        if self.risk.outstanding_approvals() != 0 {
+            return Err(EngineError::OutstandingApprovals);
+        }
+        self.risk_policies = risk_policies;
+        Ok(self)
+    }
+
+    #[cfg(test)]
+    fn outstanding_approvals(&self) -> usize {
+        self.risk.outstanding_approvals()
+    }
+
     fn persistence_state_json(&self) -> String {
         let risk_policy_digests = self
             .risk_policies
@@ -388,11 +411,6 @@ impl EngineState {
             recovered_markets: &self.recovered_markets,
         })
         .expect("engine checkpoint state contains only serializable fields")
-    }
-
-    #[cfg(test)]
-    fn outstanding_approvals(&self) -> usize {
-        self.risk.outstanding_approvals()
     }
 
     fn supports_risk_policies(
@@ -1005,6 +1023,10 @@ const fn broker_state_name(state: BrokerState) -> &'static str {
 /// Rejection of an invalid engine-boundary transition.
 #[derive(Debug, Error)]
 pub enum EngineError {
+    /// A caller attempted to replace source-bound sizing policies while a
+    /// sealed approval remained available for consumption.
+    #[error("cannot replace risk policies while a sealed approval is outstanding")]
+    OutstandingApprovals,
     /// A candidate reached the engine from a different decision boundary.
     #[error("candidate {candidate_digest} does not match engine event boundary")]
     CandidateTimeMismatch {
@@ -1056,6 +1078,29 @@ pub enum EngineError {
 }
 
 impl Engine {
+    /// Runs one entry arbitration with the engine's canonical sealed risk
+    /// snapshot.
+    ///
+    /// Adapters supply only typed candidates and verified context. The engine
+    /// derives the snapshot from its prior isolated ledger, executable books,
+    /// active universe, and frozen risk policies, so replay code cannot
+    /// manufacture a parallel risk or cost model merely to satisfy the public
+    /// [`EngineEvent::EntryArbitration`] assertion API.
+    pub fn apply_verified_entry_arbitration<'strategy>(
+        event_id: EventId,
+        at: TimestampNs,
+        candidates: Vec<EntryCandidate<'strategy>>,
+        prior_state: EngineState,
+        context: &EngineContext,
+    ) -> Result<EngineOutcome, EngineError> {
+        let snapshot = canonical_snapshot(&prior_state, &event_id, at, &candidates, context)?;
+        Self::apply(
+            EngineEvent::entry_arbitration(event_id, at, snapshot, candidates),
+            prior_state,
+            context,
+        )
+    }
+
     /// Applies one explicit input to explicit prior state without I/O or a clock.
     ///
     /// Every candidate is risk-quoted against one immutable request before any

@@ -2,6 +2,7 @@
 
 pub mod parquet;
 pub mod replay;
+pub mod research;
 pub mod sqlite;
 
 #[cfg(test)]

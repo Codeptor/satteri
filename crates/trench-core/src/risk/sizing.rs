@@ -563,7 +563,13 @@ impl RiskPolicy {
         hasher.finalize().to_hex().to_string()
     }
 
-    pub(crate) fn matches_book_digest(&self, book_digest: &str) -> bool {
+    /// Returns whether this frozen policy was derived from the exact immutable
+    /// full-depth book supplied at the engine boundary.
+    ///
+    /// Research adapters use this only to fail closed before a replay starts;
+    /// the engine repeats the check before every sealed quote.
+    #[must_use]
+    pub fn matches_book_digest(&self, book_digest: &str) -> bool {
         self.book_digest == book_digest
     }
 }
@@ -1074,7 +1080,9 @@ impl RiskEngine {
     }
 
     /// Returns the sealed approvals still retained by the private risk boundary.
-    #[cfg(test)]
+    ///
+    /// This remains crate-private; the engine uses it solely to fence a
+    /// point-in-time policy replacement between complete transitions.
     pub(crate) fn outstanding_approvals(&self) -> usize {
         self.approvals.len()
     }

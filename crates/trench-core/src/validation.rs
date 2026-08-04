@@ -25,6 +25,27 @@ const REQUIRED_CLOSED_TRADES: u32 = 100;
 const ARTIFACT_VERSION: &str = "trench.rules-artifact.v1";
 const REPORT_VERSION: &str = "trench.rules-validation.v1";
 
+/// A point-in-time source family that must be present before rules research may
+/// produce an engine outcome.
+///
+/// The ordering is protocol ordering. It makes a missing-input result stable
+/// across differently ordered partition and sidecar inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MissingReplayInput {
+    /// A completed-bar common-feature snapshot was not supplied.
+    FeatureSnapshot,
+    /// The exact long-horizon feature history was not supplied.
+    LongHorizonHistory,
+    /// The active point-in-time universe was not supplied.
+    UniverseActivation,
+    /// A recovered full executable-book set was not supplied.
+    ExecutableBooks,
+    /// The point-in-time frozen sizing policy set was not supplied.
+    RiskPolicies,
+    /// A recovery completion boundary was not supplied before execution.
+    RecoveryBoundary,
+}
+
 /// Deterministic validation, artifact, or report construction failure.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ValidationError {
@@ -47,6 +68,21 @@ pub enum ValidationError {
     /// A reported source gap intersects a required research fold.
     #[error("required point-in-time research data is unavailable")]
     RequiredDataUnavailable,
+    /// The verified normalized stream lacked one or more required typed
+    /// point-in-time sidecar inputs. Research must stop rather than invent an
+    /// outcome, feature, universe, recovery state, or sizing policy.
+    #[error("required point-in-time replay inputs are unavailable: {inputs:?}")]
+    MissingReplayInputs {
+        /// Strictly sorted, deduplicated missing source families.
+        inputs: Vec<MissingReplayInput>,
+    },
+    /// A supplied typed point-in-time sidecar contradicted the verified replay
+    /// event or its own immutable temporal contract.
+    #[error("point-in-time replay inputs are misaligned: {inputs:?}")]
+    MisalignedReplayInputs {
+        /// Strictly sorted, deduplicated source families that did not align.
+        inputs: Vec<MissingReplayInput>,
+    },
     /// Excluded gaps were duplicated, overlapped, or otherwise non-canonical.
     #[error("excluded gap ranges must be strictly ordered and non-overlapping")]
     InvalidExcludedGaps,
@@ -65,6 +101,12 @@ pub enum ValidationError {
     /// An engine replay outcome was malformed or did not contain actual stream evidence.
     #[error("engine replay outcome is invalid")]
     InvalidEngineOutcome,
+    /// The single production engine rejected a typed replay transition.
+    #[error("engine replay transition failed: {reason}")]
+    EngineReplayFailed {
+        /// Canonical engine error text retained as audit evidence.
+        reason: String,
+    },
     /// An immutable artifact or report digest was malformed or did not match its content.
     #[error("content-addressed artifact or report digest is invalid")]
     InvalidDigest,
