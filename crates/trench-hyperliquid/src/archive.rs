@@ -188,8 +188,41 @@ impl ArchiveDigest {
         Self(*blake3::hash(bytes).as_bytes())
     }
 
+    /// Parses the exact lowercase `b3:<64 hex>` archive-manifest wire form.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArchiveError::InvalidDigest`] for any noncanonical digest.
+    pub fn from_b3(value: &str) -> Result<Self, ArchiveError> {
+        let Some(hex) = value.strip_prefix("b3:") else {
+            return Err(ArchiveError::InvalidDigest);
+        };
+        if hex.len() != blake3::OUT_LEN * 2
+            || !hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(ArchiveError::InvalidDigest);
+        }
+        let mut bytes = [0_u8; blake3::OUT_LEN];
+        for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+            let high = hex_nibble(pair[0]).ok_or(ArchiveError::InvalidDigest)?;
+            let low = hex_nibble(pair[1]).ok_or(ArchiveError::InvalidDigest)?;
+            bytes[index] = (high << 4) | low;
+        }
+        Ok(Self(bytes))
+    }
+
     fn from_hasher(hasher: Hasher) -> Self {
         Self(*hasher.finalize().as_bytes())
+    }
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
     }
 }
 
@@ -657,6 +690,9 @@ pub enum ArchiveError {
     /// As-of time could not be converted to a core timestamp.
     #[error("archive as-of time `{as_of_ms}` is outside the supported timestamp range")]
     InvalidAsOf { as_of_ms: i64 },
+    /// A supplied archive-object digest did not use canonical BLAKE3 wire form.
+    #[error("archive digest must use canonical lowercase b3: BLAKE3 hex")]
+    InvalidDigest,
     /// The manifest exceeded the bounded number of source requirements.
     #[error("archive manifest has {count} requirements, exceeding {max_requirements}")]
     TooManyRequirements {

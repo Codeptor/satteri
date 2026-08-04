@@ -328,6 +328,24 @@ impl GapRecovery {
         self.queue.len()
     }
 
+    /// Returns only verified archived L2 facts for durable import.
+    ///
+    /// This explicit recovery boundary preserves the archive's documented
+    /// L2-only limitation: it never treats archived books as trades, BBOs, or
+    /// synthesized candles. A later queued gap request can consume the same
+    /// archive through [`RecoveryEvidence::ArchiveL2`] and records its candle
+    /// span as unavailable.
+    pub fn archive_l2_events(batch: &ArchiveBatch) -> Result<&[MarketEvent], RecoveryError> {
+        for event in batch.events() {
+            if !matches!(event.kind(), MarketEventKind::BookSnapshot(_)) {
+                return Err(RecoveryError::ArchiveNotL2 {
+                    event_id: event.event_id().clone(),
+                });
+            }
+        }
+        Ok(batch.events())
+    }
+
     /// Adds one WebSocket-delivered request in per-market generation order.
     ///
     /// # Errors

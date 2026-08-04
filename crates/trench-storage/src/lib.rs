@@ -1,5 +1,7 @@
 //! Durable storage and deterministic replay for paper-trading records.
 
+pub mod parquet;
+pub mod replay;
 pub mod sqlite;
 
 #[cfg(test)]

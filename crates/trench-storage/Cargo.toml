@@ -9,6 +9,13 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+arrow-array.workspace = true
+arrow-schema.workspace = true
+blake3.workspace = true
+parquet.workspace = true
+rust_decimal.workspace = true
+rustix.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
@@ -17,5 +24,6 @@ trench-core = { path = "../trench-core" }
 
 [dev-dependencies]
 rust_decimal.workspace = true
+rust_decimal_macros.workspace = true
 tempfile.workspace = true
 trench-core = { path = "../trench-core", features = ["test-support"] }
