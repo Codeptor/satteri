@@ -6,7 +6,10 @@ use std::os::unix::fs::PermissionsExt;
 use rust_decimal_macros::dec;
 use tempfile::TempDir;
 use trench_core::domain::{Market, Price, Quantity, Side};
-use trench_core::event::{Bbo, BookLevel, BookSnapshot, MarketEvent, TimestampNs, Trade};
+use trench_core::event::{
+    Bbo, BookLevel, BookSnapshot, Funding, FundingRate, MarketEvent, MarketEventKind, TimestampNs,
+    Trade,
+};
 use trench_storage::parquet::{
     DataProvenance, ParquetError, ParquetStore, PartitionFailure, PartitionManifest,
 };
@@ -57,6 +60,16 @@ fn bbo(at: i64, sequence: u64) -> MarketEvent {
             ),
         )
         .expect("fixture BBO should be valid"),
+    )
+    .expect("fixture event should be valid")
+}
+
+fn historical_funding(at: i64) -> MarketEvent {
+    MarketEvent::funding(
+        timestamp(at),
+        timestamp(at + 1),
+        Market::new("SOL").expect("fixture market should be valid"),
+        Funding::historical(FundingRate::new(dec!(0.00001))),
     )
     .expect("fixture event should be valid")
 }
@@ -162,6 +175,29 @@ fn event_kind_partitioning_keeps_distinct_normalized_facts_separate() {
 
     assert_eq!(manifests.len(), 2);
     assert!(manifests.iter().all(|manifest| manifest.row_count() == 1));
+}
+
+#[test]
+fn historical_funding_round_trips_without_an_imputed_mark() {
+    let root = TempDir::new().expect("temporary root should be created");
+    secure(&root);
+    let store = ParquetStore::open(root.path(), provenance()).expect("store should open");
+    let event = historical_funding(1_000);
+    let [manifest]: [PartitionManifest; 1] = store
+        .write_events(std::slice::from_ref(&event))
+        .expect("historical funding partition should commit")
+        .try_into()
+        .expect("one funding partition");
+
+    let [reopened]: [MarketEvent; 1] = store
+        .read_partition(&manifest)
+        .expect("historical funding partition should reopen")
+        .try_into()
+        .expect("one historical funding event");
+    assert_eq!(reopened, event);
+    assert!(
+        matches!(reopened.kind(), MarketEventKind::Funding(funding) if funding.mark_price().is_none())
+    );
 }
 
 #[test]

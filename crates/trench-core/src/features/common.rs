@@ -3811,7 +3811,7 @@ mod tests {
                 timestamp(close),
                 timestamp(direct_received_at),
                 market.clone(),
-                Funding::new(
+                Funding::with_mark(
                     FundingRate::new(Decimal::from(index) / dec!(10000)),
                     price(value),
                 ),
@@ -3888,7 +3888,10 @@ mod tests {
                         boundary,
                         boundary,
                         market.clone(),
-                        Funding::new(FundingRate::new(Decimal::from(offset)), price(dec!(100))),
+                        Funding::with_mark(
+                            FundingRate::new(Decimal::from(offset)),
+                            price(dec!(100)),
+                        ),
                     )
                     .expect("canonical funding sample must be valid");
                     samples.insert(boundary, event);
@@ -4738,7 +4741,7 @@ mod tests {
                 timestamp(source_time),
                 timestamp(source_time),
                 btc.clone(),
-                Funding::new(FundingRate::new(Decimal::from(sequence)), price(dec!(227))),
+                Funding::with_mark(FundingRate::new(Decimal::from(sequence)), price(dec!(227))),
             )
             .expect("funding event must be valid");
             engine.observe(&funding).expect("funding must be observed");
@@ -5313,7 +5316,7 @@ mod tests {
                 received_at,
                 received_at,
                 market.clone(),
-                Funding::new(
+                Funding::with_mark(
                     FundingRate::new(Decimal::from(sequence as u64)),
                     price(value),
                 ),

@@ -1651,7 +1651,7 @@ impl StoredEvent {
             }),
             MarketEventKind::Funding(funding) => json!({
                 "rate": funding.rate().value().to_string(),
-                "mark_price": funding.mark_price().value().to_string(),
+                "mark_price": funding.mark_price().map(|price| price.value().to_string()),
             }),
             MarketEventKind::CompletedCandle(candle) => json!({
                 "interval": interval_name(candle.interval()),
@@ -1747,10 +1747,16 @@ impl StoredEvent {
                 event_time,
                 received_at,
                 market,
-                Funding::new(
-                    FundingRate::new(required_decimal(&self.payload, "rate")?),
-                    required_price(&self.payload, "mark_price")?,
-                ),
+                match optional_price(&self.payload, "mark_price")? {
+                    Some(mark_price) => Funding::with_mark(
+                        FundingRate::new(required_decimal(&self.payload, "rate")?),
+                        mark_price,
+                    ),
+                    None => Funding::historical(FundingRate::new(required_decimal(
+                        &self.payload,
+                        "rate",
+                    )?)),
+                },
             ),
             "completed_candle" => MarketEvent::completed_candle(
                 event_time,

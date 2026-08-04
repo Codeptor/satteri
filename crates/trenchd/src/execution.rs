@@ -451,6 +451,11 @@ impl TypedMarketRouter {
                 }]))
             }
             MarketEventKind::Funding(funding) => {
+                let Some(mark_price) = funding.mark_price() else {
+                    return Ok(MarketRoute::Engine(vec![TypedEngineEvent::AdvanceTime {
+                        source,
+                    }]));
+                };
                 if let Some(reason) = self.execution_blocker(source.market()) {
                     return Ok(MarketRoute::Blocked {
                         market: source.market().clone(),
@@ -460,7 +465,7 @@ impl TypedMarketRouter {
                 Ok(MarketRoute::Engine(vec![
                     TypedEngineEvent::FundingObserved {
                         rate: funding.rate(),
-                        mark_price: funding.mark_price(),
+                        mark_price,
                         source,
                     },
                 ]))
@@ -845,7 +850,7 @@ mod tests {
             timestamp(22),
             timestamp(22),
             market(),
-            Funding::new(FundingRate::new(Decimal::ZERO), price(100)),
+            Funding::with_mark(FundingRate::new(Decimal::ZERO), price(100)),
         )
         .expect("fixture funding");
 
@@ -864,6 +869,22 @@ mod tests {
                 .events()
                 .expect("typed engine route"),
             [super::TypedEngineEvent::FundingObserved { .. }]
+        ));
+
+        let historical = MarketEvent::funding(
+            timestamp(23),
+            timestamp(23),
+            market(),
+            Funding::historical(FundingRate::new(Decimal::ZERO)),
+        )
+        .expect("historical funding source");
+        assert!(matches!(
+            router
+                .route_market_event(historical, None)
+                .expect("historical funding route")
+                .events()
+                .expect("source-clock route"),
+            [super::TypedEngineEvent::AdvanceTime { .. }]
         ));
     }
 

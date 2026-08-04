@@ -513,14 +513,30 @@ impl Trade {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Funding {
     rate: FundingRate,
-    mark_price: Price,
+    mark_price: Option<Price>,
 }
 
 impl Funding {
-    /// Creates a typed funding payload.
+    /// Creates a funding observation with the contemporaneous venue mark.
     #[must_use]
-    pub const fn new(rate: FundingRate, mark_price: Price) -> Self {
-        Self { rate, mark_price }
+    pub const fn with_mark(rate: FundingRate, mark_price: Price) -> Self {
+        Self {
+            rate,
+            mark_price: Some(mark_price),
+        }
+    }
+
+    /// Creates a historical funding observation for which the venue did not
+    /// provide a contemporaneous mark.
+    ///
+    /// This fact is valid feature provenance, but must never be used to book a
+    /// paper-broker funding cashflow.
+    #[must_use]
+    pub const fn historical(rate: FundingRate) -> Self {
+        Self {
+            rate,
+            mark_price: None,
+        }
     }
 
     /// Returns the signed funding rate.
@@ -529,9 +545,9 @@ impl Funding {
         self.rate
     }
 
-    /// Returns the contemporaneous mark price.
+    /// Returns the contemporaneous mark price when the source supplied one.
     #[must_use]
-    pub const fn mark_price(&self) -> Price {
+    pub const fn mark_price(&self) -> Option<Price> {
         self.mark_price
     }
 }
@@ -1109,7 +1125,7 @@ mod tests {
                 event_time,
                 received_at,
                 market("BTC"),
-                Funding::new(FundingRate::new(dec!(0.0001)), price(dec!(100))),
+                Funding::with_mark(FundingRate::new(dec!(0.0001)), price(dec!(100))),
             )
             .expect("funding event must be valid"),
             MarketEvent::completed_candle(
@@ -1244,19 +1260,34 @@ mod tests {
     }
 
     #[test]
+    fn historical_funding_keeps_the_absence_of_a_contemporaneous_mark() {
+        let event = MarketEvent::funding(
+            timestamp(100),
+            timestamp(120),
+            market("SOL"),
+            Funding::historical(FundingRate::new(dec!(-0.00001))),
+        )
+        .expect("historical funding fact must be valid");
+
+        assert!(matches!(event.kind(), MarketEventKind::Funding(funding)
+            if funding.rate() == FundingRate::new(dec!(-0.00001))
+                && funding.mark_price().is_none()));
+    }
+
+    #[test]
     fn ordering_uses_event_time_before_receipt_time() {
         let earlier_exchange = MarketEvent::funding(
             timestamp(100),
             timestamp(300),
             market("BTC"),
-            Funding::new(FundingRate::new(dec!(0.001)), price(dec!(100))),
+            Funding::with_mark(FundingRate::new(dec!(0.001)), price(dec!(100))),
         )
         .expect("earlier exchange event must be valid");
         let later_exchange = MarketEvent::funding(
             timestamp(200),
             timestamp(201),
             market("BTC"),
-            Funding::new(FundingRate::new(dec!(0.001)), price(dec!(100))),
+            Funding::with_mark(FundingRate::new(dec!(0.001)), price(dec!(100))),
         )
         .expect("later exchange event must be valid");
         let mut events = [later_exchange.clone(), earlier_exchange.clone()];
