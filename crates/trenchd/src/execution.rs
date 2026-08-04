@@ -55,6 +55,12 @@ pub(crate) enum TypedEngineEvent {
         /// Immutable normalized source fact.
         source: MarketEvent,
     },
+    /// A late source fact retained for audit and recovery evidence without
+    /// advancing the already-newer broker clock.
+    SourceRetained {
+        /// Immutable normalized source fact.
+        source: MarketEvent,
+    },
     /// A durable record that one fresh L2 snapshot opened a recovery fence.
     ///
     /// This is deliberately only a source-clock transition. It cannot restore
@@ -114,6 +120,7 @@ impl TypedEngineEvent {
     pub(crate) fn event_id(&self) -> &EventId {
         match self {
             Self::AdvanceTime { source }
+            | Self::SourceRetained { source }
             | Self::ExecutableBook { source, .. }
             | Self::MarketMark { source, .. }
             | Self::FundingObserved { source, .. } => source.event_id(),
@@ -130,7 +137,8 @@ impl TypedEngineEvent {
             Self::AdvanceTime { source }
             | Self::ExecutableBook { source, .. }
             | Self::MarketMark { source, .. }
-            | Self::FundingObserved { source, .. } => source.event_time(),
+            | Self::FundingObserved { source, .. } => source.received_at(),
+            Self::SourceRetained { source } => source.event_time(),
             Self::RecoveryRequested { at, .. } | Self::MarketRecovered { at, .. } => *at,
         }
     }
@@ -140,6 +148,7 @@ impl TypedEngineEvent {
     pub(crate) fn market(&self) -> &Market {
         match self {
             Self::AdvanceTime { source }
+            | Self::SourceRetained { source }
             | Self::ExecutableBook { source, .. }
             | Self::MarketMark { source, .. }
             | Self::FundingObserved { source, .. } => source.market(),
@@ -152,6 +161,7 @@ impl TypedEngineEvent {
     pub(crate) const fn source_kind(&self) -> &'static str {
         match self {
             Self::AdvanceTime { .. } => "source_clock",
+            Self::SourceRetained { .. } => "source_retained",
             Self::RecoveryRequested { .. } => "recovery_request",
             Self::MarketRecovered { .. } => "market_recovered",
             Self::ExecutableBook { .. } => "executable_book",
@@ -170,6 +180,14 @@ impl TypedEngineEvent {
                 "event_time_ns": source.event_time().value(),
                 "received_at_ns": source.received_at().value(),
                 "kind": "source_clock",
+            }),
+            Self::SourceRetained { source } => serde_json::json!({
+                "schema_version": 1,
+                "event_id": source.event_id().as_str(),
+                "market": source.market().as_str(),
+                "event_time_ns": source.event_time().value(),
+                "received_at_ns": source.received_at().value(),
+                "kind": "source_retained",
             }),
             Self::RecoveryRequested {
                 event_id,
@@ -241,6 +259,10 @@ impl TypedEngineEvent {
         match self {
             Self::AdvanceTime { source } => EngineEvent::AdvanceTime {
                 event_id: source.event_id().clone(),
+                at: source.received_at(),
+            },
+            Self::SourceRetained { source } => EngineEvent::SourceRetained {
+                event_id: source.event_id().clone(),
                 at: source.event_time(),
             },
             Self::RecoveryRequested { event_id, at, .. } => {
@@ -258,12 +280,12 @@ impl TypedEngineEvent {
             },
             Self::ExecutableBook { source, book } => EngineEvent::ExecutableBook {
                 event_id: source.event_id().clone(),
-                at: source.event_time(),
+                at: source.received_at(),
                 book,
             },
             Self::MarketMark { source, price } => EngineEvent::MarketMark {
                 event_id: source.event_id().clone(),
-                at: source.event_time(),
+                at: source.received_at(),
                 market: source.market().clone(),
                 price,
                 event_time: source.event_time(),
@@ -275,7 +297,7 @@ impl TypedEngineEvent {
                 mark_price,
             } => EngineEvent::FundingObserved {
                 event_id: source.event_id().clone(),
-                at: source.event_time(),
+                at: source.received_at(),
                 market: source.market().clone(),
                 venue_at: source.event_time(),
                 received_at: source.received_at(),
@@ -292,7 +314,7 @@ impl TypedEngineEvent {
         let event_id = recovery_request_event_id(request);
         Self::RecoveryRequested {
             event_id,
-            at: request.snapshot_event_time(),
+            at: request.snapshot_received_at(),
             market: request.market().clone(),
             generation: request.generation(),
             snapshot_event_id: request.snapshot_event_id().clone(),
@@ -307,7 +329,6 @@ pub(crate) struct RecoveryCompletion {
     generation: u64,
     boundary_at: TimestampNs,
     snapshot_event_id: EventId,
-    backfill_events: Vec<MarketEvent>,
 }
 
 impl RecoveryCompletion {
@@ -327,7 +348,6 @@ impl RecoveryCompletion {
             generation: request.generation(),
             boundary_at: result.completed_through(),
             snapshot_event_id: request.snapshot_event_id().clone(),
-            backfill_events: result.backfill_events().to_vec(),
         })
     }
 
@@ -338,7 +358,6 @@ impl RecoveryCompletion {
             generation: 1,
             boundary_at,
             snapshot_event_id,
-            backfill_events: Vec::new(),
         }
     }
 }
@@ -400,6 +419,13 @@ impl TypedMarketRouter {
         self.recovered_at.remove(&market);
         self.unavailable.remove(&market);
         self.deferred_books.remove(&market);
+    }
+
+    /// Returns the completed boundary that any later executable source must
+    /// strictly exceed for this market.
+    #[must_use]
+    pub(crate) fn recovery_boundary(&self, market: &Market) -> Option<TimestampNs> {
+        self.recovered_at.get(market).copied()
     }
 
     /// Routes exactly one normalized source fact without inventing execution semantics.
@@ -518,18 +544,13 @@ impl TypedMarketRouter {
             generation: _,
             boundary_at,
             snapshot_event_id,
-            backfill_events,
         } = completion;
-        let mut events = backfill_events
-            .into_iter()
-            .map(|source| TypedEngineEvent::AdvanceTime { source })
-            .collect::<Vec<_>>();
-        events.push(TypedEngineEvent::MarketRecovered {
+        let events = vec![TypedEngineEvent::MarketRecovered {
             event_id,
             at: boundary_at,
             market: market.clone(),
             snapshot_event_id,
-        });
+        }];
         // The immutable snapshot proves this recovery request, but evidence
         // may complete at a later UTC boundary. It must never become a book
         // for execution when it predates that boundary; wait for a new full L2

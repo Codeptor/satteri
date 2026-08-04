@@ -2033,7 +2033,9 @@ impl PaperBroker {
         Ok(())
     }
 
-    fn causal_boundary(&self) -> TimestampNs {
+    /// Returns the latest broker-owned causal boundary for source admission.
+    #[must_use]
+    pub fn causal_boundary(&self) -> TimestampNs {
         self.last_transition_at.max(self.latest_seen_as_of)
     }
 

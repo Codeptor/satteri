@@ -289,6 +289,14 @@ pub enum EngineEvent<'strategy> {
         /// Explicit time boundary.
         at: TimestampNs,
     },
+    /// A late normalized source fact retained for audit and recovery evidence
+    /// without changing the broker's causal clock.
+    SourceRetained {
+        /// Globally unique normalized source event.
+        event_id: EventId,
+        /// Original source event time.
+        at: TimestampNs,
+    },
     /// Explicit source exhaustion; residual exposure remains unresolved.
     EndOfData {
         /// Globally unique normalized end-of-stream event.
@@ -1138,6 +1146,9 @@ impl Engine {
             EngineEvent::AdvanceTime { event_id, at } => {
                 Self::apply_advance_time(event_id, at, prior_state, context)
             }
+            EngineEvent::SourceRetained { event_id, at } => {
+                Self::apply_source_retained(event_id, at, prior_state, context)
+            }
             EngineEvent::EndOfData { event_id, at } => {
                 Self::apply_end_of_data(event_id, at, prior_state, context)
             }
@@ -1563,6 +1574,22 @@ impl Engine {
             });
             apply_broker_transition(&mut state, &mut batch, &transition)?;
         }
+        Ok(EngineOutcome { state, batch })
+    }
+
+    fn apply_source_retained(
+        event_id: EventId,
+        at: TimestampNs,
+        state: EngineState,
+        context: &EngineContext,
+    ) -> Result<EngineOutcome, EngineError> {
+        let causality_id = CausalityId::from_event(event_id);
+        let mut batch = EngineBatch::new(causality_id, at);
+        if context.admission == EventAdmission::Duplicate {
+            batch.push(EngineRecord::DuplicateIgnored);
+            return Ok(EngineOutcome { state, batch });
+        }
+        batch.push(EngineRecord::EventReceived);
         Ok(EngineOutcome { state, batch })
     }
 
