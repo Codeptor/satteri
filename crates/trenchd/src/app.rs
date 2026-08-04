@@ -688,7 +688,7 @@ async fn admit_capture_output(
 ) -> Result<StreamScopeAction, AppError> {
     match output {
         CaptureOutput::Captured(batch) => {
-            parquet_store.write_events(batch.events())?;
+            parquet_store.write_capture_batch(batch.events())?;
             for event in batch.events().iter().cloned() {
                 admit_market_event(writer, authority, event, recovery_sender).await?;
             }
@@ -1964,6 +1964,65 @@ mod tests {
                 .events,
             0,
             "the induced authority failure occurs after source persistence"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_atomic_capture_publication_cannot_activate_a_stream_scope() {
+        let (capture, request, _server) = mounted_context_capture(None).await;
+        let batch = capture
+            .capture(&request, &SystemReceiptClock)
+            .await
+            .expect("complete public context batch");
+        let directory = tempfile::tempdir().expect("fixture root");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("private fixture root");
+        let store = ParquetStore::open(directory.path(), provenance()).expect("fixture store");
+        // An already-published ordinary source fact makes this distinct atomic
+        // capture fail its duplicate fence before any batch commit marker can
+        // become visible.
+        store
+            .write_events(std::slice::from_ref(&batch.events()[0]))
+            .expect("fixture conflicting source fact");
+        let mut writer = EngineWriter::open(
+            directory.path().join("trench.sqlite"),
+            "run-capture-publication-failure",
+            current_time_ns().expect("UTC clock"),
+        )
+        .await
+        .expect("fixture writer");
+        let mut authority = authority("run-capture-publication-failure");
+        let mut scheduler = CaptureScheduler::new(Vec::new());
+        let config = PaperConfig::from_toml(PAPER_CONFIG).expect("fixture config");
+        let _ = scheduler
+            .dispatch(current_timestamp())
+            .expect("capture schedule")
+            .expect("metadata-only capture schedule");
+
+        let error = admit_capture_output(
+            &store,
+            &mut writer,
+            &mut authority,
+            CaptureOutput::Captured(batch),
+            &mut scheduler,
+            &config,
+            None,
+        )
+        .await
+        .expect_err("atomic publication conflict must reject the complete capture");
+
+        assert!(matches!(error, super::AppError::Storage(_)));
+        assert!(authority.live.scope.is_empty());
+        assert!(!authority.live.active_epoch);
+        assert!(scheduler.in_flight());
+        assert_eq!(
+            writer
+                .journal_counts()
+                .await
+                .expect("journal counts")
+                .events,
+            0,
+            "no capture fact may reach the writer after atomic publication failure"
         );
     }
 
