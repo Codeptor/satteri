@@ -44,6 +44,12 @@ pub enum ValidationError {
         /// Complete trustworthy UTC days admitted from the source manifest.
         available_days: u16,
     },
+    /// A reported source gap intersects a required research fold.
+    #[error("required point-in-time research data is unavailable")]
+    RequiredDataUnavailable,
+    /// Excluded gaps were duplicated, overlapped, or otherwise non-canonical.
+    #[error("excluded gap ranges must be strictly ordered and non-overlapping")]
+    InvalidExcludedGaps,
     /// A caller did not supply every declared candidate exactly once.
     #[error("the research grid must contain exactly the twelve declared rules configurations")]
     IncompleteGrid,
@@ -102,6 +108,12 @@ impl TimeRange {
     #[must_use]
     pub const fn end(self) -> TimestampNs {
         self.end
+    }
+
+    /// Returns whether two half-open source-time ranges share any instant.
+    #[must_use]
+    pub fn intersects(self, other: Self) -> bool {
+        self.start < other.end && other.start < self.end
     }
 
     fn day_range(
@@ -217,6 +229,14 @@ impl OuterFold {
     #[must_use]
     pub const fn inner(&self) -> &[InnerFold; 4] {
         &self.inner
+    }
+
+    fn intersects_gap(&self, gap: TimeRange) -> bool {
+        // The complete outer window is intentionally conservative. A gap in a
+        // nominal purge/embargo interval can still poison feature lookbacks or
+        // replay recovery, so it may not be ignored merely because no outcome
+        // was scored at that exact instant.
+        self.development.start() < gap.end() && gap.start() < self.test.end()
     }
 }
 
@@ -871,6 +891,7 @@ impl RulesValidationReport {
         excluded_gaps: Vec<ExcludedGap>,
     ) -> Result<Self, ValidationError> {
         provenance.validate()?;
+        let excluded_gaps = normalize_excluded_gaps(excluded_gaps)?;
         let mut report = Self {
             provenance,
             complete_days,
@@ -878,6 +899,34 @@ impl RulesValidationReport {
             folds: Vec::new(),
             eligibility: ResearchEligibility::Ineligible {
                 reason: IneligibleReason::InsufficientTrustworthyHistory,
+                available_days: complete_days,
+                required_days: ValidationPlan::minimum_complete_days(),
+                outer_test_folds: 0,
+                closed_trades: 0,
+            },
+            artifact: None,
+            digest: String::new(),
+        };
+        report.digest = report_digest(&report)?;
+        Ok(report)
+    }
+
+    /// Builds an explicit canonical report when a required point-in-time input
+    /// is missing, gapped, or cannot feed the authoritative engine replay.
+    pub fn required_data_unavailable(
+        provenance: ResearchProvenance,
+        complete_days: u16,
+        excluded_gaps: Vec<ExcludedGap>,
+    ) -> Result<Self, ValidationError> {
+        provenance.validate()?;
+        let excluded_gaps = normalize_excluded_gaps(excluded_gaps)?;
+        let mut report = Self {
+            provenance,
+            complete_days,
+            excluded_gaps,
+            folds: Vec::new(),
+            eligibility: ResearchEligibility::Ineligible {
+                reason: IneligibleReason::RequiredDataUnavailable,
                 available_days: complete_days,
                 required_days: ValidationPlan::minimum_complete_days(),
                 outer_test_folds: 0,
@@ -898,6 +947,18 @@ impl RulesValidationReport {
         replay: &mut E,
     ) -> Result<Self, ValidationError> {
         provenance.validate()?;
+        let excluded_gaps = normalize_excluded_gaps(excluded_gaps)?;
+        if excluded_gaps.iter().any(|gap| {
+            plan.outer()
+                .iter()
+                .any(|fold| fold.intersects_gap(gap.range))
+        }) {
+            return Self::required_data_unavailable(
+                provenance,
+                plan.complete_days(),
+                excluded_gaps,
+            );
+        }
         let mut folds = Vec::with_capacity(plan.outer().len());
         for fold in plan.outer() {
             let mut candidates = Vec::with_capacity(RuleGrid::CANDIDATE_COUNT);
@@ -1031,11 +1092,13 @@ impl RulesValidationReport {
         if report_digest(&report)? != report.digest {
             return Err(ValidationError::InvalidDigest);
         }
+        report.validate_structure()?;
         Ok(report)
     }
 
     /// Checks whether this report and its optional artifact form one active-mode pair.
     pub fn validate_active_pair(&self) -> Result<(), ValidationError> {
+        self.validate_structure()?;
         match (&self.eligibility, &self.artifact) {
             (ResearchEligibility::Eligible { .. }, Some(artifact)) => {
                 artifact.verify_provenance(&self.provenance)?;
@@ -1051,6 +1114,185 @@ impl RulesValidationReport {
             _ => Err(ValidationError::IneligibleReport),
         }
     }
+
+    /// Verifies the runtime-bound portions of an otherwise complete active pair.
+    ///
+    /// `expected_config_digest` commits the exact physical configuration file
+    /// selected by the daemon. `expected_code_digest` comes from the embedded
+    /// workspace build commitment. Feature/data commitments are checked between
+    /// the report and artifact by [`Self::validate_active_pair`], preserving the
+    /// data cutoff selected during research without pretending that forward
+    /// market data must hash to a historical immutable input.
+    pub fn validate_for_active(
+        &self,
+        expected_config_digest: &str,
+        expected_code_digest: &str,
+    ) -> Result<&RulesArtifact, ValidationError> {
+        if !is_digest(expected_config_digest) || !is_digest(expected_code_digest) {
+            return Err(ValidationError::InvalidDigest);
+        }
+        self.validate_active_pair()?;
+        if self.provenance.config_digest != expected_config_digest
+            || self.provenance.code_digest != expected_code_digest
+        {
+            return Err(ValidationError::ArtifactReportMismatch);
+        }
+        self.artifact
+            .as_ref()
+            .ok_or(ValidationError::IneligibleReport)
+    }
+
+    fn validate_structure(&self) -> Result<(), ValidationError> {
+        self.provenance.validate()?;
+        if normalize_excluded_gaps(self.excluded_gaps.clone())? != self.excluded_gaps {
+            return Err(ValidationError::InvalidExcludedGaps);
+        }
+        let expected_plan = match self.folds.first() {
+            Some(first) => {
+                ValidationPlan::build(first.fold.development().start(), self.complete_days)?
+            }
+            None => return self.validate_empty_ineligible_report(),
+        };
+        if expected_plan.outer().len() != self.folds.len()
+            || expected_plan
+                .outer()
+                .iter()
+                .zip(&self.folds)
+                .any(|(expected, actual)| expected != &actual.fold)
+            || self.excluded_gaps.iter().any(|gap| {
+                expected_plan
+                    .outer()
+                    .iter()
+                    .any(|fold| fold.intersects_gap(gap.range))
+            })
+        {
+            return Err(ValidationError::RequiredDataUnavailable);
+        }
+
+        for fold in &self.folds {
+            validate_outer_fold_report(fold)?;
+        }
+        let closed_trades = self.folds.iter().try_fold(0_u32, |total, fold| {
+            total
+                .checked_add(fold.test.closed_trades())
+                .ok_or(ValidationError::InvalidEngineOutcome)
+        })?;
+        let outer_test_folds =
+            u16::try_from(self.folds.len()).map_err(|_| ValidationError::InvalidEngineOutcome)?;
+        match (&self.eligibility, &self.artifact) {
+            (
+                ResearchEligibility::Eligible {
+                    outer_test_folds: declared_folds,
+                    closed_trades: declared_trades,
+                },
+                Some(_),
+            ) if usize::from(*declared_folds) >= REQUIRED_OUTER_TESTS
+                && *declared_folds == outer_test_folds
+                && *declared_trades == closed_trades
+                && closed_trades >= REQUIRED_CLOSED_TRADES =>
+            {
+                Ok(())
+            }
+            (
+                ResearchEligibility::Ineligible {
+                    reason: IneligibleReason::InsufficientClosedTrades,
+                    available_days,
+                    required_days,
+                    outer_test_folds: declared_folds,
+                    closed_trades: declared_trades,
+                },
+                None,
+            ) if *available_days == self.complete_days
+                && *required_days == ValidationPlan::minimum_complete_days()
+                && *declared_folds == outer_test_folds
+                && *declared_trades == closed_trades
+                && closed_trades < REQUIRED_CLOSED_TRADES =>
+            {
+                Ok(())
+            }
+            _ => Err(ValidationError::IneligibleReport),
+        }
+    }
+
+    fn validate_empty_ineligible_report(&self) -> Result<(), ValidationError> {
+        match (&self.eligibility, &self.artifact) {
+            (
+                ResearchEligibility::Ineligible {
+                    reason: IneligibleReason::InsufficientTrustworthyHistory,
+                    available_days,
+                    required_days,
+                    outer_test_folds: 0,
+                    closed_trades: 0,
+                },
+                None,
+            ) if *available_days == self.complete_days
+                && *available_days < ValidationPlan::minimum_complete_days()
+                && *required_days == ValidationPlan::minimum_complete_days() =>
+            {
+                Ok(())
+            }
+            (
+                ResearchEligibility::Ineligible {
+                    reason: IneligibleReason::RequiredDataUnavailable,
+                    available_days,
+                    required_days,
+                    outer_test_folds: 0,
+                    closed_trades: 0,
+                },
+                None,
+            ) if *available_days == self.complete_days
+                && *required_days == ValidationPlan::minimum_complete_days() =>
+            {
+                Ok(())
+            }
+            _ => Err(ValidationError::IneligibleReport),
+        }
+    }
+}
+
+fn validate_outer_fold_report(report: &OuterFoldReport) -> Result<(), ValidationError> {
+    if report.candidates.len() != RuleGrid::CANDIDATE_COUNT {
+        return Err(ValidationError::IncompleteGrid);
+    }
+    let selection_inputs = report
+        .candidates
+        .iter()
+        .map(|candidate| {
+            let config = candidate.selection.to_config()?;
+            let recomputed = selection_from_outcomes(config, &candidate.inner)?;
+            if candidate.median_net_expectancy != recomputed.median_net_expectancy
+                || candidate.turnover != recomputed.turnover
+            {
+                return Err(ValidationError::InvalidInnerFoldOutcomes);
+            }
+            Ok(CandidateInnerOutcomes {
+                config,
+                outcomes: candidate.inner.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, ValidationError>>()?;
+    let selection = select_from_inner(&selection_inputs)?;
+    if RuleSelection::from_config(selection.config()) != report.selected {
+        return Err(ValidationError::InvalidInnerFoldOutcomes);
+    }
+    report.calibration.validate()?;
+    report.test.validate()?;
+    Ok(())
+}
+
+fn normalize_excluded_gaps(
+    mut gaps: Vec<ExcludedGap>,
+) -> Result<Vec<ExcludedGap>, ValidationError> {
+    gaps.sort_by(|left, right| {
+        (left.range.start(), left.range.end()).cmp(&(right.range.start(), right.range.end()))
+    });
+    if gaps
+        .windows(2)
+        .any(|pair| pair[0].range.end() > pair[1].range.start())
+    {
+        return Err(ValidationError::InvalidExcludedGaps);
+    }
+    Ok(gaps)
 }
 
 fn selection_from_outcomes(
@@ -1307,6 +1549,7 @@ impl ReportWire {
                 })
             })
             .collect::<Result<Vec<_>, ValidationError>>()?;
+        let excluded_gaps = normalize_excluded_gaps(excluded_gaps)?;
         let folds = self
             .folds
             .into_iter()
@@ -1709,9 +1952,9 @@ mod tests {
 
     use super::{
         AtrFloor, CandidateInnerOutcomes, EngineReplayOutcome, EntryThreshold, IneligibleReason,
-        ResearchEligibility, ResearchProvenance, RuleConfig, RuleGrid, RuleSelection,
-        RulesArtifact, RulesValidationReport, TakeProfitMultiple, TimeRange, TimestampNs,
-        ValidationError, ValidationPlan, select_from_inner,
+        ReplayPhase, ResearchEligibility, ResearchProvenance, RuleConfig, RuleGrid, RuleReplay,
+        RuleReplayRequest, RuleSelection, RulesArtifact, RulesValidationReport, TakeProfitMultiple,
+        TimeRange, TimestampNs, ValidationError, ValidationPlan, select_from_inner,
     };
 
     const DAY_NS: i64 = 86_400_000_000_000;
@@ -1747,6 +1990,61 @@ mod tests {
             feature_schema_digest: digest(14),
             data_cutoff: timestamp(1_000),
         }
+    }
+
+    struct DeterministicEngineReplay {
+        inner_bias: Option<RuleConfig>,
+        outer_test_delta: Decimal,
+    }
+
+    impl DeterministicEngineReplay {
+        fn baseline() -> Self {
+            Self {
+                inner_bias: None,
+                outer_test_delta: Decimal::ZERO,
+            }
+        }
+    }
+
+    impl RuleReplay for DeterministicEngineReplay {
+        fn replay(
+            &mut self,
+            request: RuleReplayRequest,
+        ) -> Result<EngineReplayOutcome, ValidationError> {
+            let threshold = request.config.threshold().value();
+            let atr = request.config.atr_floor().value();
+            let take_profit = request.config.take_profit().value();
+            let mut net_pnl = threshold * dec!(100) + atr + take_profit / dec!(100);
+            if self.inner_bias == Some(request.config)
+                && matches!(request.phase, ReplayPhase::InnerValidation { .. })
+            {
+                net_pnl += dec!(100);
+            }
+            let (closed_trades, phase_offset) = match request.phase {
+                ReplayPhase::InnerValidation { inner_fold } => (1, inner_fold),
+                ReplayPhase::Calibration => (1, 10),
+                ReplayPhase::OuterTest => {
+                    net_pnl += self.outer_test_delta;
+                    (34, 20)
+                }
+            };
+            Ok(outcome(
+                net_pnl,
+                dec!(1),
+                closed_trades,
+                request.outer_fold as u8 + phase_offset + 100,
+            ))
+        }
+    }
+
+    fn complete_report(replay: &mut DeterministicEngineReplay) -> RulesValidationReport {
+        RulesValidationReport::run(
+            &ValidationPlan::build(timestamp(0), 455).expect("three outer folds"),
+            provenance(),
+            Vec::new(),
+            replay,
+        )
+        .expect("production-engine evidence creates report")
     }
 
     #[test]
@@ -1897,6 +2195,116 @@ mod tests {
         wire["selection"]["threshold"] = serde_json::Value::String("0.61".to_owned());
         assert!(
             RulesArtifact::from_canonical_json(&serde_json::to_vec(&wire).expect("JSON")).is_err()
+        );
+    }
+
+    #[test]
+    fn gaps_fail_closed_and_canonical_gap_order_is_byte_stable() {
+        let plan = ValidationPlan::build(timestamp(0), 455).expect("three outer folds");
+        let gap = super::ExcludedGap {
+            range: TimeRange::new(timestamp(200), timestamp(201)).expect("gap"),
+        };
+        let report = RulesValidationReport::run(
+            &plan,
+            provenance(),
+            vec![gap],
+            &mut DeterministicEngineReplay::baseline(),
+        )
+        .expect("gap report");
+        assert!(matches!(
+            report.eligibility(),
+            ResearchEligibility::Ineligible {
+                reason: IneligibleReason::RequiredDataUnavailable,
+                ..
+            }
+        ));
+        assert!(report.artifact().is_none());
+
+        let first = super::ExcludedGap {
+            range: TimeRange::new(timestamp(500), timestamp(501)).expect("first gap"),
+        };
+        let second = super::ExcludedGap {
+            range: TimeRange::new(timestamp(502), timestamp(503)).expect("second gap"),
+        };
+        let left =
+            RulesValidationReport::insufficient_history(provenance(), 454, vec![second, first])
+                .expect("normalized report");
+        let right =
+            RulesValidationReport::insufficient_history(provenance(), 454, vec![first, second])
+                .expect("normalized report");
+        assert_eq!(
+            left.canonical_json().expect("left JSON"),
+            right.canonical_json().expect("right JSON")
+        );
+        assert!(matches!(
+            RulesValidationReport::insufficient_history(provenance(), 454, vec![first, first]),
+            Err(ValidationError::InvalidExcludedGaps)
+        ));
+    }
+
+    #[test]
+    fn report_recomputes_selection_and_never_reuses_outer_test_for_tuning() {
+        let mut baseline_replay = DeterministicEngineReplay::baseline();
+        let baseline = complete_report(&mut baseline_replay);
+        assert!(matches!(
+            baseline.eligibility(),
+            ResearchEligibility::Eligible {
+                outer_test_folds: 3,
+                closed_trades: 102,
+            }
+        ));
+        let selected = baseline
+            .folds
+            .iter()
+            .map(|fold| fold.selected.clone())
+            .collect::<Vec<_>>();
+        let artifact_digest = baseline
+            .artifact()
+            .expect("eligible artifact")
+            .digest()
+            .to_owned();
+
+        let mut changed_test_replay = DeterministicEngineReplay {
+            inner_bias: None,
+            outer_test_delta: dec!(-100),
+        };
+        let changed_test = complete_report(&mut changed_test_replay);
+        assert_eq!(
+            changed_test
+                .folds
+                .iter()
+                .map(|fold| fold.selected.clone())
+                .collect::<Vec<_>>(),
+            selected,
+        );
+        assert_eq!(
+            changed_test.artifact().expect("eligible artifact").digest(),
+            artifact_digest
+        );
+        assert_ne!(changed_test.digest(), baseline.digest());
+
+        let mut changed_development_replay = DeterministicEngineReplay {
+            inner_bias: Some(RuleGrid::declared()[0]),
+            outer_test_delta: Decimal::ZERO,
+        };
+        let changed_development = complete_report(&mut changed_development_replay);
+        assert_ne!(changed_development.digest(), baseline.digest());
+        assert_ne!(
+            changed_development
+                .artifact()
+                .expect("eligible artifact")
+                .digest(),
+            artifact_digest
+        );
+
+        let mut forged = baseline.clone();
+        forged.folds[0].selected = RuleSelection::from_config(RuleGrid::declared()[0]);
+        forged.digest = super::report_digest(&forged).expect("recomputed forged digest");
+        assert!(
+            RulesValidationReport::from_canonical_json(
+                &forged.canonical_json().expect("forged report JSON")
+            )
+            .is_err()
         );
     }
 

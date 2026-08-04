@@ -1,5 +1,6 @@
 //! The interpretable rules-only strategy over immutable feature inputs.
 
+#[cfg(test)]
 use blake3::Hasher;
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -15,6 +16,7 @@ use crate::strategy::{
     CandidateSpecification, CostDecision, CostQuote, CostRejection, OrderIntent, SignalCandidate,
     Strategy, StrategyKind,
 };
+use crate::validation::{RulesArtifact, ValidationError};
 
 const HIGH_VOLATILITY_THRESHOLD_SURCHARGE: Decimal = Decimal::from_parts(10, 0, 0, false, 2);
 const MINIMUM_AGREEMENT_MAGNITUDE: Decimal = Decimal::from_parts(15, 0, 0, false, 2);
@@ -242,9 +244,14 @@ pub struct RulesStrategy {
 }
 
 impl RulesStrategy {
-    /// Creates a rules strategy from one frozen allowed configuration.
+    /// Creates a rules strategy for in-crate deterministic research only.
+    ///
+    /// Active daemon code must use [`Self::from_artifact`], which binds every
+    /// signal to a verified immutable research artifact rather than arbitrary
+    /// TOML-selected rule values.
     #[must_use]
-    pub fn new(config: RuleConfig) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(config: RuleConfig) -> Self {
         let mut hasher = Hasher::new_derive_key("trench.rules-strategy.v1");
         hasher.update(&[config.threshold as u8]);
         hasher.update(&[config.atr_floor as u8]);
@@ -253,6 +260,19 @@ impl RulesStrategy {
             config,
             fingerprint: hasher.finalize().to_hex().to_string(),
         }
+    }
+
+    /// Creates the only public active-mode rules strategy from a verified artifact.
+    ///
+    /// The artifact has already proven its declared grid selection, content
+    /// address, code/feature/data provenance, and validation-report pairing at
+    /// the daemon boundary. Its content identity becomes the strategy
+    /// fingerprint carried into every engine candidate.
+    pub fn from_artifact(artifact: &RulesArtifact) -> Result<Self, ValidationError> {
+        Ok(Self {
+            config: artifact.config()?,
+            fingerprint: artifact.strategy_fingerprint().to_owned(),
+        })
     }
 
     /// Returns the immutable selected configuration.

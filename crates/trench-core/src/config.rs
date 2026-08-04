@@ -3,6 +3,7 @@
 use std::path::{Component, Path};
 use std::str::FromStr;
 
+use blake3::Hasher;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use thiserror::Error;
@@ -447,6 +448,25 @@ impl PaperConfig {
         let config = Self::try_from(raw)?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Returns the canonical digest of the paper-engine configuration excluding
+    /// the entire rules reference table.
+    ///
+    /// The rule selection is immutable artifact data, while the active TOML
+    /// table only names the artifact/report that prove it. Excluding that
+    /// table prevents a self-referential hash cycle between a report digest and
+    /// the config field that names it, and ensures collect-only and active
+    /// configurations with the same frozen engine gates share research
+    /// provenance.
+    pub fn research_digest(input: &str) -> Result<String, ConfigError> {
+        Self::from_toml(input)?;
+        let mut document: toml::Table = toml::from_str(input).map_err(|_| ConfigError::Toml)?;
+        document.remove("rules");
+        let canonical = toml::to_string(&document).map_err(|_| ConfigError::Toml)?;
+        let mut hasher = Hasher::new_derive_key("trench.paper-research-config.v1");
+        hasher.update(canonical.as_bytes());
+        Ok(format!("b3:{}", hasher.finalize().to_hex()))
     }
 
     /// Revalidates all frozen gates represented by this configuration.
@@ -1341,6 +1361,24 @@ mod tests {
         );
 
         assert!(PaperConfig::from_toml(&input).is_err());
+    }
+
+    #[test]
+    fn research_digest_excludes_artifact_references_but_commits_frozen_engine_gates() {
+        let active = active_config("rules-artifact.json", "rules-validation.json");
+        assert_eq!(
+            PaperConfig::research_digest(EXAMPLE).expect("collect digest"),
+            PaperConfig::research_digest(&active).expect("active digest"),
+        );
+        let altered_storage = replace_once(
+            EXAMPLE,
+            "sqlite_path = \"state/trench.sqlite\"",
+            "sqlite_path = \"state/other.sqlite\"",
+        );
+        assert_ne!(
+            PaperConfig::research_digest(EXAMPLE).expect("original digest"),
+            PaperConfig::research_digest(&altered_storage).expect("changed digest"),
+        );
     }
 
     #[test]
