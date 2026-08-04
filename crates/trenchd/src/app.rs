@@ -143,7 +143,7 @@ enum RecoveryInput {
 #[derive(Debug)]
 enum RecoveryOutput {
     /// A final reconciled or unavailable recovery conclusion.
-    Result(RecoveryResult),
+    Result(Box<RecoveryResult>),
     /// The producer could not safely retain or reconcile its queue head.
     Failed {
         /// Market that remains execution-fenced.
@@ -1131,7 +1131,7 @@ async fn recovery_worker(
         let (result, terminal) = match input_result {
             Err(error) => (RecoveryOutput::Failed { market, error }, true),
             Ok(()) => match producer.process_next(&mut candles, &cancellation).await {
-                Ok(Some(result)) => (RecoveryOutput::Result(result), false),
+                Ok(Some(result)) => (RecoveryOutput::Result(Box::new(result)), false),
                 Ok(None) => continue,
                 Err(RecoveryProducerError::Cancelled) => return,
                 Err(error) => (RecoveryOutput::Failed { market, error }, true),
@@ -1274,7 +1274,7 @@ async fn admit_recovery_output(
                 );
                 return Ok(());
             }
-            admit_recovery_result(writer, authority, result).await?;
+            admit_recovery_result(writer, authority, *result).await?;
             authority.recovery_markets.remove(&market);
             Ok(())
         }
