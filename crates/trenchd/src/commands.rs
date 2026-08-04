@@ -10,8 +10,10 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use trench_core::config::PaperConfig;
+use trench_core::config::{PaperConfig, RulesConfig};
 use trench_core::domain::Market;
+use trench_core::strategy::rules::RulesStrategy;
+use trench_core::validation::{ResearchProvenance, RulesArtifact, RulesValidationReport};
 use trench_hyperliquid::{
     ArchiveDataKind, ArchiveDigest, ArchiveManifest, ArchiveReader, ArchiveRequirement,
     ArchiveSource, ArchiveSpan, GapRecovery,
@@ -24,6 +26,7 @@ use crate::app::{self, RuntimeMode};
 
 const MAX_CONFIG_BYTES: u64 = 65_536;
 const MAX_ARCHIVE_MANIFEST_BYTES: u64 = 1_048_576;
+const MAX_RULE_ARTIFACT_BYTES: u64 = 1_048_576;
 const IMPORT_MANIFEST_VERSION: u8 = 1;
 
 /// Paper-only Trench daemon command surface.
@@ -59,10 +62,12 @@ impl Cli {
             }
             Command::Collect(arguments) => {
                 let loaded = load_config(&arguments.config.config)?;
+                let rules_startup = RulesStartup::resolve(&loaded);
                 app::run(
                     &arguments.config.config,
                     &loaded.bytes,
                     &loaded.config,
+                    rules_startup,
                     RuntimeMode::Collect,
                     arguments.duration,
                 )
@@ -71,10 +76,12 @@ impl Cli {
             }
             Command::Run(arguments) => {
                 let loaded = load_config(&arguments.config)?;
+                let rules_startup = RulesStartup::resolve(&loaded);
                 app::run(
                     &arguments.config,
                     &loaded.bytes,
                     &loaded.config,
+                    rules_startup,
                     RuntimeMode::Run,
                     None,
                 )
@@ -105,6 +112,22 @@ impl Cli {
                 }
                 Ok(())
             }
+            Command::Research(arguments) => match arguments.command {
+                ResearchCommand::Rules(arguments) => {
+                    let result = research_rules(arguments)?;
+                    tracing::info!(
+                        report = %result.report_path.display(),
+                        report_digest = %result.report_digest,
+                        artifact = ?result.artifact_path.as_ref().map(|path| path.display().to_string()),
+                        "rules research wrote canonical validation evidence"
+                    );
+                    if result.eligible {
+                        Ok(())
+                    } else {
+                        Err(CommandError::RulesResearchIneligible)
+                    }
+                }
+            },
         }
     }
 }
@@ -116,12 +139,14 @@ enum Command {
     Doctor(ConfigArgs),
     /// Start the read-only market-data collection lifecycle for a bounded interval.
     Collect(CollectArgs),
-    /// Start the long-running collection/readiness daemon until Ctrl-C; active rules are refused.
+    /// Start the long-running collection/readiness daemon until Ctrl-C; entries await typed reactor warmup.
     Run(ConfigArgs),
     /// Validate and inspect one explicit immutable deterministic replay plan.
     Replay(ReplayArgs),
     /// Request daemon readiness/status over its private Unix socket.
     Status(StatusArgs),
+    /// Run deterministic offline research over one immutable source replay plan.
+    Research(ResearchArgs),
     /// Verify a local official archive and persist only normalized L2 facts.
     ImportArchive(ImportArchiveArgs),
 }
@@ -163,6 +188,47 @@ struct StatusArgs {
     /// Emit the complete protocol status as one JSON value.
     #[arg(long)]
     json: bool,
+}
+
+/// One offline research family.
+#[derive(Debug, Clone, Args)]
+struct ResearchArgs {
+    #[command(subcommand)]
+    command: ResearchCommand,
+}
+
+/// Explicit bounded offline research jobs.
+#[derive(Debug, Clone, Subcommand)]
+enum ResearchCommand {
+    /// Validate and freeze the independently accounted rules-only strategy.
+    Rules(RulesResearchArgs),
+}
+
+/// Immutable local inputs/outputs for a rules walk-forward research run.
+#[derive(Debug, Clone, Args)]
+pub struct RulesResearchArgs {
+    /// Fully validated paper configuration TOML.
+    #[arg(long)]
+    pub config: PathBuf,
+    /// Absolute immutable replay-plan manifest selected for this research run.
+    #[arg(long)]
+    pub manifest: PathBuf,
+    /// Absolute existing private directory for immutable report/artifact outputs.
+    #[arg(long)]
+    pub output: PathBuf,
+}
+
+/// Persisted result of one rules research attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RulesResearchResult {
+    /// Canonical validation report, including a fail-closed ineligible result.
+    pub report_path: PathBuf,
+    /// Content identity of the emitted report.
+    pub report_digest: String,
+    /// Content-addressed artifact only when all hard gates passed.
+    pub artifact_path: Option<PathBuf>,
+    /// Whether an active-mode artifact was actually authorized.
+    pub eligible: bool,
 }
 
 /// Explicit local paths for an immutable official archive import.
@@ -264,6 +330,9 @@ pub fn import_archive(arguments: ImportArchiveArgs) -> Result<ImportArchiveResul
 
 /// A descriptor-safely read, fully validated paper configuration.
 pub(crate) struct LoadedConfig {
+    /// Canonical physical config target captured before parsing. Relative active
+    /// artifacts must use this immutable sibling directory, never a symlink alias.
+    pub(crate) physical_path: PathBuf,
     /// Original immutable TOML bytes used in provenance commitments.
     pub(crate) bytes: Vec<u8>,
     /// Strict parsed configuration with no secret-bearing raw fields retained.
@@ -272,11 +341,331 @@ pub(crate) struct LoadedConfig {
 
 /// Reads a bounded non-symlink config and parses it with the strict paper schema.
 pub(crate) fn load_config(path: &Path) -> Result<LoadedConfig, CommandError> {
-    let bytes = read_bounded_regular_file(path, MAX_CONFIG_BYTES, "config")?;
+    let physical_path =
+        physical_config_target(path).map_err(|_| CommandError::InvalidConfigPath)?;
+    let bytes = read_bounded_regular_file(&physical_path, MAX_CONFIG_BYTES, "config")?;
     let config = std::str::from_utf8(&bytes)
         .map_err(|_| CommandError::InvalidConfigEncoding)
         .and_then(|text| PaperConfig::from_toml(text).map_err(CommandError::Config))?;
-    Ok(LoadedConfig { bytes, config })
+    Ok(LoadedConfig {
+        physical_path,
+        bytes,
+        config,
+    })
+}
+
+/// Startup result for the rules-only ledger. A failed artifact leaves the
+/// collection daemon and every mandatory-exit path available while keeping new
+/// rules entries unready.
+pub(crate) enum RulesStartup {
+    /// No strategy may generate entries while only collecting market data.
+    CollectOnly,
+    /// The configured sibling artifact/report pair passed every active gate.
+    Active(ResolvedRules),
+    /// Active configuration was present but its immutable evidence failed closed.
+    Unready(RulesArtifactError),
+}
+
+impl RulesStartup {
+    /// Resolves active artifact state without widening a config failure into a
+    /// global daemon failure.
+    pub(crate) fn resolve(loaded: &LoadedConfig) -> Self {
+        match resolve_active_rules(loaded) {
+            Ok(Some(resolved)) => Self::Active(resolved),
+            Ok(None) => Self::CollectOnly,
+            Err(error) => Self::Unready(error),
+        }
+    }
+
+    /// Returns the artifact-derived strategy only after complete verification.
+    pub(crate) fn strategy(&self) -> Option<&RulesStrategy> {
+        match self {
+            Self::Active(resolved) => Some(&resolved.strategy),
+            Self::CollectOnly | Self::Unready(_) => None,
+        }
+    }
+
+    /// Returns the active-resolution error for an auditable rules-local status.
+    pub(crate) fn error(&self) -> Option<&RulesArtifactError> {
+        match self {
+            Self::Unready(error) => Some(error),
+            Self::CollectOnly | Self::Active(_) => None,
+        }
+    }
+}
+
+/// Complete active rules strategy resolved from physical config siblings only.
+pub(crate) struct ResolvedRules {
+    strategy: RulesStrategy,
+}
+
+/// Active artifact resolution failure. Details stay stable and path-free so a
+/// local status response cannot disclose an operator's filesystem layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub(crate) enum RulesArtifactError {
+    /// Supplied config could not be bound to a physical regular-file target.
+    #[error("rules configuration target is invalid")]
+    ConfigTarget,
+    /// Named artifact was not a bounded non-symlink regular sibling file.
+    #[error("rules artifact file is invalid")]
+    ArtifactFile,
+    /// Named report was not a bounded non-symlink regular sibling file.
+    #[error("rules validation report file is invalid")]
+    ReportFile,
+    /// Artifact JSON was not exactly canonical immutable bytes.
+    #[error("rules artifact is not canonical")]
+    NonCanonicalArtifact,
+    /// Report JSON was not exactly canonical immutable bytes.
+    #[error("rules validation report is not canonical")]
+    NonCanonicalReport,
+    /// Configured content address did not equal the independently verified artifact.
+    #[error("rules artifact digest does not match configuration")]
+    ArtifactDigest,
+    /// Configured content address did not equal the independently verified report.
+    #[error("rules validation report digest does not match configuration")]
+    ReportDigest,
+    /// Artifact/report eligibility or provenance could not authorize active mode.
+    #[error("rules artifact/report validation failed")]
+    Validation,
+}
+
+fn resolve_active_rules(
+    loaded: &LoadedConfig,
+) -> Result<Option<ResolvedRules>, RulesArtifactError> {
+    let RulesConfig::Active(active) = loaded.config.rules() else {
+        return Ok(None);
+    };
+    let parent = loaded
+        .physical_path
+        .parent()
+        .ok_or(RulesArtifactError::ConfigTarget)?;
+    let artifact_path = parent.join(active.artifact_file());
+    let report_path = parent.join(active.validation_report_file());
+    let artifact_bytes =
+        read_bounded_regular_file(&artifact_path, MAX_RULE_ARTIFACT_BYTES, "rules artifact")
+            .map_err(|_| RulesArtifactError::ArtifactFile)?;
+    let report_bytes = read_bounded_regular_file(
+        &report_path,
+        MAX_RULE_ARTIFACT_BYTES,
+        "rules validation report",
+    )
+    .map_err(|_| RulesArtifactError::ReportFile)?;
+    let artifact = RulesArtifact::from_canonical_json(&artifact_bytes)
+        .map_err(|_| RulesArtifactError::Validation)?;
+    if artifact
+        .canonical_json()
+        .map_err(|_| RulesArtifactError::Validation)?
+        != artifact_bytes
+    {
+        return Err(RulesArtifactError::NonCanonicalArtifact);
+    }
+    let report = RulesValidationReport::from_canonical_json(&report_bytes)
+        .map_err(|_| RulesArtifactError::Validation)?;
+    if report
+        .canonical_json()
+        .map_err(|_| RulesArtifactError::Validation)?
+        != report_bytes
+    {
+        return Err(RulesArtifactError::NonCanonicalReport);
+    }
+    if artifact.digest() != active.artifact_digest() {
+        return Err(RulesArtifactError::ArtifactDigest);
+    }
+    if report.digest() != active.validation_report_digest() {
+        return Err(RulesArtifactError::ReportDigest);
+    }
+    let config_text =
+        std::str::from_utf8(&loaded.bytes).map_err(|_| RulesArtifactError::ConfigTarget)?;
+    let config_digest =
+        PaperConfig::research_digest(config_text).map_err(|_| RulesArtifactError::ConfigTarget)?;
+    let code_digest =
+        option_env!("TRENCH_WORKSPACE_BUILD_DIGEST").ok_or(RulesArtifactError::Validation)?;
+    let embedded = report
+        .validate_for_active(&config_digest, code_digest)
+        .map_err(|_| RulesArtifactError::Validation)?;
+    if embedded != &artifact {
+        return Err(RulesArtifactError::Validation);
+    }
+    let strategy =
+        RulesStrategy::from_artifact(&artifact).map_err(|_| RulesArtifactError::Validation)?;
+    Ok(Some(ResolvedRules { strategy }))
+}
+
+fn physical_config_target(config_path: &Path) -> Result<PathBuf, RulesArtifactError> {
+    let initial =
+        fs::symlink_metadata(config_path).map_err(|_| RulesArtifactError::ConfigTarget)?;
+    if initial.file_type().is_symlink() || !initial.is_file() {
+        return Err(RulesArtifactError::ConfigTarget);
+    }
+    let target = fs::canonicalize(config_path).map_err(|_| RulesArtifactError::ConfigTarget)?;
+    let target_metadata =
+        fs::symlink_metadata(&target).map_err(|_| RulesArtifactError::ConfigTarget)?;
+    if target_metadata.file_type().is_symlink() || !target_metadata.is_file() {
+        return Err(RulesArtifactError::ConfigTarget);
+    }
+    Ok(target)
+}
+
+/// Runs the authoritative rules-research admission path.
+///
+/// The present archived source format contains normalized market facts only;
+/// it does not yet contain the point-in-time universe/features/recovery input
+/// stream required to construct real `Engine` entry arbitration. The command
+/// therefore writes a canonical ineligible report instead of substituting a
+/// candle or approximate-cost backtest. Once that typed replay adapter exists,
+/// it must implement `trench_core::validation::RuleReplay` and supply actual
+/// engine/broker/ledger stream commitments to the core validator.
+pub fn research_rules(arguments: RulesResearchArgs) -> Result<RulesResearchResult, CommandError> {
+    require_absolute(&arguments.manifest, "manifest")?;
+    require_absolute(&arguments.output, "output")?;
+    let loaded = load_config(&arguments.config)?;
+    let expected_provenance = DataProvenance::new(
+        digest_bytes(&loaded.bytes),
+        code_digest()?,
+        ParquetStore::schema_hash(),
+    )?;
+    let plan = ReplayPlan::read_from(&arguments.manifest)?;
+    if plan.provenance() != &expected_provenance {
+        return Err(CommandError::ReplayProvenanceMismatch);
+    }
+    let parquet_root =
+        resolve_configured_path(&arguments.config, loaded.config.storage().parquet_path())?;
+    let replay =
+        trench_storage::replay::DeterministicReplay::open_plan(&parquet_root, plan.clone())?;
+    let provenance = research_provenance(&loaded.bytes, &plan, replay.events())?;
+    let observed_days = observed_source_span_days(replay.events());
+    let report = if observed_days < trench_core::validation::ValidationPlan::minimum_complete_days()
+    {
+        RulesValidationReport::insufficient_history(provenance, observed_days, Vec::new())?
+    } else {
+        RulesValidationReport::required_data_unavailable(provenance, observed_days, Vec::new())?
+    };
+    write_research_report(&arguments.output, &report)
+}
+
+fn research_provenance(
+    config_bytes: &[u8],
+    plan: &ReplayPlan,
+    events: &[trench_core::event::MarketEvent],
+) -> Result<ResearchProvenance, CommandError> {
+    let text =
+        std::str::from_utf8(config_bytes).map_err(|_| CommandError::InvalidConfigEncoding)?;
+    let data_cutoff = events
+        .last()
+        .map(trench_core::event::MarketEvent::event_time)
+        .ok_or(CommandError::ResearchSourceEmpty)?;
+    Ok(ResearchProvenance {
+        config_digest: PaperConfig::research_digest(text)?,
+        code_digest: code_digest()?,
+        data_digest: plan.digest().to_owned(),
+        // These commitments say exactly which unavailable input contracts the
+        // current report observed; they cannot be confused with a ready source.
+        universe_digest: digest_bytes(b"trench.rules.universe-input-unavailable.v1"),
+        feature_schema_digest: digest_bytes(b"trench.rules.feature-input-unavailable.v1"),
+        data_cutoff,
+    })
+}
+
+fn observed_source_span_days(events: &[trench_core::event::MarketEvent]) -> u16 {
+    const DAY_NS: i64 = 86_400_000_000_000;
+    let Some(first) = events.first() else {
+        return 0;
+    };
+    let Some(last) = events.last() else {
+        return 0;
+    };
+    let span = last
+        .event_time()
+        .value()
+        .saturating_sub(first.event_time().value());
+    u16::try_from(span / DAY_NS).unwrap_or(u16::MAX)
+}
+
+fn write_research_report(
+    output: &Path,
+    report: &RulesValidationReport,
+) -> Result<RulesResearchResult, CommandError> {
+    let output = research_output_directory(output)?;
+    let report_path = output.join("rules-validation.json");
+    write_immutable_research_bytes(&report_path, &report.canonical_json()?)?;
+    let artifact_path = report
+        .artifact()
+        .map(|artifact| -> Result<PathBuf, CommandError> {
+            let path = output.join("rules-artifact.json");
+            write_immutable_research_bytes(&path, &artifact.canonical_json()?)?;
+            Ok(path)
+        })
+        .transpose()?;
+    Ok(RulesResearchResult {
+        report_path,
+        report_digest: report.digest().to_owned(),
+        eligible: artifact_path.is_some(),
+        artifact_path,
+    })
+}
+
+fn research_output_directory(path: &Path) -> Result<PathBuf, CommandError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| CommandError::Filesystem {
+        operation: "inspecting research output directory",
+        source,
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(CommandError::InvalidResearchOutput);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
+            return Err(CommandError::InvalidResearchOutput);
+        }
+    }
+    fs::canonicalize(path).map_err(|source| CommandError::Filesystem {
+        operation: "canonicalizing research output directory",
+        source,
+    })
+}
+
+fn write_immutable_research_bytes(path: &Path, bytes: &[u8]) -> Result<(), CommandError> {
+    let parent = path.parent().ok_or(CommandError::InvalidResearchOutput)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| matches!(*name, "rules-validation.json" | "rules-artifact.json"))
+        .ok_or(CommandError::InvalidResearchOutput)?;
+    let temporary = parent.join(format!(".{name}.tmp"));
+    if path.exists() {
+        let existing = read_bounded_regular_file(path, MAX_RULE_ARTIFACT_BYTES, "research output")?;
+        return if existing == bytes {
+            Ok(())
+        } else {
+            Err(CommandError::ImmutableResearchConflict)
+        };
+    }
+    if temporary.exists() {
+        return Err(CommandError::TemporaryResearchOutput);
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|source| CommandError::Filesystem {
+            operation: "creating research output",
+            source,
+        })?;
+    set_private_import_file(&file)?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|source| CommandError::Filesystem {
+            operation: "writing research output",
+            source,
+        })?;
+    sync_directory(parent)?;
+    fs::rename(&temporary, path).map_err(|source| CommandError::Filesystem {
+        operation: "publishing research output",
+        source,
+    })?;
+    sync_directory(parent)
 }
 
 #[derive(Debug, Serialize)]
@@ -677,6 +1066,9 @@ fn doctor(config_path: &Path) -> Result<DoctorReport, CommandError> {
         Some(parent) => inspect_directory(parent, "runtime_directory", &mut reasons),
         None => reasons.push("runtime_directory_invalid"),
     }
+    if RulesStartup::resolve(&loaded).error().is_some() {
+        reasons.push("rules_artifact_unready");
+    }
     Ok(DoctorReport {
         ok: reasons.is_empty(),
         reasons,
@@ -793,6 +1185,9 @@ pub enum CommandError {
     /// Offline doctor found a non-mutating local preflight failure.
     #[error("doctor reported failed local preflight")]
     DoctorFailed,
+    /// Research completed with a canonical but promotion-ineligible report.
+    #[error("rules research is ineligible; inspect rules-validation.json")]
+    RulesResearchIneligible,
     /// Descriptor-safe local archive imports require Unix no-follow semantics.
     #[cfg(not(unix))]
     #[error("archive import is unsupported on this platform")]
@@ -828,6 +1223,21 @@ pub enum CommandError {
     /// A content-addressed import path already contains different immutable bytes.
     #[error("immutable import manifest conflicts with existing content")]
     ImmutableImportConflict,
+    /// A rules-research output directory or fixed output name was unsafe.
+    #[error("rules research output directory is invalid")]
+    InvalidResearchOutput,
+    /// A prior interrupted rules-research write remains as a temporary sibling.
+    #[error("temporary rules research output exists")]
+    TemporaryResearchOutput,
+    /// A fixed immutable rules-research output already contains different bytes.
+    #[error("immutable rules research output conflicts with existing content")]
+    ImmutableResearchConflict,
+    /// The research replay plan belongs to another config/code/schema run.
+    #[error("replay plan provenance does not match the supplied config and code")]
+    ReplayProvenanceMismatch,
+    /// The replay source contained no normalized market facts.
+    #[error("research replay source is empty")]
+    ResearchSourceEmpty,
     /// A local filesystem operation failed.
     #[error("filesystem operation failed while {operation}")]
     Filesystem {
@@ -838,6 +1248,9 @@ pub enum CommandError {
     /// The bounded JSON manifest format was invalid.
     #[error("JSON input is invalid")]
     Json(#[from] serde_json::Error),
+    /// Rules artifact/report canonicalization or validation failed.
+    #[error(transparent)]
+    Validation(#[from] trench_core::validation::ValidationError),
     /// Archive verification or decoding rejected local evidence.
     #[error(transparent)]
     Archive(#[from] trench_hyperliquid::ArchiveError),
@@ -1097,5 +1510,281 @@ mod doctor_tests {
         assert!(!root.path().join("state").exists());
         assert!(!root.path().join("data").exists());
         assert!(!root.path().join("runtime").exists());
+    }
+}
+
+#[cfg(test)]
+mod rules_research_tests {
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    use rust_decimal::Decimal;
+    use trench_core::domain::{Market, Price, Quantity, Side};
+    use trench_core::event::{MarketEvent, TimestampNs, Trade};
+    use trench_core::strategy::Strategy;
+    use trench_core::validation::{
+        EngineReplayOutcome, IneligibleReason, ReplayPhase, ResearchEligibility,
+        ResearchProvenance, RuleReplay, RuleReplayRequest, RulesValidationReport, ValidationPlan,
+    };
+    use trench_storage::parquet::{DataProvenance, ParquetStore};
+    use trench_storage::replay::ReplayPlan;
+
+    use super::{
+        CommandError, RulesArtifactError, RulesResearchArgs, RulesStartup, code_digest,
+        digest_bytes, load_config, research_rules,
+    };
+
+    fn secure(path: &std::path::Path) {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .expect("fixture directory should be private");
+    }
+
+    fn digest(index: u8) -> String {
+        format!("b3:{index:064x}")
+    }
+
+    fn base_config(root: &std::path::Path) -> String {
+        include_str!("../../../config/paper.example.toml")
+            .replace(
+                "parquet_path = \"data/parquet\"",
+                &format!("parquet_path = \"{}\"", root.join("parquet").display()),
+            )
+            .replace(
+                "/run/trench/trenchd.sock",
+                &root.join("runtime/trenchd.sock").display().to_string(),
+            )
+    }
+
+    struct Replay;
+
+    impl RuleReplay for Replay {
+        fn replay(
+            &mut self,
+            request: RuleReplayRequest,
+        ) -> Result<EngineReplayOutcome, trench_core::validation::ValidationError> {
+            let score = request.config.threshold().value() * Decimal::from(100)
+                + request.config.atr_floor().value()
+                + request.config.take_profit().value() / Decimal::from(100);
+            let (trades, offset) = match request.phase {
+                ReplayPhase::InnerValidation { inner_fold } => (1, inner_fold),
+                ReplayPhase::Calibration => (1, 10),
+                ReplayPhase::OuterTest => (34, 20),
+            };
+            EngineReplayOutcome::new(
+                score,
+                Decimal::ONE,
+                trades,
+                digest(request.outer_fold as u8 + offset + 20),
+                digest(request.outer_fold as u8 + offset + 40),
+                digest(request.outer_fold as u8 + offset + 60),
+                digest(request.outer_fold as u8 + offset + 80),
+            )
+        }
+    }
+
+    fn active_fixture(root: &std::path::Path) -> std::path::PathBuf {
+        active_fixture_with_code(root, code_digest().expect("embedded build digest"))
+    }
+
+    fn active_fixture_with_code(
+        root: &std::path::Path,
+        artifact_code_digest: String,
+    ) -> std::path::PathBuf {
+        let staged = root.join("staged");
+        fs::create_dir(&staged).expect("staged directory");
+        secure(&staged);
+        let collect = base_config(root);
+        let provenance = ResearchProvenance {
+            config_digest: trench_core::config::PaperConfig::research_digest(&collect)
+                .expect("semantic config digest"),
+            code_digest: artifact_code_digest,
+            data_digest: digest(1),
+            universe_digest: digest(2),
+            feature_schema_digest: digest(3),
+            data_cutoff: TimestampNs::new(1).expect("cutoff"),
+        };
+        let report = RulesValidationReport::run(
+            &ValidationPlan::build(TimestampNs::new(0).expect("origin"), 455).expect("fold plan"),
+            provenance,
+            Vec::new(),
+            &mut Replay,
+        )
+        .expect("eligible report");
+        let artifact = report.artifact().expect("eligible artifact");
+        let active = collect.replacen(
+            "mode = \"collect_only\"",
+            &format!(
+                "mode = \"active\"\nartifact_file = \"rules-artifact.json\"\nartifact_digest = \"{}\"\nvalidation_report_file = \"rules-validation.json\"\nvalidation_report_digest = \"{}\"",
+                artifact.digest(),
+                report.digest(),
+            ),
+            1,
+        );
+        let config = staged.join("paper.toml");
+        fs::write(&config, active).expect("staged config");
+        fs::write(
+            staged.join("rules-artifact.json"),
+            artifact.canonical_json().expect("artifact JSON"),
+        )
+        .expect("artifact");
+        fs::write(
+            staged.join("rules-validation.json"),
+            report.canonical_json().expect("report JSON"),
+        )
+        .expect("report");
+        config
+    }
+
+    #[test]
+    fn research_writes_a_canonical_insufficient_history_report_without_an_artifact() {
+        let root = tempfile::tempdir().expect("fixture root");
+        secure(root.path());
+        let parquet = root.path().join("parquet");
+        let output = root.path().join("output");
+        fs::create_dir(&parquet).expect("parquet root");
+        fs::create_dir(&output).expect("output root");
+        secure(&parquet);
+        secure(&output);
+        let config = root.path().join("paper.toml");
+        fs::write(&config, base_config(root.path())).expect("config");
+        let loaded = load_config(&config).expect("load config");
+        let provenance = DataProvenance::new(
+            digest_bytes(&loaded.bytes),
+            code_digest().expect("code digest"),
+            ParquetStore::schema_hash(),
+        )
+        .expect("parquet provenance");
+        let store = ParquetStore::open(&parquet, provenance.clone()).expect("store");
+        let at = TimestampNs::new(1).expect("event time");
+        let event = MarketEvent::trade(
+            at,
+            at,
+            Market::new("SOL").expect("market"),
+            Trade::new(
+                1,
+                Side::Buy,
+                Price::new(Decimal::ONE).expect("price"),
+                Quantity::new(Decimal::ONE).expect("quantity"),
+            )
+            .expect("trade"),
+        )
+        .expect("event");
+        let plan = ReplayPlan::new(provenance, store.write_events(&[event]).expect("partition"))
+            .expect("plan");
+        let manifest = root.path().join("replay.json");
+        plan.write_to(&manifest).expect("immutable plan");
+
+        let result = research_rules(RulesResearchArgs {
+            config,
+            manifest,
+            output: output.clone(),
+        })
+        .expect("ineligible research still writes report");
+        assert!(!result.eligible);
+        assert!(result.report_path.is_file());
+        assert!(result.artifact_path.is_none());
+        let report = RulesValidationReport::from_canonical_json(
+            &fs::read(&result.report_path).expect("report bytes"),
+        )
+        .expect("canonical report");
+        assert!(matches!(
+            report.eligibility(),
+            ResearchEligibility::Ineligible {
+                reason: IneligibleReason::InsufficientTrustworthyHistory,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn active_rules_read_only_the_physical_staged_config_siblings_and_fail_closed_on_symlink_or_digest()
+     {
+        let root = tempfile::tempdir().expect("fixture root");
+        secure(root.path());
+        let config = active_fixture(root.path());
+        let current = root.path().join("current");
+        symlink(config.parent().expect("staged parent"), &current).expect("current symlink");
+        let loaded = load_config(&current.join("paper.toml")).expect("staged config loads");
+
+        let current_target = root.path().join("current-target");
+        fs::create_dir(&current_target).expect("current target");
+        secure(&current_target);
+        fs::write(current_target.join("rules-artifact.json"), b"unrelated")
+            .expect("unrelated current artifact");
+        fs::remove_file(&current).expect("remove current alias");
+        symlink(&current_target, &current).expect("switch current symlink");
+
+        let startup = RulesStartup::resolve(&loaded);
+        let strategy = startup.strategy().expect("staged siblings activate rules");
+        assert_eq!(strategy.fingerprint().len(), 64);
+
+        let artifact = config
+            .parent()
+            .expect("staged parent")
+            .join("rules-artifact.json");
+        let target = config
+            .parent()
+            .expect("staged parent")
+            .join("artifact-target.json");
+        fs::rename(&artifact, &target).expect("move artifact target");
+        symlink(&target, &artifact).expect("artifact symlink");
+        let startup = RulesStartup::resolve(&loaded);
+        assert_eq!(startup.error(), Some(&RulesArtifactError::ArtifactFile));
+
+        fs::remove_file(&artifact).expect("remove symlink");
+        fs::rename(&target, &artifact).expect("restore artifact");
+        let body = fs::read_to_string(&config).expect("config body");
+        let invalid = body
+            .lines()
+            .map(|line| {
+                if line.starts_with("artifact_digest =") {
+                    format!("artifact_digest = \"b3:{}\"", "0".repeat(64))
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&config, invalid).expect("wrong digest config");
+        let loaded = load_config(&config).expect("wrong digest still parses");
+        let startup = RulesStartup::resolve(&loaded);
+        assert_eq!(startup.error(), Some(&RulesArtifactError::ArtifactDigest));
+
+        fs::write(&config, body).expect("restore active config");
+        let report_digest_mismatch = fs::read_to_string(&config)
+            .expect("config body")
+            .lines()
+            .map(|line| {
+                if line.starts_with("validation_report_digest =") {
+                    format!("validation_report_digest = \"b3:{}\"", "0".repeat(64))
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&config, report_digest_mismatch).expect("wrong report digest config");
+        let loaded = load_config(&config).expect("wrong report digest still parses");
+        let startup = RulesStartup::resolve(&loaded);
+        assert_eq!(startup.error(), Some(&RulesArtifactError::ReportDigest));
+    }
+
+    #[test]
+    fn active_rules_reject_report_provenance_that_does_not_match_this_build() {
+        let root = tempfile::tempdir().expect("fixture root");
+        secure(root.path());
+        let config = active_fixture_with_code(root.path(), digest(99));
+        let loaded = load_config(&config).expect("active config loads");
+        let startup = RulesStartup::resolve(&loaded);
+        assert_eq!(startup.error(), Some(&RulesArtifactError::Validation));
+    }
+
+    #[test]
+    fn rules_research_cli_surfaces_the_canonical_ineligible_result_as_nonzero() {
+        let error = CommandError::RulesResearchIneligible;
+        assert_eq!(
+            error.to_string(),
+            "rules research is ineligible; inspect rules-validation.json"
+        );
     }
 }

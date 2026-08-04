@@ -10,12 +10,13 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use trench_core::broker::{BrokerConfig, BrokerRunContext, PaperBroker};
 use trench_core::config::PaperConfig;
-use trench_core::domain::{LedgerId, RulesMode, RunId, Usdc};
+use trench_core::domain::{LedgerId, RunId, Usdc};
 use trench_core::engine::{
     Engine, EngineContext, EngineEvent, EngineState, SnapshotBindings, StrategyFingerprints,
 };
 use trench_core::event::{DurationNs, MarketEvent, MarketEventKind, TimestampNs};
 use trench_core::ledger::LedgerState;
+use trench_core::strategy::Strategy;
 use trench_core::universe::UniverseSelector;
 use trench_hyperliquid::{GapEvent, InfoClient, WsClient, WsConfig, WsOutput, WsStream};
 use trench_storage::parquet::{DataProvenance, ParquetError, ParquetStore};
@@ -24,6 +25,7 @@ use trench_storage::replay::{DeterministicReplay, ReplayError, ReplayPlan};
 use crate::admin::{
     AdminError, AdminServer, AuthorityRequest, DaemonMode, DaemonStatus, authority_channel,
 };
+use crate::commands::RulesStartup;
 use crate::readiness::Readiness;
 use crate::writer::{EngineWriter, SourceEvent, WriterError};
 
@@ -79,10 +81,10 @@ pub async fn run(
     config_path: &Path,
     config_bytes: &[u8],
     config: &PaperConfig,
+    rules_startup: RulesStartup,
     mode: RuntimeMode,
     duration: Option<Duration>,
 ) -> Result<(), AppError> {
-    require_collection_only(config)?;
     let sqlite_path = configured_path(config_path, config.storage().sqlite_path())?;
     let parquet_path = configured_path(config_path, config.storage().parquet_path())?;
     let admin_socket = PathBuf::from(config.runtime().admin_socket_path());
@@ -107,8 +109,21 @@ pub async fn run(
     authority
         .readiness
         .set_ntp_synchronized(local_ntp_synchronized());
-    authority.readiness.set_rules_configuration_valid(false);
+    authority
+        .readiness
+        .set_rules_configuration_valid(rules_startup.strategy().is_some());
     authority.readiness.set_rules_sleeve_warm(false);
+    if let Some(strategy) = rules_startup.strategy() {
+        tracing::info!(
+            rules_artifact = %strategy.fingerprint(),
+            "verified frozen rules artifact; entries remain unavailable pending typed reactor warmup"
+        );
+    } else if let Some(error) = rules_startup.error() {
+        tracing::warn!(
+            reason = %error,
+            "rules artifact is unready; keeping collection and mandatory-exit paths available"
+        );
+    }
     tracing::info!(
         mode = ?mode,
         "strategy/recovery reactors are not active; daemon is sealed collection-only"
@@ -466,13 +481,6 @@ fn provenance(config_bytes: &[u8]) -> Result<DataProvenance, AppError> {
     .map_err(Into::into)
 }
 
-fn require_collection_only(config: &PaperConfig) -> Result<(), AppError> {
-    if config.rules().mode() == RulesMode::Active {
-        return Err(AppError::ActiveRulesUnavailable);
-    }
-    Ok(())
-}
-
 pub(crate) fn configured_path(config_path: &Path, value: &str) -> Result<PathBuf, AppError> {
     let config_path = absolute_path(config_path)?;
     let value = Path::new(value);
@@ -562,11 +570,6 @@ pub enum AppError {
     /// The minimal no-entry engine state could not be initialized safely.
     #[error("paper engine initial state could not be constructed")]
     InitialEngineState,
-    /// An active rules artifact cannot run before its typed execution reactor.
-    #[error(
-        "active rules require the typed strategy/recovery execution reactor; this daemon is collection-only"
-    )]
-    ActiveRulesUnavailable,
     /// Canonical source evidence could not be serialized.
     #[error("normalized source evidence could not be serialized")]
     Json(#[source] serde_json::Error),
@@ -602,7 +605,7 @@ mod tests {
 
     use super::{
         AuthorityState, admit_source_event, configured_path, initial_engine_state,
-        recover_source_stream, require_collection_only,
+        recover_source_stream,
     };
     use crate::readiness::Readiness;
     use crate::writer::EngineWriter;
@@ -635,23 +638,6 @@ mod tests {
                 .expect("empty recovery")
                 .is_none()
         );
-    }
-
-    #[test]
-    fn active_rules_are_refused_until_the_typed_execution_reactor_exists() {
-        const DIGEST: &str = "b3:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let active = include_str!("../../../config/paper.example.toml").replacen(
-            "mode = \"collect_only\"",
-            &format!(
-                "mode = \"active\"\nartifact_file = \"rules.toml\"\nartifact_digest = \"{DIGEST}\"\nvalidation_report_file = \"validation.json\"\nvalidation_report_digest = \"{DIGEST}\""
-            ),
-            1,
-        );
-        let config = trench_core::config::PaperConfig::from_toml(&active).expect("active fixture");
-        assert!(matches!(
-            require_collection_only(&config),
-            Err(super::AppError::ActiveRulesUnavailable)
-        ));
     }
 
     #[tokio::test]
