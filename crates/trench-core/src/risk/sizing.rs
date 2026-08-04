@@ -428,6 +428,30 @@ impl RiskSnapshot {
         &self.book_digest
     }
 
+    /// Returns the exact isolated-ledger digest bound to this quote request.
+    #[must_use]
+    pub fn ledger_digest(&self) -> &str {
+        &self.ledger_digest
+    }
+
+    /// Returns the exact active-universe digest bound to this quote request.
+    #[must_use]
+    pub fn universe_digest(&self) -> &str {
+        &self.universe_digest
+    }
+
+    /// Returns the immutable run/configuration digest bound to this quote request.
+    #[must_use]
+    pub fn config_digest(&self) -> &str {
+        &self.config_digest
+    }
+
+    /// Returns the exact causal event digest bound to this quote request.
+    #[must_use]
+    pub fn event_digest(&self) -> &str {
+        &self.event_digest
+    }
+
     fn digest(&self) -> String {
         let mut hasher = Hasher::new_derive_key(RISK_QUOTE_DOMAIN);
         for value in [
@@ -461,6 +485,89 @@ pub struct RiskRequest {
     limits: RiskLimits,
 }
 
+/// Frozen sizing policy owned by an engine run rather than an individual event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RiskPolicy {
+    book_digest: String,
+    constraints: VenueConstraints,
+    costs: ConservativeCosts,
+    limits: RiskLimits,
+}
+
+impl RiskPolicy {
+    fn from_request(request: RiskRequest) -> Self {
+        Self {
+            book_digest: request.snapshot.book_digest,
+            constraints: request.constraints,
+            costs: request.costs,
+            limits: request.limits,
+        }
+    }
+
+    fn request(&self, snapshot: RiskSnapshot) -> RiskRequest {
+        RiskRequest {
+            snapshot,
+            constraints: self.constraints.clone(),
+            costs: self.costs.clone(),
+            limits: self.limits,
+        }
+    }
+
+    pub(crate) fn commitment_digest(&self) -> String {
+        let mut hasher = Hasher::new_derive_key("trench.risk-policy.v1");
+        for value in [
+            self.book_digest.clone(),
+            self.constraints.quantity_decimals.to_string(),
+            self.constraints.minimum_notional.value().to_string(),
+            self.constraints.maximum_notional.value().to_string(),
+            self.constraints
+                .maximum_executable_notional
+                .value()
+                .to_string(),
+            self.constraints.maximum_leverage.value().to_string(),
+            self.costs.entry_fee_fraction.to_string(),
+            self.costs.exit_fee_fraction.to_string(),
+            self.costs.current_funding_fraction.to_string(),
+            self.costs.trailing_p99_funding_fraction.to_string(),
+            self.costs.funding_timestamps.to_string(),
+            self.limits.risk_budget.value().to_string(),
+            self.limits.margin_cap_fraction.to_string(),
+            self.limits.liquidation_stop_multiple.to_string(),
+        ] {
+            hasher.update(&(value.len() as u64).to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+        for tier in self.constraints.maintenance_tiers.as_slice() {
+            for value in [
+                tier.lower_notional().value().to_string(),
+                tier.upper_notional()
+                    .map_or_else(|| "none".to_owned(), |upper| upper.value().to_string()),
+                tier.maintenance_rate().to_string(),
+                tier.maintenance_deduction().value().to_string(),
+            ] {
+                hasher.update(&(value.len() as u64).to_be_bytes());
+                hasher.update(value.as_bytes());
+            }
+        }
+        for band in &self.costs.impact_curve.0 {
+            for value in [
+                band.upper_notional
+                    .map_or_else(|| "none".to_owned(), |upper| upper.value().to_string()),
+                band.current_fraction.to_string(),
+                band.trailing_p99_fraction.to_string(),
+            ] {
+                hasher.update(&(value.len() as u64).to_be_bytes());
+                hasher.update(value.as_bytes());
+            }
+        }
+        hasher.finalize().to_hex().to_string()
+    }
+
+    pub(crate) fn matches_book_digest(&self, book_digest: &str) -> bool {
+        self.book_digest == book_digest
+    }
+}
+
 impl RiskRequest {
     /// Creates a deterministic risk request from explicit point-in-time inputs.
     #[must_use]
@@ -482,6 +589,26 @@ impl RiskRequest {
     #[must_use]
     pub const fn snapshot(&self) -> &RiskSnapshot {
         &self.snapshot
+    }
+
+    /// Freezes this request's sizing inputs for the lifetime of one engine run.
+    #[must_use]
+    pub fn into_policy(self) -> RiskPolicy {
+        RiskPolicy::from_request(self)
+    }
+
+    pub(crate) fn from_policy(snapshot: RiskSnapshot, policy: &RiskPolicy) -> Self {
+        policy.request(snapshot)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_snapshot(&self, snapshot: RiskSnapshot) -> Self {
+        Self {
+            snapshot,
+            constraints: self.constraints.clone(),
+            costs: self.costs.clone(),
+            limits: self.limits,
+        }
     }
 }
 
@@ -938,6 +1065,18 @@ impl RiskEngine {
         self.approvals
             .remove(quote_id)
             .ok_or(RiskError::UnknownOrConsumedQuote)
+    }
+
+    /// Removes an unselected approval before it can become stale or consume
+    /// bounded approval-cache capacity. Only the core engine owns this path.
+    pub(crate) fn discard_quote(&mut self, quote_id: &QuoteId) -> bool {
+        self.approvals.remove(quote_id).is_some()
+    }
+
+    /// Returns the sealed approvals still retained by the private risk boundary.
+    #[cfg(test)]
+    pub(crate) fn outstanding_approvals(&self) -> usize {
+        self.approvals.len()
     }
 
     fn next_quote_id(&mut self, source_digest: &str) -> Result<QuoteId, RiskError> {
@@ -1500,6 +1639,7 @@ mod tests {
             snapshot_digest: digest('a'),
             universe_digest: digest('c'),
             history_digest: digest('d'),
+            strategy_fingerprint: digest('e'),
             explanation_json: "{}".into(),
         })
         .expect("candidate")
@@ -1654,6 +1794,7 @@ mod tests {
             snapshot_digest: digest('a'),
             universe_digest: digest('c'),
             history_digest: digest('d'),
+            strategy_fingerprint: digest('e'),
             explanation_json: "{}".into(),
         };
         let mismatched = SignalCandidate::new(specification).expect("candidate");

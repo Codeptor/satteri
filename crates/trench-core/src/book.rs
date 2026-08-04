@@ -1,5 +1,6 @@
 //! Immutable validated order books and deterministic visible-depth walking.
 
+use blake3::Hasher;
 use rust_decimal::Decimal;
 use thiserror::Error;
 
@@ -181,6 +182,35 @@ impl OrderBook {
             bids: snapshot.bids().to_vec(),
             asks: snapshot.asks().to_vec(),
         })
+    }
+
+    /// Returns a canonical commitment over this validated full-depth source book.
+    #[must_use]
+    pub fn commitment_digest(&self) -> String {
+        let mut hasher = Hasher::new_derive_key("trench.order-book.v1");
+        for value in [
+            self.event_id.as_str().to_owned(),
+            self.event_time.value().to_string(),
+            self.received_at.value().to_string(),
+            self.market.as_str().to_owned(),
+            self.sequence.to_string(),
+        ] {
+            hasher.update(&(value.len() as u64).to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+        for (side, levels) in [(b"bid".as_slice(), &self.bids), (b"ask", &self.asks)] {
+            hasher.update(side);
+            for level in levels {
+                for value in [
+                    level.price().value().to_string(),
+                    level.quantity().value().to_string(),
+                ] {
+                    hasher.update(&(value.len() as u64).to_be_bytes());
+                    hasher.update(value.as_bytes());
+                }
+            }
+        }
+        hasher.finalize().to_hex().to_string()
     }
 
     /// Walks visible liquidity without mutating this snapshot.

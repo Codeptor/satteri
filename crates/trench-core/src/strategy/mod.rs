@@ -38,6 +38,7 @@ pub struct SignalCandidate {
     snapshot_digest: String,
     universe_digest: String,
     history_digest: String,
+    strategy_fingerprint: String,
     explanation_json: String,
     digest: String,
 }
@@ -75,6 +76,9 @@ impl SignalCandidate {
         {
             return Err(CandidateError::MissingProvenance);
         }
+        if !is_blake3_digest(&specification.strategy_fingerprint) {
+            return Err(CandidateError::InvalidStrategyFingerprint);
+        }
         let mut candidate = Self {
             strategy: specification.strategy,
             market: specification.market,
@@ -89,6 +93,7 @@ impl SignalCandidate {
             snapshot_digest: specification.snapshot_digest,
             universe_digest: specification.universe_digest,
             history_digest: specification.history_digest,
+            strategy_fingerprint: specification.strategy_fingerprint,
             explanation_json: specification.explanation_json,
             digest: String::new(),
         };
@@ -174,6 +179,12 @@ impl SignalCandidate {
         &self.history_digest
     }
 
+    /// Returns the validated frozen strategy artifact/version fingerprint.
+    #[must_use]
+    pub fn strategy_fingerprint(&self) -> &str {
+        &self.strategy_fingerprint
+    }
+
     /// Returns the byte-stable auditable rules explanation JSON.
     #[must_use]
     pub fn explanation_json(&self) -> &str {
@@ -203,6 +214,7 @@ pub(crate) struct CandidateSpecification {
     pub(crate) snapshot_digest: String,
     pub(crate) universe_digest: String,
     pub(crate) history_digest: String,
+    pub(crate) strategy_fingerprint: String,
     pub(crate) explanation_json: String,
 }
 
@@ -240,6 +252,9 @@ pub enum CandidateError {
     /// A candidate cannot be reconstructed without all three input digests.
     #[error("candidate requires snapshot, universe, and long-horizon provenance digests")]
     MissingProvenance,
+    /// A candidate must seal a canonical BLAKE3 strategy artifact/version fingerprint.
+    #[error("candidate strategy fingerprint must be a 64-character hexadecimal BLAKE3 digest")]
+    InvalidStrategyFingerprint,
 }
 
 fn candidate_digest(candidate: &SignalCandidate) -> String {
@@ -274,12 +289,17 @@ fn candidate_digest(candidate: &SignalCandidate) -> String {
         &candidate.snapshot_digest,
         &candidate.universe_digest,
         &candidate.history_digest,
+        &candidate.strategy_fingerprint,
         &candidate.explanation_json,
     ] {
         hasher.update(digest.as_bytes());
         hasher.update(&[0]);
     }
     hasher.finalize().to_hex().to_string()
+}
+
+fn is_blake3_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Opaque identifier assigned to a sealed risk-sized cost quote.
@@ -701,6 +721,9 @@ pub enum CostDecision {
 ///
 /// Strategies receive no sealed quantity, margin, leverage, PnL, or order.
 pub trait Strategy {
+    /// Returns the immutable artifact/version fingerprint that produced candidates.
+    fn fingerprint(&self) -> &str;
+
     /// Applies the exact `gross_edge >= 1.5 * total_cost` acceptance gate.
     fn accept_cost(&self, candidate: &SignalCandidate, quote: &CostQuote) -> CostDecision;
 }
@@ -725,6 +748,17 @@ mod tests {
         assert!(matches!(
             SignalCandidate::new(specification),
             Err(CandidateError::NonPositiveGrossEdge { gross_edge }) if gross_edge == dec!(0)
+        ));
+    }
+
+    #[test]
+    fn candidate_rejects_a_noncanonical_strategy_artifact_fingerprint() {
+        let mut specification = candidate_specification(Side::Buy);
+        specification.strategy_fingerprint = "not-a-blake3-digest".to_owned();
+
+        assert!(matches!(
+            SignalCandidate::new(specification),
+            Err(CandidateError::InvalidStrategyFingerprint)
         ));
     }
 
@@ -852,6 +886,7 @@ mod tests {
             snapshot_digest: "snapshot".to_owned(),
             universe_digest: "universe".to_owned(),
             history_digest: "history".to_owned(),
+            strategy_fingerprint: "a".repeat(64),
             explanation_json: "{}".to_owned(),
         }
     }

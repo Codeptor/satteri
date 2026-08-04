@@ -1,5 +1,6 @@
 //! The interpretable rules-only strategy over immutable feature inputs.
 
+use blake3::Hasher;
 use rust_decimal::Decimal;
 use serde::Serialize;
 
@@ -234,21 +235,29 @@ impl RuleDecision {
 }
 
 /// Stateless rules strategy using only frozen feature and long-horizon inputs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RulesStrategy {
     config: RuleConfig,
+    fingerprint: String,
 }
 
 impl RulesStrategy {
     /// Creates a rules strategy from one frozen allowed configuration.
     #[must_use]
-    pub const fn new(config: RuleConfig) -> Self {
-        Self { config }
+    pub fn new(config: RuleConfig) -> Self {
+        let mut hasher = Hasher::new_derive_key("trench.rules-strategy.v1");
+        hasher.update(&[config.threshold as u8]);
+        hasher.update(&[config.atr_floor as u8]);
+        hasher.update(&[config.take_profit as u8]);
+        Self {
+            config,
+            fingerprint: hasher.finalize().to_hex().to_string(),
+        }
     }
 
     /// Returns the immutable selected configuration.
     #[must_use]
-    pub const fn config(self) -> RuleConfig {
+    pub const fn config(&self) -> RuleConfig {
         self.config
     }
 
@@ -431,6 +440,7 @@ impl RulesStrategy {
             snapshot_digest: source.snapshot_digest,
             universe_digest: source.universe_digest,
             history_digest: source.history_digest,
+            strategy_fingerprint: self.fingerprint.clone(),
             explanation_json: explanation_json.clone(),
         });
         match candidate {
@@ -516,6 +526,10 @@ impl RulesStrategy {
 }
 
 impl Strategy for RulesStrategy {
+    fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
     fn accept_cost(&self, candidate: &SignalCandidate, quote: &CostQuote) -> CostDecision {
         if candidate.strategy() != StrategyKind::RulesOnly
             || candidate.market() != quote.market()
@@ -1084,6 +1098,7 @@ mod tests {
             snapshot_digest: "snapshot".to_owned(),
             universe_digest: "universe".to_owned(),
             history_digest: "history".to_owned(),
+            strategy_fingerprint: "a".repeat(64),
             explanation_json: "{}".to_owned(),
         })
         .expect("candidate")

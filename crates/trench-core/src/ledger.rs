@@ -1,5 +1,6 @@
 //! Immutable isolated-margin ledger transitions for one paper experiment.
 
+use blake3::Hasher;
 use rust_decimal::Decimal;
 use thiserror::Error;
 
@@ -111,6 +112,14 @@ impl ExitFill {
 pub struct FundingCashflow(Decimal);
 
 impl FundingCashflow {
+    /// Creates an exact signed broker funding cashflow.
+    ///
+    /// Positive values debit isolated collateral; negative values credit it.
+    #[must_use]
+    pub const fn from_signed(value: Decimal) -> Self {
+        Self(value)
+    }
+
     /// Creates an exact funding debit.
     #[must_use]
     pub const fn debit(amount: Usdc) -> Self {
@@ -483,6 +492,81 @@ impl LedgerState {
             book_freshness: BookFreshnessStatus::Unmarked,
             liquidity_incomplete: false,
         })
+    }
+
+    pub(crate) fn commitment_digest(&self) -> String {
+        let mut hasher = Hasher::new_derive_key("trench.ledger-state.v1");
+        hash_component(
+            &mut hasher,
+            match self.ledger_id {
+                LedgerId::RulesOnly => "rules_only",
+                LedgerId::MlChampion => "ml_champion",
+            },
+        );
+        for value in [
+            self.cash.value(),
+            self.isolated_collateral,
+            self.realized_pnl,
+            self.unrealized_pnl,
+            self.fees_paid.value(),
+            self.funding_paid.value(),
+            self.funding_received.value(),
+            self.equity.value(),
+        ] {
+            hash_component(&mut hasher, &value.to_string());
+        }
+        match &self.position {
+            Some(position) => {
+                hash_component(&mut hasher, "position");
+                hash_component(&mut hasher, position.market.as_str());
+                hash_component(
+                    &mut hasher,
+                    match position.side {
+                        PositionSide::Long => "long",
+                        PositionSide::Short => "short",
+                    },
+                );
+                for value in [
+                    position.quantity.value(),
+                    position.entry_price.value(),
+                    Decimal::from(position.leverage.value()),
+                    position.trade_cashflow,
+                ] {
+                    hash_component(&mut hasher, &value.to_string());
+                }
+            }
+            None => hash_component(&mut hasher, "flat"),
+        }
+        hash_breakers(&mut hasher, &self.breakers);
+        match self.last_executable_mark {
+            Some(mark) => {
+                hash_component(&mut hasher, "mark");
+                for value in [
+                    mark.exit_value.value(),
+                    mark.estimated_exit_fee.value(),
+                    mark.estimated_exit_funding.value(),
+                ] {
+                    hash_component(&mut hasher, &value.to_string());
+                }
+                hash_component(
+                    &mut hasher,
+                    if mark.liquidity_incomplete { "1" } else { "0" },
+                );
+            }
+            None => hash_component(&mut hasher, "no-mark"),
+        }
+        hash_component(
+            &mut hasher,
+            self.fresh_book_market
+                .as_ref()
+                .map_or("none", Market::as_str),
+        );
+        hash_book_freshness(&mut hasher, self.book_freshness);
+        hash_component(
+            &mut hasher,
+            if self.liquidity_incomplete { "1" } else { "0" },
+        );
+        hasher.finalize().to_hex().to_string()
     }
 
     /// Returns the independent ledger identity.
@@ -1222,6 +1306,84 @@ fn equity_from(
         .filter(|value| *value >= Decimal::ZERO)
         .ok_or(LedgerError::NegativeEquity)
         .and_then(|value| Usdc::new(value).map_err(LedgerError::from))
+}
+
+fn hash_component(hasher: &mut Hasher, value: &str) {
+    hasher.update(&(value.len() as u64).to_be_bytes());
+    hasher.update(value.as_bytes());
+}
+
+fn hash_breakers(hasher: &mut Hasher, breakers: &BreakerState) {
+    for budget in [breakers.daily(), breakers.weekly()] {
+        for value in [
+            budget.anchor().value().to_string(),
+            budget.starting_equity().value().to_string(),
+            budget.limit().value().to_string(),
+            budget.used().value().to_string(),
+        ] {
+            hash_component(hasher, &value);
+        }
+        hash_component(hasher, if budget.tripped() { "1" } else { "0" });
+    }
+    for value in [
+        breakers.high_water_equity().value().to_string(),
+        breakers.entries_today().to_string(),
+        breakers.consecutive_losses().to_string(),
+        breakers.last_transition_at().value().to_string(),
+    ] {
+        hash_component(hasher, &value);
+    }
+    hash_component(
+        hasher,
+        if breakers.hard_drawdown_latched() {
+            "1"
+        } else {
+            "0"
+        },
+    );
+    hash_component(
+        hasher,
+        &breakers
+            .cooldown_until()
+            .map_or_else(|| "none".to_owned(), |at| at.value().to_string()),
+    );
+}
+
+fn hash_book_freshness(hasher: &mut Hasher, status: BookFreshnessStatus) {
+    match status {
+        BookFreshnessStatus::Unmarked => hash_component(hasher, "unmarked"),
+        BookFreshnessStatus::Fresh { source, max_age } => {
+            hash_component(hasher, "fresh");
+            hash_book_source(hasher, source);
+            hash_component(hasher, &max_age.value().to_string());
+        }
+        BookFreshnessStatus::Stale {
+            source,
+            max_age,
+            reason,
+        } => {
+            hash_component(hasher, "stale");
+            match source {
+                Some(source) => hash_book_source(hasher, source),
+                None => hash_component(hasher, "no-source"),
+            }
+            hash_component(hasher, &max_age.value().to_string());
+            hash_component(
+                hasher,
+                match reason {
+                    BookStaleReason::Missing => "missing",
+                    BookStaleReason::FutureEventTime => "future-event",
+                    BookStaleReason::FutureReceiptTime => "future-receipt",
+                    BookStaleReason::TooOld => "too-old",
+                },
+            );
+        }
+    }
+}
+
+fn hash_book_source(hasher: &mut Hasher, source: BookSourceTimes) {
+    hash_component(hasher, &source.event_time().value().to_string());
+    hash_component(hasher, &source.received_at().value().to_string());
 }
 
 fn checked_add_usdc(left: Usdc, right: Usdc, operation: &'static str) -> Result<Usdc, LedgerError> {

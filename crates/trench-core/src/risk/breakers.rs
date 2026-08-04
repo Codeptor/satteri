@@ -573,6 +573,12 @@ impl BreakerState {
         self.cooldown_until
     }
 
+    /// Returns the last explicit time accepted by breaker state.
+    #[must_use]
+    pub const fn last_transition_at(&self) -> TimestampNs {
+        self.last_transition_at
+    }
+
     fn require_monotonic_time(&self, at: TimestampNs) -> Result<(), BreakerError> {
         if at < self.last_transition_at {
             return Err(BreakerError::NonMonotonicTime {
