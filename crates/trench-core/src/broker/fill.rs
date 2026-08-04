@@ -149,6 +149,26 @@ pub fn walk_visible_quantity(
     };
     let best = levels.first().ok_or(FillError::NoFill)?.price();
     let limit = limit_price(best, side, limit_band)?;
+    walk_visible_quantity_to_price(book, side, requested_quantity, limit)
+}
+
+/// Walks visible liquidity against an explicit marketable-limit price.
+///
+/// This is used for a sealed entry limit derived from the risk-approved
+/// reference price, so a tight post-gap book cannot bypass sizing slippage.
+pub(crate) fn walk_visible_quantity_to_price(
+    book: &OrderBook,
+    side: Side,
+    requested_quantity: Quantity,
+    limit: Price,
+) -> Result<QuantityWalk, FillError> {
+    if requested_quantity.value().is_zero() {
+        return Err(FillError::ZeroRequestedQuantity);
+    }
+    let levels = match side {
+        Side::Buy => book.asks(),
+        Side::Sell => book.bids(),
+    };
     let mut remaining_quantity = requested_quantity;
     let mut filled_notional = Usdc::zero();
     let mut fills = Vec::new();

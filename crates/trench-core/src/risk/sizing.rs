@@ -13,7 +13,7 @@ use rust_decimal::{
 };
 use thiserror::Error;
 
-use crate::domain::{DomainError, Leverage, Price, Quantity, Side, Usdc};
+use crate::domain::{Bps, DomainError, Leverage, Price, Quantity, Side, Usdc};
 use crate::event::TimestampNs;
 use crate::ledger::PositionSide;
 use crate::risk::liquidation::{
@@ -28,6 +28,7 @@ const MAX_MARGIN_FRACTION: Decimal = Decimal::from_parts(25, 0, 0, false, 2);
 const MIN_LIQUIDATION_STOP_MULTIPLE: Decimal = Decimal::from_parts(25, 0, 0, false, 1);
 const MAX_TRADE_RISK_FRACTION: Decimal = Decimal::from_parts(5, 0, 0, false, 3);
 const MAX_OUTSTANDING_APPROVALS: usize = 64;
+const APPROVED_ENTRY_SLIPPAGE_BPS: Decimal = Decimal::from_parts(50, 0, 0, false, 0);
 const RISK_QUOTE_DOMAIN: &str = "trench.risk-quote.v1";
 
 /// Frozen venue limits used by the deterministic isolated sizing solver.
@@ -503,6 +504,8 @@ pub(crate) struct ApprovedOrder {
     isolated_margin: Usdc,
     planned_loss: Usdc,
     liquidation: LiquidationResult,
+    maintenance_tiers: MaintenanceTiers,
+    entry_slippage_limit: Bps,
     snapshot_digest: String,
     freshness: CostQuoteFreshness,
     counterfactuals: [LeverageCounterfactual; 4],
@@ -513,6 +516,12 @@ pub(crate) struct ApprovedOrder {
     reason = "Task 13's pure engine is the sole production consumer of sealed approval data"
 )]
 impl ApprovedOrder {
+    /// Returns the immutable candidate sealed by this risk approval.
+    #[must_use]
+    pub(crate) const fn candidate(&self) -> &SignalCandidate {
+        &self.candidate
+    }
+
     /// Returns the sealed quantity to the core execution transition only.
     #[must_use]
     pub(crate) const fn quantity(&self) -> Quantity {
@@ -547,6 +556,18 @@ impl ApprovedOrder {
     #[must_use]
     pub(crate) const fn liquidation(&self) -> LiquidationResult {
         self.liquidation
+    }
+
+    /// Returns the frozen complete maintenance table for actual-fill revaluation.
+    #[must_use]
+    pub(crate) const fn maintenance_tiers(&self) -> &MaintenanceTiers {
+        &self.maintenance_tiers
+    }
+
+    /// Returns the sealed maximum adverse entry movement from reference price.
+    #[must_use]
+    pub(crate) const fn entry_slippage_limit(&self) -> Bps {
+        self.entry_slippage_limit
     }
 
     /// Returns the four fixed leverage counterfactuals for the journal.
@@ -861,6 +882,8 @@ impl RiskEngine {
             isolated_margin,
             planned_loss,
             liquidation,
+            maintenance_tiers: request.constraints.maintenance_tiers.clone(),
+            entry_slippage_limit: approved_entry_slippage_limit()?,
             snapshot_digest: snapshot.digest(),
             freshness,
             counterfactuals,
@@ -966,6 +989,10 @@ impl RiskEngine {
             rejections,
         })
     }
+}
+
+fn approved_entry_slippage_limit() -> Result<Bps, RiskError> {
+    Ok(Bps::new(APPROVED_ENTRY_SLIPPAGE_BPS)?)
 }
 
 fn cost_feasibility_reason(rejection: RiskRejection) -> CostFeasibilityReason {
