@@ -107,6 +107,12 @@ impl MaintenanceTiers {
         {
             return Err(LiquidationError::NonterminalOpenEndedTier);
         }
+        if tiers
+            .last()
+            .is_some_and(|tier| tier.upper_notional.is_some())
+        {
+            return Err(LiquidationError::TerminalTierMustBeOpenEnded);
+        }
         Ok(Self(tiers))
     }
 
@@ -245,6 +251,9 @@ pub enum LiquidationError {
     /// An unbounded tier was followed by another tier.
     #[error("only the final maintenance tier may be open-ended")]
     NonterminalOpenEndedTier,
+    /// A finite final tier cannot represent a complete venue margin table.
+    #[error("the final maintenance tier must be open-ended")]
+    TerminalTierMustBeOpenEnded,
     /// No candidate tier was self-consistent at the solved liquidation notional.
     #[error("no maintenance tier contains the solved liquidation notional")]
     NoApplicableTier,
@@ -488,6 +497,18 @@ mod tests {
         assert!(matches!(
             MaintenanceTier::new(usdc(dec!(0)), None, Decimal::ONE, usdc(dec!(0))),
             Err(LiquidationError::InvalidMaintenanceRate { .. })
+        ));
+        assert!(matches!(
+            MaintenanceTiers::new(vec![
+                MaintenanceTier::new(
+                    usdc(dec!(0)),
+                    Some(usdc(dec!(100))),
+                    dec!(0.025),
+                    usdc(dec!(0)),
+                )
+                .expect("finite tier"),
+            ]),
+            Err(LiquidationError::TerminalTierMustBeOpenEnded)
         ));
         let high_equity = LiquidationInput::new(
             quantity(dec!(1)),

@@ -27,6 +27,7 @@ use crate::strategy::{
 const MAX_MARGIN_FRACTION: Decimal = Decimal::from_parts(25, 0, 0, false, 2);
 const MIN_LIQUIDATION_STOP_MULTIPLE: Decimal = Decimal::from_parts(25, 0, 0, false, 1);
 const MAX_TRADE_RISK_FRACTION: Decimal = Decimal::from_parts(5, 0, 0, false, 3);
+const MAX_OUTSTANDING_APPROVALS: usize = 64;
 const RISK_QUOTE_DOMAIN: &str = "trench.risk-quote.v1";
 
 /// Frozen venue limits used by the deterministic isolated sizing solver.
@@ -114,25 +115,113 @@ impl VenueConstraints {
     }
 }
 
-/// Conservative per-notional costs and scheduled-funding reserve inputs.
+/// One bounded notional band of observed current and trailing-p99 impact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImpactBand {
+    upper_notional: Option<Usdc>,
+    current_fraction: Decimal,
+    trailing_p99_fraction: Decimal,
+}
+
+impl ImpactBand {
+    /// Creates one right-closed impact band, or the final open-ended band.
+    pub fn new(
+        upper_notional: Option<Usdc>,
+        current_fraction: Decimal,
+        trailing_p99_fraction: Decimal,
+    ) -> Result<Self, RiskInputError> {
+        for (field, value) in [
+            ("current impact", current_fraction),
+            ("trailing p99 impact", trailing_p99_fraction),
+        ] {
+            if value < Decimal::ZERO {
+                return Err(RiskInputError::NegativeFraction { field, value });
+            }
+        }
+        let stressed = current_fraction
+            .checked_mul(Decimal::TWO)
+            .map(|doubled| doubled.max(trailing_p99_fraction))
+            .ok_or(RiskInputError::ImpactArithmetic)?;
+        if stressed >= Decimal::ONE {
+            return Err(RiskInputError::UnsafeImpactFraction { stressed });
+        }
+        Ok(Self {
+            upper_notional,
+            current_fraction,
+            trailing_p99_fraction,
+        })
+    }
+
+    fn contains(self, notional: Usdc) -> bool {
+        self.upper_notional.is_none_or(|upper| notional <= upper)
+    }
+
+    fn stressed_fraction(self) -> Result<Decimal, RiskError> {
+        self.current_fraction
+            .checked_mul(Decimal::TWO)
+            .map(|doubled| doubled.max(self.trailing_p99_fraction))
+            .ok_or(RiskError::Arithmetic {
+                operation: "banded stressed impact",
+            })
+    }
+}
+
+/// Complete ascending impact ladder, frozen with the executable book snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImpactCurve(Vec<ImpactBand>);
+
+impl ImpactCurve {
+    /// Creates a nonempty ascending ladder with exactly one final open band.
+    pub fn new(bands: Vec<ImpactBand>) -> Result<Self, RiskInputError> {
+        let Some(last) = bands.last() else {
+            return Err(RiskInputError::EmptyImpactCurve);
+        };
+        if last.upper_notional.is_some() {
+            return Err(RiskInputError::ImpactCurveMustBeOpenEnded);
+        }
+        for pair in bands.windows(2) {
+            let Some(left) = pair[0].upper_notional else {
+                return Err(RiskInputError::NonterminalOpenImpactBand);
+            };
+            let Some(right) = pair[1].upper_notional else {
+                continue;
+            };
+            if right <= left {
+                return Err(RiskInputError::NonAscendingImpactBands);
+            }
+        }
+        Ok(Self(bands))
+    }
+
+    fn stressed_fraction(&self, notional: Usdc) -> Result<Decimal, RiskError> {
+        self.0
+            .iter()
+            .copied()
+            .find(|band| band.contains(notional))
+            .ok_or(RiskError::Arithmetic {
+                operation: "impact ladder lookup",
+            })?
+            .stressed_fraction()
+    }
+}
+
+/// Conservative costs and scheduled-funding reserve bound to a frozen impact ladder.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConservativeCosts {
     entry_fee_fraction: Decimal,
     exit_fee_fraction: Decimal,
-    current_impact_fraction: Decimal,
-    trailing_p99_impact_fraction: Decimal,
+    impact_curve: ImpactCurve,
     current_funding_fraction: Decimal,
     trailing_p99_funding_fraction: Decimal,
     funding_timestamps: u16,
 }
 
 impl ConservativeCosts {
-    /// Creates checked nonnegative fractional cost inputs.
+    /// Creates checked nonnegative fee/funding inputs and a complete impact ladder.
     pub fn new(
         entry_fee_fraction: Decimal,
         exit_fee_fraction: Decimal,
-        current_impact_fraction: Decimal,
-        trailing_p99_impact_fraction: Decimal,
+        impact_curve: ImpactCurve,
         current_funding_fraction: Decimal,
         trailing_p99_funding_fraction: Decimal,
         funding_timestamps: u16,
@@ -140,8 +229,6 @@ impl ConservativeCosts {
         for (field, value) in [
             ("entry fee", entry_fee_fraction),
             ("exit fee", exit_fee_fraction),
-            ("current impact", current_impact_fraction),
-            ("trailing p99 impact", trailing_p99_impact_fraction),
             ("current funding", current_funding_fraction),
             ("trailing p99 funding", trailing_p99_funding_fraction),
         ] {
@@ -152,8 +239,7 @@ impl ConservativeCosts {
         Ok(Self {
             entry_fee_fraction,
             exit_fee_fraction,
-            current_impact_fraction,
-            trailing_p99_impact_fraction,
+            impact_curve,
             current_funding_fraction,
             trailing_p99_funding_fraction,
             funding_timestamps,
@@ -162,28 +248,22 @@ impl ConservativeCosts {
 
     /// Returns the fixed entry-fee fraction.
     #[must_use]
-    pub const fn entry_fee_fraction(self) -> Decimal {
+    pub const fn entry_fee_fraction(&self) -> Decimal {
         self.entry_fee_fraction
     }
 
     /// Returns the fixed exit-fee fraction.
     #[must_use]
-    pub const fn exit_fee_fraction(self) -> Decimal {
+    pub const fn exit_fee_fraction(&self) -> Decimal {
         self.exit_fee_fraction
     }
 
-    /// Returns `max(2 * current impact, trailing 30-day p99 impact)`.
-    pub fn stressed_impact_fraction(self) -> Result<Decimal, RiskError> {
-        self.current_impact_fraction
-            .checked_mul(Decimal::TWO)
-            .map(|doubled| doubled.max(self.trailing_p99_impact_fraction))
-            .ok_or(RiskError::Arithmetic {
-                operation: "stressed impact",
-            })
+    fn stressed_impact_fraction(&self, notional: Usdc) -> Result<Decimal, RiskError> {
+        self.impact_curve.stressed_fraction(notional)
     }
 
     /// Returns the full-horizon adverse funding reserve fraction.
-    pub fn funding_reserve_fraction(self) -> Result<Decimal, RiskError> {
+    pub fn funding_reserve_fraction(&self) -> Result<Decimal, RiskError> {
         self.current_funding_fraction
             .max(self.trailing_p99_funding_fraction)
             .checked_mul(Decimal::from(self.funding_timestamps))
@@ -297,17 +377,16 @@ impl RiskSnapshot {
             config_digest: config_digest.into(),
             event_digest: event_digest.into(),
         };
-        if [
-            snapshot.ledger_digest.as_str(),
-            snapshot.book_digest.as_str(),
-            snapshot.universe_digest.as_str(),
-            snapshot.config_digest.as_str(),
-            snapshot.event_digest.as_str(),
-        ]
-        .iter()
-        .any(|digest| digest.is_empty())
-        {
-            return Err(RiskInputError::MissingDigest);
+        for (field, digest) in [
+            ("ledger", snapshot.ledger_digest.as_str()),
+            ("book", snapshot.book_digest.as_str()),
+            ("universe", snapshot.universe_digest.as_str()),
+            ("config", snapshot.config_digest.as_str()),
+            ("event", snapshot.event_digest.as_str()),
+        ] {
+            if !is_blake3_digest(digest) {
+                return Err(RiskInputError::InvalidDigest { field });
+            }
         }
         Ok(snapshot)
     }
@@ -348,11 +427,16 @@ impl RiskSnapshot {
             self.config_digest.clone(),
             self.event_digest.clone(),
         ] {
+            let length = value.len() as u64;
+            hasher.update(&length.to_be_bytes());
             hasher.update(value.as_bytes());
-            hasher.update(&[0]);
         }
         hasher.finalize().to_hex().to_string()
     }
+}
+
+fn is_blake3_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Fully frozen inputs for one risk quote calculation.
@@ -408,6 +492,7 @@ pub(crate) struct ApprovedOrder {
     planned_loss: Usdc,
     liquidation: LiquidationResult,
     snapshot_digest: String,
+    freshness: CostQuoteFreshness,
     counterfactuals: [LeverageCounterfactual; 4],
 }
 
@@ -505,6 +590,8 @@ pub enum RiskRejection {
     Liquidation,
     /// The candidate's stressed stop could not remain positive and executable.
     PriceBand,
+    /// The bounded approval cache already contains unconsumed current quotes.
+    ApprovalCapacity,
 }
 
 /// Checked invalid input before quoting begins.
@@ -548,6 +635,27 @@ pub enum RiskInputError {
     /// Every approved-order binding digest is mandatory.
     #[error("risk snapshot requires nonempty ledger, book, universe, config, and event digests")]
     MissingDigest,
+    /// A source digest must be a fixed-width hexadecimal BLAKE3 value.
+    #[error("{field} digest must be a 64-character hexadecimal BLAKE3 digest")]
+    InvalidDigest { field: &'static str },
+    /// Every impact ladder needs at least one band.
+    #[error("impact curve must contain at least one band")]
+    EmptyImpactCurve,
+    /// The final impact band must cover every greater notional.
+    #[error("the final impact band must be open-ended")]
+    ImpactCurveMustBeOpenEnded,
+    /// An open-ended impact band may only appear last.
+    #[error("only the final impact band may be open-ended")]
+    NonterminalOpenImpactBand,
+    /// Finite impact bands must increase strictly by notional.
+    #[error("impact bands must have strictly increasing upper notionals")]
+    NonAscendingImpactBands,
+    /// Exact impact multiplication could not be represented.
+    #[error("impact arithmetic could not be represented")]
+    ImpactArithmetic,
+    /// An adverse impact cannot consume a full price or more.
+    #[error("stressed impact fraction must be below one, got {stressed}")]
+    UnsafeImpactFraction { stressed: Decimal },
 }
 
 /// Risk quote or one-time approval consumption failed.
@@ -597,11 +705,25 @@ impl RiskEngine {
         request: &RiskRequest,
     ) -> Result<RiskQuote, RiskError> {
         let snapshot = &request.snapshot;
+        self.prune_expired(snapshot.as_of_time);
         let source_digest = snapshot.digest();
         let quote_id = self.next_quote_id(&source_digest)?;
         let freshness = CostQuoteFreshness::new(snapshot.as_of_time, snapshot.valid_through)?;
         let source_digests = CostSourceDigests::new(snapshot.book_digest.clone(), source_digest);
-        let (attributions, total_cost) = cost_attributions(request.costs)?;
+        let (attributions, total_cost) =
+            cost_attributions(&request.costs, request.constraints.minimum_notional)?;
+
+        if self.approvals.len() >= MAX_OUTSTANDING_APPROVALS {
+            return self.rejected_quote(
+                quote_id,
+                candidate,
+                freshness,
+                source_digests,
+                total_cost,
+                attributions,
+                Vec::from([RiskRejection::ApprovalCapacity]),
+            );
+        }
 
         let mut rejections = Vec::new();
         if candidate.decision_time() != snapshot.as_of_time {
@@ -622,19 +744,14 @@ impl RiskEngine {
             );
         }
 
-        if stressed_stop(candidate, request.costs.stressed_impact_fraction()?).is_err() {
-            return self.rejected_quote(
-                quote_id,
-                candidate,
-                freshness,
-                source_digests,
-                total_cost,
-                attributions,
-                Vec::from([RiskRejection::PriceBand]),
-            );
-        }
         let some_notional = find_largest_safe_notional(candidate, request)?;
         let Some(entry_notional) = some_notional else {
+            let reason = if maximum_quote_notional(request)? < request.constraints.minimum_notional
+            {
+                RiskRejection::VenueConstraint
+            } else {
+                RiskRejection::RiskBudget
+            };
             return self.rejected_quote(
                 quote_id,
                 candidate,
@@ -642,7 +759,7 @@ impl RiskEngine {
                 source_digests,
                 total_cost,
                 attributions,
-                Vec::from([RiskRejection::RiskBudget]),
+                Vec::from([reason]),
             );
         };
         if entry_notional < request.constraints.minimum_notional {
@@ -692,7 +809,7 @@ impl RiskEngine {
                 Vec::from([RiskRejection::VenueConstraint]),
             );
         }
-        let planned_loss = planned_loss(candidate, rounded_notional, request.costs)?;
+        let planned_loss = planned_loss(candidate, rounded_notional, &request.costs)?;
         if planned_loss > effective_risk_budget(request)? {
             return self.rejected_quote(
                 quote_id,
@@ -730,8 +847,10 @@ impl RiskEngine {
             planned_loss,
             liquidation,
             snapshot_digest: snapshot.digest(),
+            freshness,
             counterfactuals,
         };
+        let (attributions, total_cost) = cost_attributions(&request.costs, rounded_notional)?;
         let quote = CostQuote::new(
             quote_id.clone(),
             candidate.market().clone(),
@@ -761,6 +880,7 @@ impl RiskEngine {
         &mut self,
         intent: &OrderIntent,
         current_snapshot: &RiskSnapshot,
+        at: TimestampNs,
     ) -> Result<ApprovedOrder, RiskError> {
         let quote_id = intent.quote_id();
         let approval = self
@@ -772,6 +892,10 @@ impl RiskEngine {
         }
         if approval.snapshot_digest != current_snapshot.digest() {
             return Err(RiskError::SnapshotChanged);
+        }
+        if !approval.freshness.is_fresh_at(at) {
+            self.approvals.remove(quote_id);
+            return Err(RiskError::UnknownOrConsumedQuote);
         }
         self.approvals
             .remove(quote_id)
@@ -787,6 +911,11 @@ impl RiskEngine {
                 operation: "quote sequence",
             })?;
         QuoteId::new(format!("risk-{index}-{source_digest}")).map_err(RiskError::from)
+    }
+
+    fn prune_expired(&mut self, at: TimestampNs) {
+        self.approvals
+            .retain(|_, approval| approval.freshness.valid_through() >= at);
     }
 
     #[expect(
@@ -833,17 +962,18 @@ fn cost_feasibility_reason(rejection: RiskRejection) -> CostFeasibilityReason {
         RiskRejection::LiquidationDistance | RiskRejection::PriceBand => {
             CostFeasibilityReason::PriceBand
         }
-        RiskRejection::CandidateTimeMismatch | RiskRejection::UniverseDigestMismatch => {
-            CostFeasibilityReason::RiskBlocked
-        }
+        RiskRejection::CandidateTimeMismatch
+        | RiskRejection::UniverseDigestMismatch
+        | RiskRejection::ApprovalCapacity => CostFeasibilityReason::RiskBlocked,
     }
 }
 
 fn cost_attributions(
-    costs: ConservativeCosts,
+    costs: &ConservativeCosts,
+    notional: Usdc,
 ) -> Result<(Vec<CostAttribution>, Decimal), RiskError> {
     let funding = costs.funding_reserve_fraction()?;
-    let impact = costs.stressed_impact_fraction()?;
+    let impact = costs.stressed_impact_fraction(notional)?;
     let attributions = Vec::from([
         CostAttribution::entry_fee(costs.entry_fee_fraction),
         CostAttribution::exit_fee(costs.exit_fee_fraction),
@@ -866,11 +996,7 @@ fn find_largest_safe_notional(
     candidate: &SignalCandidate,
     request: &RiskRequest,
 ) -> Result<Option<Usdc>, RiskError> {
-    let venue_cap = request
-        .constraints
-        .maximum_notional
-        .min(request.constraints.maximum_executable_notional);
-    let cap = venue_cap.min(maximum_margin_notional(request)?);
+    let cap = maximum_quote_notional(request)?;
     let unit_notional = quantity_quantum_notional(
         candidate.reference_entry(),
         request.constraints.quantity_decimals,
@@ -890,7 +1016,7 @@ fn find_largest_safe_notional(
                 operation: "notional bisection midpoint",
             })?;
         let notional = units_to_notional(upper_mid, unit_notional)?;
-        if planned_loss(candidate, notional, request.costs)? <= effective_risk_budget(request)? {
+        if planned_loss(candidate, notional, &request.costs)? <= effective_risk_budget(request)? {
             low = upper_mid;
         } else {
             high = upper_mid.checked_sub(1).ok_or(RiskError::Arithmetic {
@@ -901,6 +1027,14 @@ fn find_largest_safe_notional(
     (low > 0)
         .then(|| units_to_notional(low, unit_notional))
         .transpose()
+}
+
+fn maximum_quote_notional(request: &RiskRequest) -> Result<Usdc, RiskError> {
+    Ok(request
+        .constraints
+        .maximum_notional
+        .min(request.constraints.maximum_executable_notional)
+        .min(maximum_margin_notional(request)?))
 }
 
 fn maximum_margin_notional(request: &RiskRequest) -> Result<Usdc, RiskError> {
@@ -1003,9 +1137,9 @@ fn rounded_quantity(
 fn planned_loss(
     candidate: &SignalCandidate,
     notional: Usdc,
-    costs: ConservativeCosts,
+    costs: &ConservativeCosts,
 ) -> Result<Usdc, RiskError> {
-    let stressed_stop = stressed_stop(candidate, costs.stressed_impact_fraction()?)?;
+    let stressed_stop = stressed_stop(candidate, costs.stressed_impact_fraction(notional)?)?;
     let stop_distance = match candidate.side() {
         Side::Buy => candidate
             .reference_entry()
@@ -1271,8 +1405,8 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use super::{
-        ConservativeCosts, RiskEngine, RiskLimits, RiskRejection, RiskRequest, RiskSnapshot,
-        VenueConstraints,
+        ConservativeCosts, ImpactBand, ImpactCurve, RiskEngine, RiskInputError, RiskLimits,
+        RiskRejection, RiskRequest, RiskSnapshot, VenueConstraints,
     };
     use crate::domain::{Leverage, Market, Price, Side, Sleeve, Usdc};
     use crate::event::TimestampNs;
@@ -1284,6 +1418,21 @@ mod tests {
 
     fn usdc(value: rust_decimal::Decimal) -> Usdc {
         Usdc::new(value).expect("nonnegative synthetic USDC")
+    }
+
+    fn digest(value: char) -> String {
+        value.to_string().repeat(64)
+    }
+
+    fn impact_curve(
+        current_fraction: rust_decimal::Decimal,
+        trailing_p99_fraction: rust_decimal::Decimal,
+    ) -> ImpactCurve {
+        ImpactCurve::new(vec![
+            ImpactBand::new(None, current_fraction, trailing_p99_fraction)
+                .expect("valid open impact band"),
+        ])
+        .expect("complete impact curve")
     }
 
     fn candidate(side: Side) -> SignalCandidate {
@@ -1306,9 +1455,9 @@ mod tests {
             })
             .expect("target"),
             time_exit: TimestampNs::new(2_000).expect("timestamp"),
-            snapshot_digest: "snapshot".into(),
-            universe_digest: "universe".into(),
-            history_digest: "history".into(),
+            snapshot_digest: digest('a'),
+            universe_digest: digest('c'),
+            history_digest: digest('d'),
             explanation_json: "{}".into(),
         })
         .expect("candidate")
@@ -1324,11 +1473,11 @@ mod tests {
                 TimestampNs::new(1_000).expect("timestamp"),
                 TimestampNs::new(1_000).expect("timestamp"),
                 usdc(dec!(100)),
-                "ledger",
-                "book",
-                "universe",
-                "config",
-                "event",
+                digest('a'),
+                digest('b'),
+                digest('c'),
+                digest('d'),
+                digest('e'),
             )
             .expect("snapshot"),
             VenueConstraints::new(
@@ -1349,13 +1498,53 @@ mod tests {
         ConservativeCosts::new(
             dec!(0.00075),
             dec!(0.00075),
-            dec!(0.0005),
-            dec!(0.001),
+            impact_curve(dec!(0.0005), dec!(0.001)),
             dec!(0.0001),
             dec!(0.0002),
             4,
         )
         .expect("costs")
+    }
+
+    #[test]
+    fn impact_costs_are_selected_from_the_proposed_notional_band() {
+        let costs = ConservativeCosts::new(
+            dec!(0.00075),
+            dec!(0.00075),
+            ImpactCurve::new(vec![
+                ImpactBand::new(Some(usdc(dec!(10))), dec!(0.0001), dec!(0.0002))
+                    .expect("small band"),
+                ImpactBand::new(None, dec!(0.005), dec!(0.006)).expect("large band"),
+            ])
+            .expect("complete curve"),
+            dec!(0),
+            dec!(0),
+            0,
+        )
+        .expect("costs");
+        let (_, low_cost) = super::cost_attributions(&costs, usdc(dec!(10))).expect("low cost");
+        let (_, high_cost) =
+            super::cost_attributions(&costs, usdc(dec!(10.001))).expect("high cost");
+
+        assert!(high_cost > low_cost);
+    }
+
+    #[test]
+    fn snapshot_digest_bindings_reject_controls_and_non_hex_text() {
+        let invalid = RiskSnapshot::new(
+            TimestampNs::new(1_000).expect("timestamp"),
+            TimestampNs::new(1_000).expect("timestamp"),
+            usdc(dec!(100)),
+            "a\0b",
+            digest('b'),
+            digest('c'),
+            digest('d'),
+            digest('e'),
+        );
+        assert!(matches!(
+            invalid,
+            Err(RiskInputError::InvalidDigest { field: "ledger" })
+        ));
     }
 
     #[test]
@@ -1381,8 +1570,7 @@ mod tests {
         let high_costs = ConservativeCosts::new(
             dec!(0.003),
             dec!(0.003),
-            dec!(0.004),
-            dec!(0.004),
+            impact_curve(dec!(0.004), dec!(0.004)),
             dec!(0.001),
             dec!(0.001),
             4,
@@ -1410,9 +1598,9 @@ mod tests {
             stop: Price::new(dec!(99)).expect("stop"),
             target: Price::new(dec!(102)).expect("target"),
             time_exit: TimestampNs::new(2_000).expect("timestamp"),
-            snapshot_digest: "snapshot".into(),
-            universe_digest: "universe".into(),
-            history_digest: "history".into(),
+            snapshot_digest: digest('a'),
+            universe_digest: digest('c'),
+            history_digest: digest('d'),
             explanation_json: "{}".into(),
         };
         let mismatched = SignalCandidate::new(specification).expect("candidate");
@@ -1425,23 +1613,11 @@ mod tests {
     }
 
     #[test]
-    fn impossible_stop_impact_fails_closed_without_a_size() {
-        let mut engine = RiskEngine::default();
-        let impact = ConservativeCosts::new(
-            dec!(0.00075),
-            dec!(0.00075),
-            dec!(0.75),
-            dec!(0.75),
-            dec!(0),
-            dec!(0),
-            0,
-        )
-        .expect("costs");
-        let quote = engine
-            .quote_candidate(&candidate(Side::Buy), &request(impact, dec!(0.5)))
-            .expect("public rejected quote");
-        assert_eq!(quote.rejections(), &[RiskRejection::PriceBand]);
-        assert!(!quote.is_approved());
+    fn unsafe_impact_ladder_is_rejected_before_quote() {
+        assert!(matches!(
+            ImpactBand::new(None, dec!(0.75), dec!(0.75)),
+            Err(RiskInputError::UnsafeImpactFraction { .. })
+        ));
     }
 
     #[test]
@@ -1500,20 +1676,20 @@ mod tests {
             request.snapshot().as_of_time(),
             request.snapshot().valid_through(),
             request.snapshot().equity(),
-            "changed-ledger",
-            "book",
-            "universe",
-            "config",
-            "event",
+            digest('f'),
+            digest('b'),
+            digest('c'),
+            digest('d'),
+            digest('e'),
         )
         .expect("changed snapshot");
         assert!(matches!(
-            engine.consume_quote(&intent, &changed),
+            engine.consume_quote(&intent, &changed, request.snapshot().as_of_time()),
             Err(super::RiskError::SnapshotChanged)
         ));
 
         let order = engine
-            .consume_quote(&intent, request.snapshot())
+            .consume_quote(&intent, request.snapshot(), request.snapshot().as_of_time())
             .expect("matching seal consumes once");
         assert!(order.quantity().value() > dec!(0));
         assert!(order.entry_notional().value() > dec!(0));
@@ -1527,8 +1703,45 @@ mod tests {
         assert!(first_counterfactual.isolated_margin.is_some());
         assert!(first_counterfactual.liquidation.is_some());
         assert!(matches!(
-            engine.consume_quote(&intent, request.snapshot()),
+            engine.consume_quote(&intent, request.snapshot(), request.snapshot().as_of_time()),
             Err(super::RiskError::UnknownOrConsumedQuote)
         ));
+    }
+
+    #[test]
+    fn expired_or_excess_unselected_approvals_fail_closed_and_stay_bounded() {
+        let mut engine = RiskEngine::default();
+        let request = request(costs(), dec!(0.5));
+        let candidate = candidate(Side::Buy);
+        let quote = engine
+            .quote_candidate(&candidate, &request)
+            .expect("approved quote");
+        let CostDecision::Accepted(intent) =
+            RulesStrategy::new(RuleConfig::default()).accept_cost(&candidate, quote.cost_quote())
+        else {
+            panic!("cost gate must accept a safe candidate");
+        };
+        assert!(matches!(
+            engine.consume_quote(
+                &intent,
+                request.snapshot(),
+                TimestampNs::new(1_001).expect("expired timestamp"),
+            ),
+            Err(super::RiskError::UnknownOrConsumedQuote)
+        ));
+
+        for _ in 0..super::MAX_OUTSTANDING_APPROVALS {
+            assert!(
+                engine
+                    .quote_candidate(&candidate, &request)
+                    .expect("bounded quote")
+                    .is_approved()
+            );
+        }
+        let overflow = engine
+            .quote_candidate(&candidate, &request)
+            .expect("capacity rejection quote");
+        assert_eq!(overflow.rejections(), &[RiskRejection::ApprovalCapacity]);
+        assert!(!overflow.is_approved());
     }
 }
