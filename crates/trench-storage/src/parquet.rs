@@ -37,6 +37,7 @@ use trench_core::event::{
 
 const PARTITIONS_DIRECTORY: &str = "partitions";
 const CAPTURE_BATCHES_DIRECTORY: &str = "capture-batches";
+const RECOVERY_OUTCOMES_DIRECTORY: &str = "recovery-outcomes";
 const IMPORTS_DIRECTORY: &str = "imports";
 const EVENT_FILE: &str = "events.parquet";
 const MANIFEST_FILE: &str = "manifest.json";
@@ -495,6 +496,8 @@ impl ParquetStore {
         let capture_batches = root.join(CAPTURE_BATCHES_DIRECTORY);
         ensure_private_directory(&capture_batches)?;
         cleanup_staged_capture_batches(&capture_batches)?;
+        let recovery_outcomes = root.join(RECOVERY_OUTCOMES_DIRECTORY);
+        ensure_private_directory(&recovery_outcomes)?;
         Ok(Self { root, provenance })
     }
 
@@ -515,6 +518,7 @@ impl ParquetStore {
         }
         let root = validate_private_root(root)?;
         ensure_existing_private_directory(&root.join(PARTITIONS_DIRECTORY))?;
+        ensure_existing_private_directory(&root.join(RECOVERY_OUTCOMES_DIRECTORY))?;
         Ok(Self { root, provenance })
     }
 
@@ -528,6 +532,18 @@ impl ParquetStore {
     #[must_use]
     pub const fn provenance(&self) -> &DataProvenance {
         &self.provenance
+    }
+
+    pub(crate) fn recovery_outcomes_descriptor(&self) -> Result<File, ParquetError> {
+        #[cfg(not(unix))]
+        {
+            Err(ParquetError::UnsupportedPlatform)
+        }
+        #[cfg(unix)]
+        {
+            let root = open_private_root_descriptor(&self.root)?;
+            open_private_directory_at(&root, RECOVERY_OUTCOMES_DIRECTORY)
+        }
     }
 
     /// Writes one bounded event batch as deterministic, complete partitions.

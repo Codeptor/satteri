@@ -4,7 +4,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::BinaryHeap,
+    collections::{BTreeMap, BTreeSet, BinaryHeap},
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
     path::Path,
@@ -34,6 +34,10 @@ use trench_core::{
 use crate::{
     parquet::{
         DataProvenance, ParquetError, ParquetStore, canonical_event_wire, event_from_canonical_wire,
+    },
+    recovery_outcomes::{
+        MAX_TOTAL_RECOVERY_PROOF_REFERENCES, ReconciledRecoveryOutcome, RecoveryOutcomeStore,
+        RecoverySourceReference,
     },
     research_plan::{
         ResearchMemberLocator, ResearchPlanError, ResearchSourcePlanDraft, ResearchSourcePlanWire,
@@ -66,6 +70,24 @@ pub struct AvailabilityKey {
 }
 
 impl AvailabilityKey {
+    /// Builds one checked source availability coordinate.
+    pub fn new(
+        received_at: TimestampNs,
+        event_time: TimestampNs,
+        event_id: EventId,
+    ) -> Result<Self, ResearchRunError> {
+        if event_time > received_at {
+            return Err(ResearchRunError::InvalidRun {
+                reason: "source event time is later than its receipt time",
+            });
+        }
+        Ok(Self {
+            received_at,
+            event_time,
+            event_id,
+        })
+    }
+
     /// Returns the local receipt time that controls source availability.
     #[must_use]
     pub const fn received_at(&self) -> TimestampNs {
@@ -440,6 +462,7 @@ pub struct ResearchSourcePlan;
 pub struct VerifiedResearchSourcePlan {
     draft: ResearchSourcePlanDraft,
     availability_run: AvailabilityRun,
+    recovery_outcomes: Vec<ReconciledRecoveryOutcome>,
     source_plan_digest: String,
     merge_passes: u16,
 }
@@ -455,6 +478,12 @@ impl VerifiedResearchSourcePlan {
     #[must_use]
     pub const fn availability_run(&self) -> &AvailabilityRun {
         &self.availability_run
+    }
+
+    /// Returns descriptor-revalidated recovery companion outcomes bound to this exact source plan.
+    #[must_use]
+    pub fn recovery_outcomes(&self) -> &[ReconciledRecoveryOutcome] {
+        &self.recovery_outcomes
     }
 
     /// Returns the final digest computed after the verified final availability run exists.
@@ -503,10 +532,11 @@ impl ResearchSourcePlan {
         let run =
             AvailabilityRun::open_bound_at(directory, draft.member_set_digest(), draft.members())?;
         verify_final_manifest(&manifest, &draft, &run)?;
-        verify_final_run_source_union(store, &draft, &run)?;
+        let recovery_outcomes = verify_final_run_source_union(store, &draft, &run)?;
         Ok(VerifiedResearchSourcePlan {
             draft,
             availability_run: run,
+            recovery_outcomes,
             source_plan_digest: manifest.source_plan_digest,
             merge_passes: manifest.merge_passes,
         })
@@ -981,7 +1011,7 @@ fn verify_final_run_source_union(
     store: &ParquetStore,
     draft: &ResearchSourcePlanDraft,
     final_run: &AvailabilityRun,
-) -> Result<(), ResearchRunError> {
+) -> Result<Vec<ReconciledRecoveryOutcome>, ResearchRunError> {
     let mut expected = Vec::with_capacity(draft.members().len());
     for (ordinal, locator) in draft.members().iter().enumerate() {
         let ordinal = u32::try_from(ordinal).map_err(|_| ResearchRunError::ResourceLimit)?;
@@ -1009,6 +1039,20 @@ fn verify_final_run_source_union(
     let mut actual = (0..draft.members().len())
         .map(|_| MemberRecordsHasher::new())
         .collect::<Vec<_>>();
+    let outcome_store = RecoveryOutcomeStore::open(store)?;
+    let mut recovery_outcomes = Vec::with_capacity(draft.recovery_outcomes().len());
+    let mut required_references = BTreeSet::new();
+    for locator in draft.recovery_outcomes() {
+        let outcome = outcome_store.open_member(locator)?;
+        for reference in outcome.source_references() {
+            required_references.insert(reference.clone());
+            if required_references.len() > MAX_TOTAL_RECOVERY_PROOF_REFERENCES {
+                return Err(ResearchRunError::ResourceLimit);
+            }
+        }
+        recovery_outcomes.push(outcome);
+    }
+    let mut observed_references = BTreeMap::new();
     final_run.inspect_verified_records(|reader| {
         while let Some(record) = reader.next_record()? {
             let state = actual
@@ -1020,6 +1064,19 @@ fn verify_final_run_source_union(
                     reason: "final run record member ordinal is outside the selected source set",
                 })?;
             state.update(&record)?;
+            let reference = RecoverySourceReference::new(
+                record.member_manifest_digest().to_owned(),
+                record.key(),
+            )?;
+            if required_references.contains(&reference)
+                && observed_references
+                    .insert(reference, record.event().clone())
+                    .is_some()
+            {
+                return Err(ResearchRunError::InvalidPlan {
+                    reason: "verified final run repeats a recovery source reference",
+                });
+            }
         }
         Ok(())
     })?;
@@ -1032,7 +1089,10 @@ fn verify_final_run_source_union(
             reason: "final run is not the complete exact union of directly reopened source members",
         });
     }
-    Ok(())
+    for outcome in &recovery_outcomes {
+        outcome.verify_result_from_raw(&observed_references)?;
+    }
+    Ok(recovery_outcomes)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1922,6 +1982,9 @@ pub enum ResearchRunError {
     /// Canonical normalized-event encoding or decoding failed.
     #[error(transparent)]
     Storage(#[from] ParquetError),
+    /// A descriptor-bound recovery companion member was invalid or drifted.
+    #[error(transparent)]
+    RecoveryOutcome(#[from] crate::recovery_outcomes::RecoveryOutcomeError),
     /// Canonical JSON metadata failed to encode or decode.
     #[error(transparent)]
     Json(#[from] serde_json::Error),

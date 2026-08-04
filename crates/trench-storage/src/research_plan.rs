@@ -16,9 +16,14 @@ use crate::parquet::{
     CaptureBatchManifest, DataProvenance, OpenedPartitionMember, ParquetError, ParquetStore,
     PartitionIdentity, PartitionManifest,
 };
+use crate::recovery_outcomes::{
+    MAX_TOTAL_RECOVERY_PROOF_REFERENCES, RecoveryOutcomeError, RecoveryOutcomeLocator,
+    RecoveryOutcomeStore,
+};
 
-const SOURCE_PLAN_VERSION: u8 = 1;
+const SOURCE_PLAN_VERSION: u8 = 2;
 const MAX_SOURCE_MEMBERS: usize = 4_096;
+const MAX_RECOVERY_OUTCOMES: usize = 4_096;
 const MAX_COVERAGE_DECLARATIONS: usize = 16_384;
 const MAX_SOURCE_BYTES: usize = 64 * 1_024;
 const MAX_PAGE_CHAIN_PAGES: usize = 128;
@@ -720,6 +725,7 @@ pub struct ResearchSourcePlanDraft {
     provenance: DataProvenance,
     members: Vec<ResearchMemberLocator>,
     coverage: Vec<CoverageDeclaration>,
+    recovery_outcomes: Vec<RecoveryOutcomeLocator>,
     warmup: TimeRange,
     evaluation: TimeRange,
     member_set_digest: String,
@@ -736,6 +742,12 @@ impl ResearchSourcePlanDraft {
     #[must_use]
     pub fn coverage(&self) -> &[CoverageDeclaration] {
         &self.coverage
+    }
+
+    /// Returns path-free immutable recovery companion members selected for this source plan.
+    #[must_use]
+    pub fn recovery_outcomes(&self) -> &[RecoveryOutcomeLocator] {
+        &self.recovery_outcomes
     }
 
     /// Returns the sole pre-run source commitment available in Task 2.
@@ -758,6 +770,7 @@ impl ResearchSourcePlanDraft {
             evaluation: self.evaluation.into(),
             members: &self.members,
             coverage: &self.coverage,
+            recovery_outcomes: &self.recovery_outcomes,
             member_set_digest: &self.member_set_digest,
         };
         match serde_json::to_writer(&mut writer, &wire) {
@@ -775,6 +788,7 @@ impl ResearchSourcePlanDraft {
             evaluation: self.evaluation.into(),
             members: self.members.clone(),
             coverage: self.coverage.clone(),
+            recovery_outcomes: self.recovery_outcomes.clone(),
             member_set_digest: self.member_set_digest.clone(),
         }
     }
@@ -789,11 +803,9 @@ impl ResearchSourcePlanDraft {
         let warmup = wire.warmup.try_range()?;
         let evaluation = wire.evaluation.try_range()?;
         validate_deserialized_coverage(&wire.coverage)?;
-        let draft = ResearchSourcePlanBuilder::new(warmup, evaluation)?.build(
-            store,
-            wire.members,
-            wire.coverage,
-        )?;
+        let draft = ResearchSourcePlanBuilder::new(warmup, evaluation)?
+            .with_recovery_outcomes(wire.recovery_outcomes)?
+            .build(store, wire.members, wire.coverage)?;
         if draft.provenance != wire.provenance || draft.member_set_digest != wire.member_set_digest
         {
             return Err(ResearchPlanError::InvalidFinalPlan);
@@ -828,6 +840,7 @@ pub(crate) struct ResearchSourcePlanWire {
     pub(crate) evaluation: TimeRangeWire,
     pub(crate) members: Vec<ResearchMemberLocator>,
     pub(crate) coverage: Vec<CoverageDeclaration>,
+    pub(crate) recovery_outcomes: Vec<RecoveryOutcomeLocator>,
     pub(crate) member_set_digest: String,
 }
 
@@ -836,6 +849,7 @@ pub(crate) struct ResearchSourcePlanWire {
 pub struct ResearchSourcePlanBuilder {
     warmup: TimeRange,
     evaluation: TimeRange,
+    recovery_outcomes: Vec<RecoveryOutcomeLocator>,
 }
 
 impl ResearchSourcePlanBuilder {
@@ -844,7 +858,30 @@ impl ResearchSourcePlanBuilder {
         if warmup.end() != evaluation.start() {
             return Err(ResearchPlanError::InvalidWindows);
         }
-        Ok(Self { warmup, evaluation })
+        Ok(Self {
+            warmup,
+            evaluation,
+            recovery_outcomes: Vec::new(),
+        })
+    }
+
+    /// Selects exact immutable recovery companion members for later causal compilation.
+    pub fn with_recovery_outcomes(
+        mut self,
+        mut recovery_outcomes: Vec<RecoveryOutcomeLocator>,
+    ) -> Result<Self, ResearchPlanError> {
+        if recovery_outcomes.len() > MAX_RECOVERY_OUTCOMES {
+            return Err(ResearchPlanError::ResourceLimit);
+        }
+        recovery_outcomes.sort();
+        if recovery_outcomes.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(ResearchPlanError::InvalidRecoveryOutcome);
+        }
+        for locator in &recovery_outcomes {
+            locator.validate()?;
+        }
+        self.recovery_outcomes = recovery_outcomes;
+        Ok(self)
     }
 
     /// Resolves every member without discovery and returns an unpublishable draft.
@@ -890,6 +927,23 @@ impl ResearchSourcePlanBuilder {
             manifests.insert(actual.manifest_digest(), actual.clone());
         }
         let provenance = provenance.expect("nonempty members establish provenance");
+        let outcome_store = RecoveryOutcomeStore::open(store)?;
+        let mut outcome_references = 0_usize;
+        for locator in &self.recovery_outcomes {
+            let outcome = outcome_store.open_member(locator)?;
+            outcome_references = outcome_references
+                .checked_add(outcome.source_references().count())
+                .ok_or(ResearchPlanError::ResourceLimit)?;
+            if outcome_references > MAX_TOTAL_RECOVERY_PROOF_REFERENCES {
+                return Err(ResearchPlanError::ResourceLimit);
+            }
+            if outcome
+                .source_references()
+                .any(|reference| !manifest_digests.contains(reference.member_manifest_digest()))
+            {
+                return Err(ResearchPlanError::InvalidRecoveryOutcome);
+            }
+        }
         coverage.sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
         self.validate_coverage_ranges(&coverage)?;
         let mut validator = CoverageValidator::new(&coverage, &manifests)?;
@@ -905,6 +959,7 @@ impl ResearchSourcePlanBuilder {
             provenance,
             members,
             coverage,
+            recovery_outcomes: self.recovery_outcomes,
             warmup: self.warmup,
             evaluation: self.evaluation,
             member_set_digest,
@@ -1234,6 +1289,7 @@ struct ResearchSourcePlanDraftWire<'a> {
     evaluation: TimeRangeWire,
     members: &'a [ResearchMemberLocator],
     coverage: &'a [CoverageDeclaration],
+    recovery_outcomes: &'a [RecoveryOutcomeLocator],
     member_set_digest: &'a str,
 }
 
@@ -1321,6 +1377,9 @@ pub enum ResearchPlanError {
     /// Exact member resolution failed.
     #[error(transparent)]
     Storage(#[from] ParquetError),
+    /// A descriptor-bound recovery companion member was invalid or drifted.
+    #[error(transparent)]
+    RecoveryOutcome(#[from] RecoveryOutcomeError),
     /// No exact committed source member was selected.
     #[error("research source plan requires at least one member")]
     EmptyMembers,
@@ -1342,6 +1401,9 @@ pub enum ResearchPlanError {
     /// A proof, boundary, digest, or referenced source row was invalid.
     #[error("research continuity evidence is invalid")]
     InvalidCoverageEvidence,
+    /// A selected recovery companion did not bind only selected raw members.
+    #[error("research recovery companion evidence is invalid")]
+    InvalidRecoveryOutcome,
     /// A bounded source-plan input or canonical JSON output exceeded its limit.
     #[error("research source plan resource limit exceeded")]
     ResourceLimit,
