@@ -77,6 +77,16 @@ impl ExitReason {
             Self::Stop | Self::Breaker | Self::Dust | Self::Liquidation
         )
     }
+
+    const fn mandatory_severity(self) -> u8 {
+        match self {
+            Self::Liquidation => 4,
+            Self::Breaker => 3,
+            Self::Stop => 2,
+            Self::Dust => 1,
+            Self::Strategy | Self::TakeProfit | Self::Time | Self::OppositeSignal => 0,
+        }
+    }
 }
 
 /// Purpose of one primary taker walk.
@@ -224,11 +234,11 @@ impl ExecutableBook {
         Ok(Self { book, as_of_time })
     }
 
-    fn book(&self) -> &OrderBook {
+    pub(crate) fn book(&self) -> &OrderBook {
         &self.book
     }
 
-    fn as_of_time(&self) -> TimestampNs {
+    pub(crate) const fn as_of_time(&self) -> TimestampNs {
         self.as_of_time
     }
 }
@@ -496,6 +506,7 @@ pub struct BrokerPosition {
     leverage: Leverage,
     liquidation: Option<LiquidationResult>,
     funding: SignedUsdc,
+    planned_loss: Usdc,
 }
 
 impl BrokerPosition {
@@ -535,6 +546,11 @@ impl BrokerPosition {
     #[must_use]
     pub const fn funding(&self) -> SignedUsdc {
         self.funding
+    }
+    /// Returns the sealed risk-budget loss that admitted this paper position.
+    #[must_use]
+    pub const fn planned_loss(&self) -> Usdc {
+        self.planned_loss
     }
 }
 
@@ -715,6 +731,7 @@ struct PaperOrder {
     stop: Price,
     target: Price,
     tiers: MaintenanceTiers,
+    planned_loss: Usdc,
 }
 
 impl PaperOrder {
@@ -734,6 +751,7 @@ impl PaperOrder {
             stop: candidate.stop(),
             target: candidate.target(),
             tiers: approved.maintenance_tiers().clone(),
+            planned_loss: approved.planned_loss(),
         }
     }
 }
@@ -799,6 +817,7 @@ impl ActivePosition {
                 leverage: order.leverage,
                 liquidation: None,
                 funding: SignedUsdc::zero(),
+                planned_loss: order.planned_loss,
             },
             collateral,
             tiers: order.tiers,
@@ -1010,6 +1029,12 @@ impl PaperBroker {
         &self.context
     }
 
+    /// Returns the frozen maximum source-book age accepted by this paper broker.
+    #[must_use]
+    pub const fn maximum_book_age(&self) -> DurationNs {
+        self.config.maximum_book_age()
+    }
+
     /// Queues one risk-sealed order. No public API can construct this order.
     #[allow(
         dead_code,
@@ -1060,6 +1085,7 @@ impl PaperBroker {
         &mut self,
         executable: &ExecutableBook,
     ) -> Result<Option<BrokerTransition>, BrokerError> {
+        self.ensure_market_input_allowed()?;
         let book = executable.book();
         self.ensure_fresh_execution_book(executable)?;
         let transition = match self.state {
@@ -1080,6 +1106,7 @@ impl PaperBroker {
         &mut self,
         observation: &ExecutableMark,
     ) -> Result<Option<BrokerTransition>, BrokerError> {
+        self.ensure_market_input_allowed()?;
         let at = observation.received_at();
         let mark_price = observation.price();
         let active = matches!(
@@ -1142,6 +1169,7 @@ impl PaperBroker {
         reason: ExitReason,
         observation: &ExecutableMark,
     ) -> Result<BrokerTransition, BrokerError> {
+        self.ensure_market_input_allowed()?;
         let at = observation.received_at();
         let mark_price = observation.price();
         let position = self.require_position()?;
@@ -1211,6 +1239,7 @@ impl PaperBroker {
         &mut self,
         observation: &ExecutableFunding,
     ) -> Result<BrokerTransition, BrokerError> {
+        self.ensure_market_input_allowed()?;
         let venue_at = observation.venue_at();
         let observed_at = observation.received_at();
         let mark_price = observation.mark_price();
@@ -1620,10 +1649,15 @@ impl PaperBroker {
 
     fn start_mandatory(&mut self, request: ExitRequest) {
         self.normal_exit = None;
-        self.mandatory_exit = Some(MandatoryExit {
-            request,
-            next_band: None,
+        let replaces_current = self.mandatory_exit.as_ref().is_none_or(|current| {
+            request.reason.mandatory_severity() > current.request.reason.mandatory_severity()
         });
+        if replaces_current {
+            self.mandatory_exit = Some(MandatoryExit {
+                request,
+                next_band: None,
+            });
+        }
         self.state = BrokerState::MandatoryExit;
     }
 
@@ -1763,6 +1797,13 @@ impl PaperBroker {
         Ok(())
     }
 
+    fn ensure_market_input_allowed(&self) -> Result<(), BrokerError> {
+        if self.state == BrokerState::Unresolved {
+            return Err(BrokerError::TerminalState { state: self.state });
+        }
+        Ok(())
+    }
+
     fn causal_boundary(&self) -> TimestampNs {
         self.last_transition_at.max(self.latest_seen_as_of)
     }
@@ -1808,6 +1849,8 @@ pub enum BrokerError {
     NoOpenPosition,
     #[error("exit is unavailable while broker state is {state:?}")]
     ExitUnavailable { state: BrokerState },
+    #[error("market input is unavailable after terminal broker state {state:?}")]
+    TerminalState { state: BrokerState },
     #[error("pending-entry state had no sealed order")]
     MissingPendingEntry,
     #[error("normal-exit state had no request")]
@@ -2450,6 +2493,56 @@ mod tests {
         assert!(fill_index < loss_index);
     }
 
+    #[test]
+    fn liquidation_reason_cannot_be_downgraded_by_a_later_stop_before_backstop() {
+        let mut broker = opened_long();
+        broker
+            .observe_mark(&mark(30, dec!(80), 0))
+            .expect("liquidation mark")
+            .expect("liquidation transition");
+        broker
+            .observe_mark(&mark(31, dec!(95), 0))
+            .expect("later stop mark")
+            .expect("stop observation transition");
+        let transition = broker
+            .on_executable_book(&executable(
+                book(32, 32, 3, dec!(70), dec!(71), dec!(0.1)),
+                32,
+                0,
+            ))
+            .expect("liquidation execution")
+            .expect("liquidation transition");
+
+        assert!(transition.records().iter().any(|record| matches!(
+            record,
+            BrokerRecord::TakerFill {
+                role: ExecutionRole::Liquidation,
+                ..
+            }
+        )));
+        assert!(
+            transition
+                .records()
+                .iter()
+                .any(|record| matches!(record, BrokerRecord::LiquidationLoss { .. }))
+        );
+    }
+
+    #[test]
+    fn unresolved_broker_rejects_later_market_inputs_without_mutation() {
+        let mut broker = opened_long();
+        broker.end_of_data(time(30)).expect("end of data");
+        let funding = funding(31, dec!(100), dec!(0.01), 0);
+        assert!(matches!(
+            broker.apply_funding(&funding),
+            Err(BrokerError::TerminalState {
+                state: BrokerState::Unresolved
+            })
+        ));
+        assert_eq!(broker.state(), BrokerState::Unresolved);
+        assert!(broker.position().is_some());
+    }
+
     fn broker() -> PaperBroker {
         PaperBroker::new(
             BrokerConfig::new(Usdc::new(dec!(1)).expect("minimum"), duration(1_000))
@@ -2486,6 +2579,7 @@ mod tests {
             stop: price(dec!(96)),
             target: price(dec!(108)),
             tiers: tiers(),
+            planned_loss: Usdc::new(dec!(0.50)).expect("planned loss"),
         }
     }
 
