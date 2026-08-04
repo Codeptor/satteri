@@ -226,6 +226,7 @@ pub enum RecoveryEvidence<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryResult {
     request: GapRecoveryRequest,
+    completed_through: TimestampNs,
     status: RecoveryStatus,
     source: RecoverySource,
     backfill_events: Vec<MarketEvent>,
@@ -236,6 +237,14 @@ impl RecoveryResult {
     #[must_use]
     pub const fn request(&self) -> &GapRecoveryRequest {
         &self.request
+    }
+
+    /// Returns the completed common candle boundary through which evidence was
+    /// evaluated. The request's fresh L2 snapshot remains its immutable
+    /// recovery anchor even when evidence had to wait for a later bar close.
+    #[must_use]
+    pub const fn completed_through(&self) -> TimestampNs {
+        self.completed_through
     }
 
     /// Returns whether independently supplied trade and candle evidence
@@ -305,6 +314,9 @@ pub enum RecoveryUnavailable {
     /// The documented public candle endpoint could not provide the requested
     /// verified comparison facts.
     OfficialCandleEvidenceUnavailable,
+    /// The bounded local source-evidence window filled before the pending gap
+    /// could reach its completed reconciliation boundary.
+    LocalTradeEvidenceCapacity,
     /// Local trade aggregation did not exactly match the supplied official
     /// candle snapshots.
     CandleConflict,
@@ -344,6 +356,23 @@ impl GapRecovery {
     #[must_use]
     pub fn next_request(&self) -> Option<&GapRecoveryRequest> {
         self.queue.front()
+    }
+
+    /// Returns whether one or more queued requests still need source evidence
+    /// for `market`.
+    #[must_use]
+    pub fn has_pending_market(&self, market: &Market) -> bool {
+        self.queue.iter().any(|request| request.market() == market)
+    }
+
+    /// Borrows queued requests for one market in FIFO order.
+    pub(crate) fn pending_requests_for_market(
+        &self,
+        market: &Market,
+    ) -> impl Iterator<Item = &GapRecoveryRequest> {
+        self.queue
+            .iter()
+            .filter(move |request| request.market() == market)
     }
 
     /// Returns only verified archived L2 facts for durable import.
@@ -433,7 +462,36 @@ impl GapRecovery {
         let Some(request) = self.queue.front().cloned() else {
             return Ok(None);
         };
-        let result = reconcile(&request, evidence, candles)?;
+        self.process_next_through(evidence, request.snapshot_event_time, candles)
+    }
+
+    /// Processes the oldest request using evidence complete through an
+    /// explicit common candle boundary.
+    ///
+    /// The request remains anchored to its original fresh L2 snapshot. A
+    /// producer may wait for a later completed boundary when that snapshot
+    /// landed mid-bar, but it may never substitute another snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without dequeuing when the supplied boundary predates
+    /// the immutable snapshot or the evidence cannot be reconciled.
+    pub fn process_next_through(
+        &mut self,
+        evidence: RecoveryEvidence<'_>,
+        completed_through: TimestampNs,
+        candles: &mut CandleAggregator,
+    ) -> Result<Option<RecoveryResult>, RecoveryError> {
+        let Some(request) = self.queue.front().cloned() else {
+            return Ok(None);
+        };
+        if completed_through < request.snapshot_event_time() {
+            return Err(RecoveryError::EvidenceBeforeSnapshot {
+                snapshot: request.snapshot_event_time(),
+                completed_through,
+            });
+        }
+        let result = reconcile(&request, evidence, completed_through, candles)?;
         let popped = self.queue.pop_front().ok_or(RecoveryError::Invariant {
             reason: "queued recovery head must remain present",
         })?;
@@ -487,6 +545,15 @@ pub enum RecoveryError {
         /// Maximum retained completed request identities.
         limit: usize,
     },
+    /// The explicit evidence boundary predates the immutable fresh L2
+    /// snapshot that anchors this recovery request.
+    #[error("recovery evidence boundary {completed_through} predates fresh snapshot {snapshot}")]
+    EvidenceBeforeSnapshot {
+        /// Immutable fresh L2 recovery-point time.
+        snapshot: TimestampNs,
+        /// Caller-supplied completed candle boundary.
+        completed_through: TimestampNs,
+    },
     /// Caller-supplied synchronous evidence exceeded its fixed processing bound.
     #[error("recovery evidence field `{field}` has {count} records, exceeding {limit}")]
     EvidenceCapacity {
@@ -537,6 +604,7 @@ pub enum RecoveryError {
 fn reconcile(
     request: &GapRecoveryRequest,
     evidence: RecoveryEvidence<'_>,
+    completed_through: TimestampNs,
     candles: &mut CandleAggregator,
 ) -> Result<RecoveryResult, RecoveryError> {
     let (status, source, backfill_events) = match evidence {
@@ -544,8 +612,13 @@ fn reconcile(
             local_trades,
             official_candles,
         } => {
-            let (status, backfill_events) =
-                reconcile_trades(request, local_trades, official_candles, candles)?;
+            let (status, backfill_events) = reconcile_trades(
+                request,
+                local_trades,
+                official_candles,
+                completed_through,
+                candles,
+            )?;
             (
                 status,
                 RecoverySource::LocalTradesAndOfficialCandles,
@@ -574,6 +647,7 @@ fn reconcile(
     };
     Ok(RecoveryResult {
         request: request.clone(),
+        completed_through,
         status,
         source,
         backfill_events,
@@ -584,6 +658,7 @@ fn reconcile_trades(
     request: &GapRecoveryRequest,
     local_trades: &[MarketEvent],
     official_candles: &[Candle],
+    completed_through: TimestampNs,
     candles: &mut CandleAggregator,
 ) -> Result<(RecoveryStatus, Vec<MarketEvent>), RecoveryError> {
     if local_trades.len() > MAX_RECOVERY_LOCAL_TRADES {
@@ -601,7 +676,7 @@ fn reconcile_trades(
         });
     }
     for event in local_trades {
-        validate_trade(request, event)?;
+        validate_trade(request, event, completed_through)?;
     }
     for candle in official_candles {
         if candle.market() != request.market() {
@@ -614,7 +689,7 @@ fn reconcile_trades(
 
     let unavailable_reason = if request.trade_predecessor_event_time.is_none() {
         Some(RecoveryUnavailable::MissingTradePredecessor)
-    } else if !all_required_sleeves_closed(request) {
+    } else if !all_required_sleeves_closed(completed_through) {
         Some(RecoveryUnavailable::IncompleteSleeves)
     } else {
         None
@@ -623,7 +698,7 @@ fn reconcile_trades(
         return mark_unavailable(request, candles, reason).map(|status| (status, Vec::new()));
     }
 
-    let Some(expected_candle_keys) = required_candle_keys(request) else {
+    let Some(expected_candle_keys) = required_candle_keys(request, completed_through) else {
         return mark_unavailable(
             request,
             candles,
@@ -644,20 +719,27 @@ fn reconcile_trades(
     for event in local_trades {
         candidate.ingest(event)?;
     }
-    let completed =
-        candidate.complete_market_through(request.market(), request.snapshot_event_time)?;
+    let completed = candidate.complete_market_through(request.market(), completed_through)?;
     if candles_match(&expected_candle_keys, &completed, official_candles) {
         *candles = candidate;
         return Ok((
             RecoveryStatus::Reconciled { candles: completed },
-            local_trades.to_vec(),
+            local_trades
+                .iter()
+                .filter(|event| event.event_time() < request.snapshot_event_time())
+                .cloned()
+                .collect(),
         ));
     }
     mark_unavailable(request, candles, RecoveryUnavailable::CandleConflict)
         .map(|status| (status, Vec::new()))
 }
 
-fn validate_trade(request: &GapRecoveryRequest, event: &MarketEvent) -> Result<(), RecoveryError> {
+fn validate_trade(
+    request: &GapRecoveryRequest,
+    event: &MarketEvent,
+    completed_through: TimestampNs,
+) -> Result<(), RecoveryError> {
     if !matches!(event.kind(), MarketEventKind::Trade(_)) {
         return Err(RecoveryError::ExpectedTrade {
             event_id: event.event_id().clone(),
@@ -681,7 +763,7 @@ fn validate_trade(request: &GapRecoveryRequest, event: &MarketEvent) -> Result<(
                 .then_with(|| event.event_id().cmp(event_id))
                 .is_gt()
         });
-    if !after_predecessor || event.event_time() >= request.snapshot_event_time {
+    if !after_predecessor || event.event_time() >= completed_through {
         return Err(RecoveryError::TradeOutsideGap {
             event_id: event.event_id().clone(),
         });
@@ -689,15 +771,14 @@ fn validate_trade(request: &GapRecoveryRequest, event: &MarketEvent) -> Result<(
     Ok(())
 }
 
-fn all_required_sleeves_closed(request: &GapRecoveryRequest) -> bool {
+fn all_required_sleeves_closed(completed_through: TimestampNs) -> bool {
     [
         CoreCandleInterval::FifteenMinutes,
         CoreCandleInterval::OneHour,
     ]
     .into_iter()
     .all(|interval| {
-        request
-            .snapshot_event_time
+        completed_through
             .value()
             .rem_euclid(interval.duration().value())
             == 0
@@ -706,7 +787,10 @@ fn all_required_sleeves_closed(request: &GapRecoveryRequest) -> bool {
 
 type CandleKey = (CoreCandleInterval, TimestampNs);
 
-fn required_candle_keys(request: &GapRecoveryRequest) -> Option<BTreeSet<CandleKey>> {
+fn required_candle_keys(
+    request: &GapRecoveryRequest,
+    completed_through: TimestampNs,
+) -> Option<BTreeSet<CandleKey>> {
     let start = request.trade_predecessor_event_time?;
     let mut expected = BTreeSet::new();
     for interval in [
@@ -718,9 +802,9 @@ fn required_candle_keys(request: &GapRecoveryRequest) -> Option<BTreeSet<CandleK
             .value()
             .checked_sub(start.value().rem_euclid(duration.value()))?;
         let mut open = TimestampNs::new(i128::from(first_open)).ok()?;
-        while open < request.snapshot_event_time {
+        while open < completed_through {
             let close = open.checked_add(duration).ok()?;
-            if close > start && close <= request.snapshot_event_time {
+            if close > start && close <= completed_through {
                 if expected.len() == MAX_RECOVERY_OFFICIAL_CANDLES {
                     return None;
                 }
