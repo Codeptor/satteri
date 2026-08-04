@@ -11,12 +11,9 @@ use tokio_util::sync::CancellationToken;
 use trench_core::broker::{BrokerConfig, BrokerRunContext, PaperBroker};
 use trench_core::config::PaperConfig;
 use trench_core::domain::{LedgerId, RunId, Usdc};
-use trench_core::engine::{
-    Engine, EngineContext, EngineEvent, EngineState, SnapshotBindings, StrategyFingerprints,
-};
-use trench_core::event::{DurationNs, MarketEvent, MarketEventKind, TimestampNs};
+use trench_core::engine::{Engine, EngineContext, EngineState};
+use trench_core::event::{DurationNs, MarketEvent, TimestampNs};
 use trench_core::ledger::LedgerState;
-use trench_core::universe::UniverseSelector;
 use trench_hyperliquid::{GapEvent, InfoClient, WsClient, WsConfig, WsOutput, WsStream};
 use trench_storage::parquet::{DataProvenance, ParquetError, ParquetStore};
 use trench_storage::replay::{DeterministicReplay, ReplayError, ReplayPlan};
@@ -25,10 +22,12 @@ use crate::admin::{
     AdminError, AdminServer, AuthorityRequest, DaemonMode, DaemonStatus, authority_channel,
 };
 use crate::commands::RulesStartup;
+use crate::execution::{MarketRoute, RoutingError, TypedEngineEvent, TypedMarketRouter};
 use crate::readiness::Readiness;
 use crate::writer::{EngineWriter, SourceEvent, WriterError};
 
 const SOURCE_CHANNEL_CAPACITY: usize = 128;
+const MAXIMUM_BOOK_AGE_NS: i64 = 1_000_000_000;
 
 /// One requested daemon lifecycle mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,9 +36,9 @@ pub enum RuntimeMode {
     Collect,
     /// Start the long-lived observation daemon without an active strategy reactor.
     ///
-    /// This mode exposes readiness for a later strategy activation, but it is
-    /// deliberately non-executing until typed recovery and strategy adapters
-    /// are installed as one atomic authority path.
+    /// This mode persists typed non-entry transitions but cannot produce a
+    /// rules entry until a verified artifact, point-in-time universe, feature,
+    /// and recovery inputs are activated together.
     Run,
 }
 
@@ -67,6 +66,7 @@ struct RecoveredSource {
 
 struct AuthorityState {
     engine_state: Option<EngineState>,
+    router: TypedMarketRouter,
     readiness: Readiness,
     reconciled: bool,
 }
@@ -101,6 +101,7 @@ pub async fn run(
         });
     let mut authority = AuthorityState {
         engine_state: Some(initial_engine_state(writer.run_id(), initial_at_ns)?),
+        router: TypedMarketRouter::new(maximum_book_age()?),
         readiness: Readiness::default(),
         reconciled: false,
     };
@@ -118,7 +119,7 @@ pub async fn run(
     }
     tracing::info!(
         mode = ?mode,
-        "strategy/recovery reactors are not active; daemon is sealed collection-only"
+        "entry reactor is sealed collection-only; missing recovery evidence keeps execution fenced"
     );
     let cancellation = CancellationToken::new();
     let (source_sender, mut source_receiver) = mpsc::channel(SOURCE_CHANNEL_CAPACITY);
@@ -130,7 +131,7 @@ pub async fn run(
         cancellation.clone(),
     ));
     while let Some(event) = source_receiver.recv().await {
-        admit_source_event(&mut writer, &mut authority, event).await?;
+        admit_market_event(&mut writer, &mut authority, event).await?;
     }
     replay_task.await.map_err(AppError::ReplayProducerJoin)?;
     authority.reconciled = true;
@@ -180,22 +181,21 @@ pub async fn run(
                 match output {
                     Some(WsOutput::MarketEvent(event)) => {
                         parquet_store.write_events(std::slice::from_ref(&event))?;
-                        update_readiness_from_market_event(&mut authority.readiness, &event);
-                        admit_source_event(&mut writer, &mut authority, event).await?;
+                        admit_market_event(&mut writer, &mut authority, event).await?;
                     }
                     Some(WsOutput::Gap(gap)) => {
+                        authority.router.open_gap(&gap);
                         let market = gap_market(&gap).clone();
-                        if let Some(gates) = authority.readiness.market_gates_mut(&market) {
-                            gates.set_recovered(false);
-                            gates.set_executable_book(false);
-                        }
+                        mark_market_execution_blocked(&mut authority.readiness, market);
                     }
                     Some(WsOutput::RecoveryRequest(request)) => {
                         let market = request.market().clone();
-                        if let Some(gates) = authority.readiness.market_gates_mut(&market) {
-                            gates.set_recovered(false);
-                            gates.set_executable_book(false);
-                        }
+                        mark_market_execution_blocked(&mut authority.readiness, market);
+                        tracing::warn!(
+                            market = request.market().as_str(),
+                            generation = request.generation(),
+                            "recovery evidence is unavailable; market remains execution-fenced"
+                        );
                     }
                     Some(WsOutput::Rejected(_)) => {}
                     Some(WsOutput::Terminal(_)) | None => {
@@ -343,16 +343,31 @@ async fn open_live_stream(config: &PaperConfig, readiness: &mut Readiness) -> Op
     }
 }
 
-fn update_readiness_from_market_event(readiness: &mut Readiness, event: &MarketEvent) {
+fn mark_market_execution_blocked(readiness: &mut Readiness, market: trench_core::domain::Market) {
+    readiness.register_market(market.clone());
+    if let Some(gates) = readiness.market_gates_mut(&market) {
+        gates.set_data_quality_valid(true);
+        gates.set_common_features_warm(false);
+        gates.set_recovered(false);
+        gates.set_executable_book(false);
+    }
+}
+
+fn update_readiness_from_typed_event(readiness: &mut Readiness, event: &TypedEngineEvent) {
     readiness.set_stream_connected(true);
     readiness.register_market(event.market().clone());
     if let Some(gates) = readiness.market_gates_mut(event.market()) {
         gates.set_data_quality_valid(true);
         gates.set_common_features_warm(false);
-        if matches!(event.kind(), MarketEventKind::BookSnapshot(_)) {
-            // An initial WebSocket snapshot has not yet completed a full gap
-            // recovery/backfill cycle, so it is deliberately not `recovered`.
-            gates.set_executable_book(true);
+        match event {
+            TypedEngineEvent::MarketRecovered { .. } => {
+                gates.set_recovered(true);
+                gates.set_executable_book(false);
+            }
+            TypedEngineEvent::ExecutableBook { .. } => gates.set_executable_book(true),
+            TypedEngineEvent::AdvanceTime { .. }
+            | TypedEngineEvent::MarketMark { .. }
+            | TypedEngineEvent::FundingObserved { .. } => {}
         }
     }
 }
@@ -364,64 +379,65 @@ fn gap_market(gap: &GapEvent) -> &trench_core::domain::Market {
     }
 }
 
-/// Durably records source-clock progression without interpreting an event as a
-/// trade, mark, book, funding, or recovery transition.
+/// Routes one normalized source fact through a typed execution fence.
 ///
-/// A typed market/recovery adapter must be introduced together with strategy
-/// activation. Until then this boundary is intentionally collection-only: it
-/// cannot create positions, submit entry candidates, or route exits.
-async fn admit_source_event(
+/// Facts that do not carry executable semantics retain an explicit source-clock
+/// transition. Marks, funding, and books require a verified recovery boundary;
+/// an unavailable boundary leaves the fact in atomic Parquet only and never
+/// fabricates an engine or broker transition.
+async fn admit_market_event(
     writer: &mut EngineWriter,
     authority: &mut AuthorityState,
     event: MarketEvent,
 ) -> Result<(), AppError> {
+    match authority.router.route_market_event(event)? {
+        MarketRoute::Engine(events) => {
+            for event in events {
+                admit_typed_engine_event(writer, authority, event).await?;
+            }
+        }
+        MarketRoute::Blocked { market, reason } => {
+            mark_market_execution_blocked(&mut authority.readiness, market.clone());
+            tracing::debug!(
+                market = market.as_str(),
+                reason = ?reason,
+                "normalized source fact is retained but execution-fenced"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Admits one already-typed source transition through the sole SQLite writer.
+async fn admit_typed_engine_event(
+    writer: &mut EngineWriter,
+    authority: &mut AuthorityState,
+    event: TypedEngineEvent,
+) -> Result<(), AppError> {
     let source = SourceEvent::new(
         writer.run_id(),
         event.event_id().as_str(),
-        event.event_time().value(),
-        market_event_kind_code(event.kind()),
-        market_event_payload(&event)?,
+        event.at().value(),
+        event.source_kind(),
+        event.source_payload_json()?,
     );
     let prior = authority
         .engine_state
         .take()
         .ok_or(AppError::MissingEngineState)?;
-    let event_id = event.event_id().clone();
-    let at = event.event_time();
+    let readiness_event = event.clone();
     let outcome = writer
         .admit_apply_append(LedgerId::RulesOnly, &source, move |admission| {
             Engine::apply(
-                EngineEvent::AdvanceTime { event_id, at },
+                event.into_engine_event(),
                 prior,
-                &engine_context(admission)?,
+                &EngineContext::passive(admission),
             )
         })
         .await?;
     authority.engine_state = Some(outcome.into_parts().0);
+    update_readiness_from_typed_event(&mut authority.readiness, &readiness_event);
     Ok(())
-}
-
-fn market_event_kind_code(kind: &MarketEventKind) -> &'static str {
-    match kind {
-        MarketEventKind::Metadata(_) => "metadata",
-        MarketEventKind::AssetContext(_) => "asset_context",
-        MarketEventKind::BookSnapshot(_) => "book_snapshot",
-        MarketEventKind::Bbo(_) => "bbo",
-        MarketEventKind::Trade(_) => "trade",
-        MarketEventKind::Funding(_) => "funding",
-        MarketEventKind::CompletedCandle(_) => "completed_candle",
-    }
-}
-
-fn market_event_payload(event: &MarketEvent) -> Result<String, AppError> {
-    serde_json::to_string(&serde_json::json!({
-        "schema_version": 1,
-        "market": event.market().as_str(),
-        "event_time_ns": event.event_time().value(),
-        "received_at_ns": event.received_at().value(),
-        "kind": market_event_kind_code(event.kind()),
-    }))
-    .map_err(AppError::Json)
 }
 
 fn initial_engine_state(run_id: &str, opened_at_ns: i64) -> Result<EngineState, AppError> {
@@ -432,7 +448,7 @@ fn initial_engine_state(run_id: &str, opened_at_ns: i64) -> Result<EngineState, 
     let broker = PaperBroker::new(
         BrokerConfig::new(
             Usdc::new(rust_decimal::Decimal::ONE).map_err(|_| AppError::InitialEngineState)?,
-            DurationNs::new(1_000_000_000).map_err(|_| AppError::InitialEngineState)?,
+            maximum_book_age()?,
         )
         .map_err(|_| AppError::InitialEngineState)?,
         BrokerRunContext::new(
@@ -446,20 +462,8 @@ fn initial_engine_state(run_id: &str, opened_at_ns: i64) -> Result<EngineState, 
     Ok(EngineState::new(ledger, broker, BTreeMap::new()))
 }
 
-fn engine_context(
-    admission: trench_core::engine::EventAdmission,
-) -> Result<EngineContext, trench_core::engine::EngineError> {
-    let initial =
-        TimestampNs::new(0).map_err(|_| trench_core::engine::EngineError::MissingVerifiedSource)?;
-    let snapshot = UniverseSelector::select(initial, Vec::new())
-        .map_err(|_| trench_core::engine::EngineError::MissingVerifiedSource)?;
-    let activation = UniverseSelector::activate(&snapshot, None, initial)
-        .map_err(|_| trench_core::engine::EngineError::MissingVerifiedSource)?;
-    Ok(EngineContext::new(
-        admission,
-        SnapshotBindings::new(BTreeMap::new(), activation),
-        StrategyFingerprints::new("rules-unavailable", "ml-unavailable"),
-    ))
+fn maximum_book_age() -> Result<DurationNs, AppError> {
+    DurationNs::new(i128::from(MAXIMUM_BOOK_AGE_NS)).map_err(|_| AppError::InitialEngineState)
 }
 
 fn provenance(config_bytes: &[u8]) -> Result<DataProvenance, AppError> {
@@ -565,9 +569,9 @@ pub enum AppError {
     /// The minimal no-entry engine state could not be initialized safely.
     #[error("paper engine initial state could not be constructed")]
     InitialEngineState,
-    /// Canonical source evidence could not be serialized.
-    #[error("normalized source evidence could not be serialized")]
-    Json(#[source] serde_json::Error),
+    /// A normalized source fact could not take a typed, fail-closed route.
+    #[error(transparent)]
+    Routing(#[from] RoutingError),
     /// SQLite admission/write ownership could not initialize or drain.
     #[error(transparent)]
     Writer(#[from] WriterError),
@@ -599,8 +603,8 @@ mod tests {
     use rust_decimal::Decimal;
 
     use super::{
-        AuthorityState, admit_source_event, configured_path, initial_engine_state,
-        recover_source_stream,
+        AuthorityState, admit_market_event, configured_path, initial_engine_state,
+        maximum_book_age, recover_source_stream,
     };
     use crate::readiness::Readiness;
     use crate::writer::EngineWriter;
@@ -676,11 +680,14 @@ mod tests {
             .min(100);
         let mut authority = AuthorityState {
             engine_state: Some(initial_engine_state("run-replay", initial_at).expect("state")),
+            router: crate::execution::TypedMarketRouter::new(
+                maximum_book_age().expect("fixture maximum book age"),
+            ),
             readiness: Readiness::default(),
             reconciled: false,
         };
         for event in recovered.events {
-            admit_source_event(&mut writer, &mut authority, event)
+            admit_market_event(&mut writer, &mut authority, event)
                 .await
                 .expect("authority admission");
         }

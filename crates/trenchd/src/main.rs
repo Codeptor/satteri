@@ -5,6 +5,7 @@ mod admin;
 mod admin;
 mod app;
 mod commands;
+mod execution;
 mod readiness;
 mod writer;
 
