@@ -23,6 +23,8 @@ pub enum GlobalBlocker {
     Stream,
     /// The dynamic-universe metadata is absent or stale.
     Metadata,
+    /// The latest bounded public-context capture did not complete and persist.
+    ContextCapture,
     /// The active universe does not have fresh executable books.
     FreshBooks,
 }
@@ -113,6 +115,7 @@ pub struct Readiness {
     storage_writable: bool,
     stream_connected: bool,
     metadata_current: bool,
+    context_capture_current: bool,
     fresh_book_markets: BTreeSet<Market>,
     markets: BTreeMap<Market, MarketGates>,
     rules_configuration_valid: bool,
@@ -160,6 +163,12 @@ impl Readiness {
         self.metadata_current = value;
     }
 
+    /// Records whether the latest complete public-context batch was persisted
+    /// and routed by the authority loop.
+    pub fn set_context_capture_current(&mut self, value: bool) {
+        self.context_capture_current = value;
+    }
+
     /// Records rules-artifact/configuration validation.
     pub fn set_rules_configuration_valid(&mut self, value: bool) {
         self.rules_configuration_valid = value;
@@ -188,6 +197,9 @@ impl Readiness {
         }
         if !self.metadata_current {
             blockers.insert(GlobalBlocker::Metadata);
+        }
+        if !self.context_capture_current {
+            blockers.insert(GlobalBlocker::ContextCapture);
         }
         if self.fresh_book_markets.is_empty()
             || !self.fresh_book_markets.iter().all(|market| {
@@ -313,6 +325,7 @@ mod tests {
                 GlobalBlocker::Storage,
                 GlobalBlocker::Stream,
                 GlobalBlocker::Metadata,
+                GlobalBlocker::ContextCapture,
                 GlobalBlocker::FreshBooks,
             ])
         );
@@ -323,6 +336,7 @@ mod tests {
         readiness.set_storage_writable(true);
         readiness.set_stream_connected(true);
         readiness.set_metadata_current(true);
+        readiness.set_context_capture_current(true);
         let gates = readiness
             .market_gates_mut(&market)
             .expect("registered market");
@@ -351,6 +365,7 @@ mod tests {
             Readiness::set_storage_writable,
             Readiness::set_stream_connected,
             Readiness::set_metadata_current,
+            Readiness::set_context_capture_current,
             Readiness::set_rules_configuration_valid,
             Readiness::set_rules_sleeve_warm,
         ] {

@@ -13,10 +13,11 @@ use trench_core::candle::CandleAggregator;
 use trench_core::config::PaperConfig;
 use trench_core::domain::{LedgerId, Market, RunId, Usdc};
 use trench_core::engine::{Engine, EngineContext, EngineState};
-use trench_core::event::{DurationNs, MarketEvent, TimestampNs};
+use trench_core::event::{DurationNs, MarketEvent, MarketEventKind, TimestampNs};
 use trench_core::ledger::LedgerState;
 use trench_hyperliquid::{
-    GapEvent, GapRecoveryRequest, InfoClient, InfoError, MetaAndAssetContexts,
+    ContextCapture, ContextCaptureBatch, ContextCaptureError, ContextCaptureRequest, GapEvent,
+    GapRecoveryRequest, InfoClient, InfoError, MetaAndAssetContexts, ReceiptClock,
     RecoveryEvidenceProducer, RecoveryProducerError, RecoveryResult, WsClient, WsConfig, WsOutput,
     WsStream,
 };
@@ -26,12 +27,15 @@ use trench_storage::replay::{DeterministicReplay, ReplayError, ReplayPlan};
 use crate::admin::{
     AdminError, AdminServer, AuthorityRequest, DaemonMode, DaemonStatus, authority_channel,
 };
+use crate::capture_scheduler::{CaptureScheduler, cadence};
 use crate::commands::RulesStartup;
 use crate::execution::{MarketRoute, RoutingError, TypedEngineEvent, TypedMarketRouter};
 use crate::readiness::Readiness;
 use crate::writer::{EngineWriter, SourceEvent, WriterError};
 
 const SOURCE_CHANNEL_CAPACITY: usize = 128;
+const CAPTURE_CHANNEL_CAPACITY: usize = 1;
+const CAPTURE_RESULT_CHANNEL_CAPACITY: usize = 1;
 const RECOVERY_CHANNEL_CAPACITY: usize = 16;
 const RECOVERY_PENDING_CAPACITY: usize = 128;
 const MAXIMUM_BOOK_AGE_NS: i64 = 1_000_000_000;
@@ -104,6 +108,32 @@ enum RecoveryOutput {
         /// Exact conservative producer failure.
         error: RecoveryProducerError,
     },
+}
+
+/// One complete all-or-nothing public context outcome returned to the authority.
+#[derive(Debug)]
+enum CaptureOutput {
+    /// The bounded public adapter produced one immutable complete source batch.
+    Captured(ContextCaptureBatch),
+    /// No source facts are available because the batch failed atomically.
+    Rejected(ContextCaptureError),
+}
+
+/// Explicit UTC receipt-time source used only by the read-only I/O adapter.
+#[derive(Debug, Clone, Copy)]
+struct SystemReceiptClock;
+
+impl ReceiptClock for SystemReceiptClock {
+    fn receipt_time(&self) -> Option<TimestampNs> {
+        current_time_ns()
+            .ok()
+            .and_then(|value| TimestampNs::new(i128::from(value)).ok())
+    }
+}
+
+struct LiveSubscription {
+    stream: Option<WsStream>,
+    markets: Vec<Market>,
 }
 
 /// Starts the paper-only daemon and waits for a bounded duration or Ctrl-C.
@@ -195,7 +225,25 @@ pub async fn run(
     }
 
     let parquet_store = ParquetStore::open(&parquet_path, provenance)?;
-    let mut live_stream = open_live_stream(config, &mut authority.readiness).await;
+    let LiveSubscription {
+        mut stream,
+        markets,
+    } = open_live_stream(config, &mut authority.readiness).await;
+    let capture_client = ContextCapture::new(InfoClient::new(config.endpoints().info_url())?);
+    let (capture_sender, capture_receiver) = mpsc::channel(CAPTURE_CHANNEL_CAPACITY);
+    let (capture_result_sender, mut capture_result_receiver) =
+        mpsc::channel(CAPTURE_RESULT_CHANNEL_CAPACITY);
+    let capture_task = tokio::spawn(capture_worker(
+        capture_client,
+        capture_receiver,
+        capture_result_sender,
+        cancellation.clone(),
+    ));
+    let mut capture_scheduler = CaptureScheduler::new(markets);
+    if !capture_scheduler.has_detailed_markets() {
+        authority.readiness.set_context_capture_current(false);
+        tracing::warn!("public context capture is waiting for a dynamic universe");
+    }
     let server = AdminServer::bind(&admin_socket).await?;
     let (authority_sender, mut authority_receiver) = authority_channel();
     let admin_cancellation = cancellation.clone();
@@ -204,11 +252,17 @@ pub async fn run(
     let stop = stop_signal(duration);
     tokio::pin!(stop);
     let mut recovery_results_open = true;
+    let mut capture_results_open = true;
     let mut recovery_clock = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_secs(1),
         Duration::from_secs(1),
     );
     recovery_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut capture_clock = tokio::time::interval_at(
+        tokio::time::Instant::now() + cadence(config.feed().universe_refresh_seconds()),
+        cadence(config.feed().universe_refresh_seconds()),
+    );
+    capture_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         flush_recovery_inputs(&recovery_sender, &mut authority);
         tokio::select! {
@@ -232,7 +286,30 @@ pub async fn run(
                     }
                 }
             }
-            output = receive_live(&mut live_stream) => {
+            output = capture_result_receiver.recv(), if capture_results_open => {
+                match output {
+                    Some(output) => {
+                        admit_capture_output(
+                            &parquet_store,
+                            &mut writer,
+                            &mut authority,
+                            output,
+                            &mut capture_scheduler,
+                            config,
+                            Some(&recovery_sender),
+                        ).await?;
+                    }
+                    None => {
+                        capture_results_open = false;
+                        capture_scheduler.complete(false);
+                        authority.readiness.set_context_capture_current(false);
+                        tracing::error!(
+                            "public context capture worker stopped; entries remain fail-closed"
+                        );
+                    }
+                }
+            }
+            output = receive_live(&mut stream) => {
                 match output {
                     Some(WsOutput::MarketEvent(event)) => {
                         parquet_store.write_events(std::slice::from_ref(&event))?;
@@ -266,7 +343,7 @@ pub async fn run(
                     Some(WsOutput::Rejected(_)) => {}
                     Some(WsOutput::Terminal(_)) | None => {
                         authority.readiness.set_stream_connected(false);
-                        live_stream = None;
+                        stream = None;
                     }
                 }
             }
@@ -298,14 +375,54 @@ pub async fn run(
                     }
                 }
             }
+            _ = capture_clock.tick(), if capture_results_open => {
+                match TimestampNs::new(i128::from(current_time_ns()?)) {
+                    Ok(scheduled_at) => match capture_scheduler.dispatch(scheduled_at) {
+                        Ok(Some(request)) => match capture_sender.try_send(request) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                capture_scheduler.complete(false);
+                                authority.readiness.set_context_capture_current(false);
+                                tracing::error!(
+                                    "public context capture scheduler became contended; entries remain fail-closed"
+                                );
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                capture_results_open = false;
+                                capture_scheduler.complete(false);
+                                authority.readiness.set_context_capture_current(false);
+                                tracing::error!(
+                                    "public context capture worker is unavailable; entries remain fail-closed"
+                                );
+                            }
+                        },
+                        Ok(None) => {}
+                        Err(error) => {
+                            authority.readiness.set_context_capture_current(false);
+                            tracing::warn!(
+                                error = %error,
+                                "public context capture schedule is invalid; entries remain fail-closed"
+                            );
+                        }
+                    },
+                    Err(_) => {
+                        authority.readiness.set_context_capture_current(false);
+                        tracing::warn!(
+                            "public context capture UTC clock is invalid; entries remain fail-closed"
+                        );
+                    }
+                }
+            }
         }
     }
 
     cancellation.cancel();
+    drop(capture_sender);
     drop(recovery_sender);
-    if let Some(stream) = live_stream {
+    if let Some(stream) = stream {
         stream.shutdown().await;
     }
+    capture_task.await.map_err(AppError::CaptureTaskJoin)?;
     recovery_task.await.map_err(AppError::RecoveryTaskJoin)?;
     while let Ok(output) = recovery_result_receiver.try_recv() {
         admit_recovery_output(&mut writer, &mut authority, output).await?;
@@ -375,6 +492,93 @@ async fn replay_producer(
             }
         }
     }
+}
+
+/// Runs one read-only complete-context request at a time outside the authority.
+///
+/// The worker has no persistence, engine, or readiness access. Cancellation
+/// drops an in-progress public request instead of publishing a partial batch.
+async fn capture_worker(
+    capture: ContextCapture,
+    mut input: mpsc::Receiver<ContextCaptureRequest>,
+    output: mpsc::Sender<CaptureOutput>,
+    cancellation: CancellationToken,
+) {
+    loop {
+        let request = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return,
+            request = input.recv() => request,
+        };
+        let Some(request) = request else {
+            return;
+        };
+        let outcome = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return,
+            result = capture.capture(&request, &SystemReceiptClock) => {
+                match result {
+                    Ok(batch) => CaptureOutput::Captured(batch),
+                    Err(error) => CaptureOutput::Rejected(error),
+                }
+            }
+        };
+        let delivered = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => false,
+            delivered = output.send(outcome) => delivered.is_ok(),
+        };
+        if !delivered {
+            return;
+        }
+    }
+}
+
+/// Persists a complete capture before every individual source fact traverses
+/// the authority writer. Rejected captures have no facts to persist or route.
+async fn admit_capture_output(
+    parquet_store: &ParquetStore,
+    writer: &mut EngineWriter,
+    authority: &mut AuthorityState,
+    output: CaptureOutput,
+    scheduler: &mut CaptureScheduler,
+    config: &PaperConfig,
+    recovery_sender: Option<&mpsc::Sender<RecoveryInput>>,
+) -> Result<(), AppError> {
+    match output {
+        CaptureOutput::Captured(batch) => {
+            parquet_store.write_events(batch.events())?;
+            for event in batch.events().iter().cloned() {
+                admit_market_event(writer, authority, event, recovery_sender).await?;
+            }
+            scheduler.complete(true);
+            let markets = select_dynamic_markets_from_capture(config, batch.events());
+            scheduler.replace_markets(markets.clone());
+            for market in &markets {
+                authority.readiness.register_market(market.clone());
+            }
+            authority
+                .readiness
+                .set_fresh_book_markets(markets.into_iter().collect());
+            authority.readiness.set_metadata_current(true);
+            authority.readiness.set_context_capture_current(true);
+            tracing::info!(
+                events = batch.events().len(),
+                captured_at_ns = batch.captured_at().value(),
+                source_digest = %batch.source_digest(),
+                "persisted and admitted complete public context capture"
+            );
+        }
+        CaptureOutput::Rejected(error) => {
+            scheduler.complete(false);
+            authority.readiness.set_context_capture_current(false);
+            tracing::warn!(
+                error = %error,
+                "public context capture rejected atomically; entries remain fail-closed"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Runs the bounded, read-only recovery producer outside the authority loop.
@@ -610,25 +814,34 @@ async fn receive_live(stream: &mut Option<WsStream>) -> Option<WsOutput> {
     }
 }
 
-async fn open_live_stream(config: &PaperConfig, readiness: &mut Readiness) -> Option<WsStream> {
+async fn open_live_stream(config: &PaperConfig, readiness: &mut Readiness) -> LiveSubscription {
     let client = match InfoClient::new(config.endpoints().info_url()) {
         Ok(client) => client,
         Err(error) => {
             tracing::warn!(error = %error, "public metadata client is unavailable; stream remains unready");
-            return None;
+            return LiveSubscription {
+                stream: None,
+                markets: Vec::new(),
+            };
         }
     };
     let metadata = match client.meta_and_asset_contexts().await {
         Ok(metadata) => metadata,
         Err(error) => {
             tracing::warn!(error = %error, "public metadata fetch failed; stream remains unready");
-            return None;
+            return LiveSubscription {
+                stream: None,
+                markets: Vec::new(),
+            };
         }
     };
     let markets = select_dynamic_markets(config, &metadata);
     if markets.is_empty() {
         tracing::warn!("no market passed the collector's conservative public liquidity prefilter");
-        return None;
+        return LiveSubscription {
+            stream: None,
+            markets,
+        };
     }
     let fresh_book_markets = markets.iter().cloned().collect();
     for market in &markets {
@@ -637,10 +850,16 @@ async fn open_live_stream(config: &PaperConfig, readiness: &mut Readiness) -> Op
     readiness.set_fresh_book_markets(fresh_book_markets);
     readiness.set_metadata_current(true);
     match WsConfig::new(markets) {
-        Ok(config) => Some(WsClient::new(config).start()),
+        Ok(config) => LiveSubscription {
+            markets: config.markets().to_vec(),
+            stream: Some(WsClient::new(config).start()),
+        },
         Err(error) => {
             tracing::warn!(error = %error, "public WebSocket configuration rejected dynamic universe");
-            None
+            LiveSubscription {
+                stream: None,
+                markets: Vec::new(),
+            }
         }
     }
 }
@@ -662,6 +881,53 @@ fn select_dynamic_markets(config: &PaperConfig, metadata: &MetaAndAssetContexts)
                 asset.market().clone(),
                 asset.context().day_notional_volume().value(),
             )
+        })
+        .collect::<Vec<_>>();
+    markets.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    markets
+        .into_iter()
+        .take(limit)
+        .map(|(market, _)| market)
+        .collect()
+}
+
+/// Selects the next detailed scope from an already-persisted complete capture.
+///
+/// The authority applies this only after every normalized fact in the batch
+/// was durable and admitted, so a failed or partial public response cannot
+/// alter the rotating universe.
+fn select_dynamic_markets_from_capture(
+    config: &PaperConfig,
+    events: &[MarketEvent],
+) -> Vec<Market> {
+    let mut metadata = BTreeMap::new();
+    let mut contexts = BTreeMap::new();
+    for event in events {
+        match event.kind() {
+            MarketEventKind::Metadata(value) => {
+                metadata.insert(event.market().clone(), *value);
+            }
+            MarketEventKind::AssetContext(value) => {
+                contexts.insert(event.market().clone(), *value);
+            }
+            MarketEventKind::BookSnapshot(_)
+            | MarketEventKind::Bbo(_)
+            | MarketEventKind::Trade(_)
+            | MarketEventKind::CompletedCandle(_)
+            | MarketEventKind::Funding(_) => {}
+        }
+    }
+    let limit = usize::from(config.feed().tradeable_market_count())
+        + usize::from(config.feed().warm_buffer_market_count());
+    let mut markets = metadata
+        .into_iter()
+        .filter_map(|(market, metadata)| {
+            let context = contexts.get(&market)?;
+            (metadata.is_active()
+                && metadata.venue_max_leverage()
+                    >= u16::from(config.risk().minimum_leverage().value())
+                && context.day_notional_volume() >= config.feed().minimum_daily_notional())
+            .then_some((market, context.day_notional_volume().value()))
         })
         .collect::<Vec<_>>();
     markets.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
@@ -957,6 +1223,9 @@ pub enum AppError {
     /// The bounded public recovery worker did not complete normally.
     #[error("recovery producer task join failed")]
     RecoveryTaskJoin(#[source] tokio::task::JoinError),
+    /// The bounded public context-capture worker did not complete normally.
+    #[error("public context capture task join failed")]
+    CaptureTaskJoin(#[source] tokio::task::JoinError),
     /// Engine state was consumed by a failed authority transition.
     #[error("authority engine state is unavailable after a failed transition")]
     MissingEngineState,
@@ -1004,17 +1273,19 @@ mod tests {
     use trench_core::config::PaperConfig;
     use trench_core::event::{BookLevel, BookSnapshot};
     use trench_hyperliquid::{
-        InfoClient, MetaAndAssetContexts, RecoveryStatus, RecoveryUnavailable,
-        recovery_request_from_events_for_test,
+        ContextCapture, ContextCaptureError, InfoClient, MetaAndAssetContexts, RecoveryStatus,
+        RecoveryUnavailable, recovery_request_from_events_for_test,
     };
     use wiremock::matchers::{body_json, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     use super::{
-        AuthorityState, RecoveryInput, RecoveryOutput, admit_market_event, admit_recovery_output,
-        configured_path, initial_engine_state, maximum_book_age, recover_source_stream,
-        recovery_worker, select_dynamic_markets,
+        AuthorityState, CaptureOutput, RecoveryInput, RecoveryOutput, SystemReceiptClock,
+        admit_capture_output, admit_market_event, admit_recovery_output, capture_worker,
+        configured_path, current_time_ns, initial_engine_state, maximum_book_age,
+        recover_source_stream, recovery_worker, select_dynamic_markets,
     };
+    use crate::capture_scheduler::CaptureScheduler;
     use crate::readiness::Readiness;
     use crate::writer::EngineWriter;
     use trench_core::domain::{Market, Price, Quantity, Side};
@@ -1134,6 +1405,92 @@ mod tests {
             recovery_pending: VecDeque::new(),
             recovery_worker_available: true,
         }
+    }
+
+    fn current_timestamp() -> TimestampNs {
+        TimestampNs::new(i128::from(current_time_ns().expect("UTC clock"))).expect("UTC timestamp")
+    }
+
+    async fn mounted_context_capture(
+        delay: Option<Duration>,
+    ) -> (
+        ContextCapture,
+        trench_hyperliquid::ContextCaptureRequest,
+        MockServer,
+    ) {
+        let server = MockServer::start().await;
+        let metadata =
+            serde_json::from_str::<Value>(META_FIXTURE).expect("fixture metadata must parse");
+        let book_time_ms = current_time_ns().expect("UTC clock") / 1_000_000;
+        Mock::given(method("POST"))
+            .and(path("/info"))
+            .respond_with(move |request: &Request| {
+                let request: Value = serde_json::from_slice(&request.body)
+                    .expect("capture request must remain JSON");
+                let body = match request["type"].as_str() {
+                    Some("metaAndAssetCtxs") => metadata.clone(),
+                    Some("l2Book") => json!({
+                        "coin": request["coin"].as_str().expect("book market"),
+                        "time": book_time_ms,
+                        "levels": [
+                            [{"px": "99", "sz": "10", "n": 1}],
+                            [{"px": "101", "sz": "10", "n": 1}]
+                        ]
+                    }),
+                    Some("candleSnapshot") => {
+                        let source = &request["req"];
+                        let interval = source["interval"].as_str().expect("candle interval");
+                        let step_ms = match interval {
+                            "15m" => 900_000_i64,
+                            "1h" => 3_600_000_i64,
+                            _ => panic!("unexpected candle interval"),
+                        };
+                        let start = source["startTime"].as_i64().expect("candle start");
+                        let end = source["endTime"].as_i64().expect("candle end");
+                        let symbol = source["coin"].as_str().expect("candle market");
+                        let mut candles = Vec::new();
+                        let mut open = start;
+                        while open <= end {
+                            candles.push(json!({
+                                "t": open,
+                                "T": open + step_ms - 1,
+                                "s": symbol,
+                                "i": interval,
+                                "o": "100",
+                                "c": "100",
+                                "h": "101",
+                                "l": "99",
+                                "v": "1",
+                                "n": 1,
+                            }));
+                            open += step_ms;
+                        }
+                        Value::Array(candles)
+                    }
+                    Some("fundingHistory") => json!([{
+                        "coin": request["coin"].as_str().expect("funding market"),
+                        "fundingRate": "0.00001",
+                        "premium": "0.00001",
+                        "time": request["startTime"].as_i64().expect("funding start"),
+                    }]),
+                    _ => panic!("unexpected public context operation"),
+                };
+                let response = ResponseTemplate::new(200).set_body_json(body);
+                match delay {
+                    Some(delay) => response.set_delay(delay),
+                    None => response,
+                }
+            })
+            .mount(&server)
+            .await;
+        let mut scheduler = CaptureScheduler::new(vec![btc()]);
+        let request = scheduler
+            .dispatch(current_timestamp())
+            .expect("capture schedule")
+            .expect("first capture schedule");
+        let client = InfoClient::new_loopback_for_test(&format!("{}/info", server.uri()))
+            .expect("loopback capture client");
+        (ContextCapture::new(client), request, server)
     }
 
     async fn next_recovery_output(receiver: &mut mpsc::Receiver<RecoveryOutput>) -> RecoveryOutput {
@@ -1265,6 +1622,210 @@ mod tests {
         );
         assert!(authority.engine_state.is_some());
         assert!(!authority.reconciled);
+    }
+
+    #[tokio::test]
+    async fn cancelled_context_capture_does_not_publish_a_partial_batch() {
+        let (capture, request, _server) =
+            mounted_context_capture(Some(Duration::from_secs(2))).await;
+        let cancellation = CancellationToken::new();
+        let (input_sender, input_receiver) = mpsc::channel(1);
+        let (output_sender, mut output_receiver) = mpsc::channel(1);
+        let task = tokio::spawn(capture_worker(
+            capture,
+            input_receiver,
+            output_sender,
+            cancellation.clone(),
+        ));
+        input_sender
+            .send(request)
+            .await
+            .expect("capture request handoff");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        cancellation.cancel();
+
+        timeout(Duration::from_secs(1), task)
+            .await
+            .expect("capture worker must observe cancellation")
+            .expect("capture worker must not panic");
+        assert!(
+            output_receiver.recv().await.is_none(),
+            "cancellation must not publish an incomplete capture"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_context_capture_degrades_readiness_without_persisting_facts() {
+        let directory = tempfile::tempdir().expect("fixture root");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("private fixture root");
+        let store = ParquetStore::open(directory.path(), provenance()).expect("fixture store");
+        let mut writer = EngineWriter::open(
+            directory.path().join("trench.sqlite"),
+            "run-capture-rejected",
+            current_time_ns().expect("UTC clock"),
+        )
+        .await
+        .expect("fixture writer");
+        let mut authority = authority("run-capture-rejected");
+        let mut scheduler = CaptureScheduler::new(vec![btc()]);
+        let config = PaperConfig::from_toml(PAPER_CONFIG).expect("fixture config");
+        let _ = scheduler
+            .dispatch(current_timestamp())
+            .expect("capture schedule")
+            .expect("in-flight capture");
+
+        admit_capture_output(
+            &store,
+            &mut writer,
+            &mut authority,
+            CaptureOutput::Rejected(ContextCaptureError::IncompleteCandles {
+                market: btc(),
+                interval: trench_hyperliquid::CandleInterval::FifteenMinutes,
+            }),
+            &mut scheduler,
+            &config,
+            None,
+        )
+        .await
+        .expect("rejected capture is a handled readiness transition");
+
+        assert!(!scheduler.in_flight());
+        assert!(
+            authority
+                .readiness
+                .global_blockers()
+                .contains(&crate::readiness::GlobalBlocker::ContextCapture)
+        );
+        assert!(store.partitions().expect("source partitions").is_empty());
+        assert_eq!(
+            writer
+                .journal_counts()
+                .await
+                .expect("journal counts")
+                .events,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_context_capture_persists_before_authority_admission() {
+        let (capture, request, _server) = mounted_context_capture(None).await;
+        let batch = capture
+            .capture(&request, &SystemReceiptClock)
+            .await
+            .expect("complete public context batch");
+        let source_ids = batch.source_ids().cloned().collect::<BTreeSet<_>>();
+        let directory = tempfile::tempdir().expect("fixture root");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("private fixture root");
+        let store = ParquetStore::open(directory.path(), provenance()).expect("fixture store");
+        let mut writer = EngineWriter::open(
+            directory.path().join("trench.sqlite"),
+            "run-capture-ordering",
+            current_time_ns().expect("UTC clock"),
+        )
+        .await
+        .expect("fixture writer");
+        let mut authority = authority("run-capture-ordering");
+        authority.engine_state = None;
+        let mut scheduler = CaptureScheduler::new(vec![btc()]);
+        let config = PaperConfig::from_toml(PAPER_CONFIG).expect("fixture config");
+        let _ = scheduler
+            .dispatch(current_timestamp())
+            .expect("capture schedule")
+            .expect("in-flight capture");
+
+        let error = admit_capture_output(
+            &store,
+            &mut writer,
+            &mut authority,
+            CaptureOutput::Captured(batch),
+            &mut scheduler,
+            &config,
+            None,
+        )
+        .await
+        .expect_err("missing authority state must reject the first engine admission");
+        assert!(matches!(error, super::AppError::MissingEngineState));
+
+        let persisted_ids = store
+            .partitions()
+            .expect("source partitions")
+            .into_iter()
+            .flat_map(|manifest| store.read_partition(&manifest).expect("source partition"))
+            .map(|event| event.event_id().clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            persisted_ids, source_ids,
+            "the complete batch must reach atomic Parquet before any authority admission"
+        );
+        assert_eq!(
+            writer
+                .journal_counts()
+                .await
+                .expect("journal counts")
+                .events,
+            0,
+            "the induced authority failure occurs after source persistence"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_context_capture_routes_every_persisted_fact_through_the_writer() {
+        let (capture, request, _server) = mounted_context_capture(None).await;
+        let batch = capture
+            .capture(&request, &SystemReceiptClock)
+            .await
+            .expect("complete public context batch");
+        let event_count = batch.events().len();
+        let directory = tempfile::tempdir().expect("fixture root");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("private fixture root");
+        let store = ParquetStore::open(directory.path(), provenance()).expect("fixture store");
+        let mut writer = EngineWriter::open(
+            directory.path().join("trench.sqlite"),
+            "run-capture-complete",
+            current_time_ns().expect("UTC clock"),
+        )
+        .await
+        .expect("fixture writer");
+        let mut authority = authority("run-capture-complete");
+        let mut scheduler = CaptureScheduler::new(vec![btc()]);
+        let config = PaperConfig::from_toml(PAPER_CONFIG).expect("fixture config");
+        let _ = scheduler
+            .dispatch(current_timestamp())
+            .expect("capture schedule")
+            .expect("in-flight capture");
+
+        admit_capture_output(
+            &store,
+            &mut writer,
+            &mut authority,
+            CaptureOutput::Captured(batch),
+            &mut scheduler,
+            &config,
+            None,
+        )
+        .await
+        .expect("complete batch must persist and route");
+
+        assert!(!scheduler.in_flight());
+        assert!(
+            !authority
+                .readiness
+                .global_blockers()
+                .contains(&crate::readiness::GlobalBlocker::ContextCapture)
+        );
+        assert_eq!(
+            writer
+                .journal_counts()
+                .await
+                .expect("journal counts")
+                .events,
+            i64::try_from(event_count).expect("bounded capture event count"),
+            "every persisted normalized fact must use the sole authority writer"
+        );
     }
 
     #[tokio::test]

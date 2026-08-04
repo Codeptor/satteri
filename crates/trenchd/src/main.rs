@@ -4,6 +4,7 @@ mod admin;
 #[path = "admin_stub.rs"]
 mod admin;
 mod app;
+mod capture_scheduler;
 mod commands;
 mod execution;
 mod readiness;
