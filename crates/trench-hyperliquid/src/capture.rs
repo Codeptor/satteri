@@ -1,10 +1,12 @@
 //! Bounded capture of public point-in-time context into normalized facts.
 //!
 //! The venue leaves `metaAndAssetCtxs` without an exchange timestamp. Those
-//! metadata, context, and current-funding facts therefore use the explicitly
-//! injected receipt timestamp as both their event and availability time. Every
-//! exchange-timestamped book, funding-history record, and completed candle
-//! retains its source timestamp separately from that receipt timestamp.
+//! metadata and context facts therefore use the explicitly injected receipt
+//! timestamp as both their event and availability time. The current funding
+//! field is retained without a mark as a non-settlement feature/risk fact:
+//! only exchange-timestamped funding records can carry settlement semantics.
+//! Every exchange-timestamped book, funding-history record, and completed
+//! candle retains its source timestamp separately from that receipt timestamp.
 
 use std::collections::{BTreeSet, HashSet};
 use std::future::Future;
@@ -506,10 +508,7 @@ fn metadata_events(
             received_at,
             received_at,
             market,
-            Funding::with_mark(
-                FundingRate::new(context.funding_rate().value()),
-                context.mark_price(),
-            ),
+            Funding::historical(FundingRate::new(context.funding_rate().value())),
         )?,
     ])
 }
@@ -827,7 +826,10 @@ mod tests {
         )
     }
 
-    async fn mounted_capture(partial_fifteen_minutes: bool) -> (ContextCapture, MockServer) {
+    async fn mounted_capture(
+        partial_fifteen_minutes: bool,
+        expected_calls: u64,
+    ) -> (ContextCapture, MockServer) {
         let server = MockServer::start().await;
         let client = InfoClient::new_loopback_for_test(&format!("{}/info", server.uri()))
             .expect("loopback client");
@@ -835,14 +837,14 @@ mod tests {
             .and(path("/info"))
             .and(body_json(json!({"type": "metaAndAssetCtxs"})))
             .respond_with(ResponseTemplate::new(200).set_body_raw(META_FIXTURE, "application/json"))
-            .expect(1)
+            .expect(expected_calls)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
             .and(path("/info"))
             .and(body_json(json!({"type": "l2Book", "coin": "BTC"})))
             .respond_with(ResponseTemplate::new(200).set_body_json(l2_body()))
-            .expect(1)
+            .expect(expected_calls)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -861,7 +863,7 @@ mod tests {
                 900_000,
                 if partial_fifteen_minutes { 3 } else { 4 },
             )))
-            .expect(1)
+            .expect(expected_calls)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -876,7 +878,7 @@ mod tests {
                 }
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(candle_body("1h", 3_600_000, 1)))
-            .expect(1)
+            .expect(expected_calls)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -893,7 +895,7 @@ mod tests {
                 "premium": "0.00002",
                 "time": HOUR_START_MS,
             }])))
-            .expect(1)
+            .expect(expected_calls)
             .mount(&server)
             .await;
         (ContextCapture::new(client), server)
@@ -901,7 +903,7 @@ mod tests {
 
     #[tokio::test]
     async fn capture_materializes_complete_explicit_time_public_context() {
-        let (capture, _server) = mounted_capture(false).await;
+        let (capture, _server) = mounted_capture(false, 1).await;
         let batch = capture
             .capture(&request(), &FixedClock)
             .await
@@ -935,7 +937,7 @@ mod tests {
         }));
         assert!(batch.events().iter().any(|event| {
             matches!(event.kind(), MarketEventKind::Funding(funding)
-                if funding.mark_price().is_some()
+                if funding.mark_price().is_none()
                     && event.event_time().value() == RECEIPT_NS as i64)
         }));
         assert_eq!(
@@ -950,7 +952,7 @@ mod tests {
 
     #[tokio::test]
     async fn capture_rejects_partial_candle_series_without_returning_facts() {
-        let (capture, _server) = mounted_capture(true).await;
+        let (capture, _server) = mounted_capture(true, 1).await;
         assert_eq!(
             capture.capture(&request(), &FixedClock).await,
             Err(ContextCaptureError::IncompleteCandles {
@@ -958,6 +960,22 @@ mod tests {
                 interval: crate::CandleInterval::FifteenMinutes,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn repeated_current_context_captures_never_materialize_settlement_funding() {
+        let (capture, _server) = mounted_capture(false, 2).await;
+        for _ in 0..2 {
+            let batch = capture
+                .capture(&request(), &FixedClock)
+                .await
+                .expect("complete public context");
+            assert!(batch.events().iter().all(|event| {
+                !matches!(event.kind(), MarketEventKind::Funding(funding)
+                    if event.event_time().value() == RECEIPT_NS as i64
+                        && funding.mark_price().is_some())
+            }));
+        }
     }
 
     #[test]
