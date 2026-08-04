@@ -190,6 +190,18 @@ impl ImpactCurve {
                 return Err(RiskInputError::NonAscendingImpactBands);
             }
         }
+        let mut previous_stressed = None;
+        for band in &bands {
+            let stressed = band
+                .current_fraction
+                .checked_mul(Decimal::TWO)
+                .map(|doubled| doubled.max(band.trailing_p99_fraction))
+                .ok_or(RiskInputError::ImpactArithmetic)?;
+            if previous_stressed.is_some_and(|previous| stressed < previous) {
+                return Err(RiskInputError::DecreasingImpactBands);
+            }
+            previous_stressed = Some(stressed);
+        }
         Ok(Self(bands))
     }
 
@@ -650,6 +662,9 @@ pub enum RiskInputError {
     /// Finite impact bands must increase strictly by notional.
     #[error("impact bands must have strictly increasing upper notionals")]
     NonAscendingImpactBands,
+    /// Stressed impact must not fall as requested notional increases.
+    #[error("stressed impact fractions must not decrease across notional bands")]
+    DecreasingImpactBands,
     /// Exact impact multiplication could not be represented.
     #[error("impact arithmetic could not be represented")]
     ImpactArithmetic,
@@ -1527,6 +1542,17 @@ mod tests {
             super::cost_attributions(&costs, usdc(dec!(10.001))).expect("high cost");
 
         assert!(high_cost > low_cost);
+    }
+
+    #[test]
+    fn decreasing_impact_ladder_is_rejected_before_bisection() {
+        let curve = ImpactCurve::new(vec![
+            ImpactBand::new(Some(usdc(dec!(10))), dec!(0.10), dec!(0.20))
+                .expect("expensive small band"),
+            ImpactBand::new(None, dec!(0.001), dec!(0.002)).expect("cheap large band"),
+        ]);
+
+        assert_eq!(curve, Err(RiskInputError::DecreasingImpactBands));
     }
 
     #[test]
