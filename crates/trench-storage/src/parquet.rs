@@ -11,6 +11,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -22,6 +24,8 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use rust_decimal::Decimal;
+#[cfg(unix)]
+use rustix::fs::{FileType, Mode, OFlags, fstat, open, openat};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -115,6 +119,28 @@ impl DataProvenance {
     }
 }
 
+/// The validated logical location of one immutable partition.
+///
+/// The fields remain private so callers can only obtain an identity from a
+/// validated manifest (or deserialize one that is subsequently revalidated by
+/// a direct member reader).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PartitionIdentity {
+    date: String,
+    event_kind: String,
+    market: String,
+}
+
+impl PartitionIdentity {
+    fn key(&self) -> Result<PartitionKey, ParquetError> {
+        PartitionKey::new(
+            self.date.clone(),
+            self.event_kind.clone(),
+            self.market.clone(),
+        )
+    }
+}
+
 /// One immutable partition manifest committed alongside its Parquet rows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartitionManifest {
@@ -136,6 +162,23 @@ impl PartitionManifest {
     #[must_use]
     pub fn partition_id(&self) -> &str {
         &self.partition_id
+    }
+
+    /// Returns the validated logical location used to derive this partition's
+    /// exact final directory.
+    #[must_use]
+    pub fn identity(&self) -> PartitionIdentity {
+        PartitionIdentity {
+            date: self.date.clone(),
+            event_kind: self.event_kind.clone(),
+            market: self.market.clone(),
+        }
+    }
+
+    /// Returns the BLAKE3 digest over this manifest's canonical JSON form.
+    #[must_use]
+    pub fn manifest_digest(&self) -> String {
+        canonical_json_digest(self)
     }
 
     /// Returns the committed event row count.
@@ -240,6 +283,13 @@ impl CaptureBatchManifest {
         &self.batch_id
     }
 
+    /// Returns the BLAKE3 digest over this capture marker's canonical JSON
+    /// form.
+    #[must_use]
+    pub fn manifest_digest(&self) -> String {
+        canonical_json_digest(self)
+    }
+
     /// Returns every partition committed atomically with this capture.
     #[must_use]
     pub fn partitions(&self) -> &[PartitionManifest] {
@@ -295,6 +345,7 @@ impl CaptureBatchManifest {
             });
         }
         let mut partition_ids = BTreeSet::new();
+        let mut partition_identities = BTreeSet::new();
         let mut previous_id = None;
         for partition in &self.partitions {
             partition.validate()?;
@@ -306,6 +357,11 @@ impl CaptureBatchManifest {
             if !partition_ids.insert(partition.partition_id.clone()) {
                 return Err(ParquetError::InvalidCaptureBatch {
                     reason: "capture batch repeats a partition identifier",
+                });
+            }
+            if !partition_identities.insert(partition.identity()) {
+                return Err(ParquetError::InvalidCaptureBatch {
+                    reason: "capture batch repeats a partition identity",
                 });
             }
             if previous_id
@@ -371,6 +427,53 @@ pub enum CaptureBatchFailure {
 pub struct ParquetStore {
     root: PathBuf,
     provenance: DataProvenance,
+}
+
+/// One exact, verified immutable partition member opened without discovery.
+#[derive(Debug, Clone)]
+pub struct OpenedPartitionMember {
+    directory: Arc<File>,
+    manifest: PartitionManifest,
+    provenance: DataProvenance,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct DescriptorPartitionRead {
+    manifest: PartitionManifest,
+    events: Vec<MarketEvent>,
+}
+
+impl OpenedPartitionMember {
+    /// Returns the fully revalidated committed partition manifest.
+    #[must_use]
+    pub const fn manifest(&self) -> &PartitionManifest {
+        &self.manifest
+    }
+
+    /// Reopens the exact member and returns its canonical normalized rows.
+    pub fn read_all(&self) -> Result<Vec<MarketEvent>, ParquetError> {
+        #[cfg(not(unix))]
+        {
+            return Err(ParquetError::UnsupportedPlatform);
+        }
+        #[cfg(unix)]
+        {
+            let key = self.manifest.key()?;
+            let verified = read_partition_directory_from_descriptor(
+                &self.directory,
+                &self.provenance,
+                &key,
+                self.manifest.partition_id(),
+            )?;
+            if verified.manifest != self.manifest {
+                return Err(ParquetError::ManifestMismatch {
+                    partition_id: self.manifest.partition_id.clone(),
+                });
+            }
+            Ok(verified.events)
+        }
+    }
 }
 
 impl ParquetStore {
@@ -452,7 +555,7 @@ impl ParquetStore {
     pub fn write_capture_batch(
         &self,
         events: &[MarketEvent],
-    ) -> Result<Vec<PartitionManifest>, ParquetError> {
+    ) -> Result<CaptureBatchManifest, ParquetError> {
         self.write_capture_batch_inner(events, None)
     }
 
@@ -462,7 +565,7 @@ impl ParquetStore {
         &self,
         events: &[MarketEvent],
         failure: CaptureBatchFailure,
-    ) -> Result<Vec<PartitionManifest>, ParquetError> {
+    ) -> Result<CaptureBatchManifest, ParquetError> {
         self.write_capture_batch_inner(events, Some(failure))
     }
 
@@ -470,10 +573,12 @@ impl ParquetStore {
         &self,
         events: &[MarketEvent],
         failure: Option<CaptureBatchFailure>,
-    ) -> Result<Vec<PartitionManifest>, ParquetError> {
+    ) -> Result<CaptureBatchManifest, ParquetError> {
         let partitions = prepare_event_partitions(events)?;
         if partitions.is_empty() {
-            return Ok(Vec::new());
+            return Err(ParquetError::InvalidCaptureBatch {
+                reason: "capture batch cannot be empty",
+            });
         }
         if partitions.len() > MAX_PARTITIONS_PER_CAPTURE_BATCH {
             return Err(ParquetError::CaptureBatchTooLarge {
@@ -510,7 +615,7 @@ impl ParquetStore {
         if final_directory.exists() {
             return self
                 .validate_existing_capture_batch(&final_directory, &batch)
-                .map(|batch| batch.partitions);
+                .map(|_| batch);
         }
         // Capture retries are all-or-nothing. A partition-level retry is not
         // enough here: republishing one old member alongside new members would
@@ -568,7 +673,7 @@ impl ParquetStore {
             }
         })?;
         sync_directory(&batches)?;
-        Ok(batch.partitions)
+        Ok(batch)
     }
 
     fn write_events_inner(
@@ -787,6 +892,135 @@ impl ParquetStore {
         read_events_file(&path.join(EVENT_FILE))
     }
 
+    /// Opens one legacy partition by its validated logical identity and exact
+    /// manifest digest without scanning the store root.
+    pub fn open_legacy_member(
+        &self,
+        identity: &PartitionIdentity,
+        partition_id: &str,
+        partition_manifest_digest: &str,
+    ) -> Result<OpenedPartitionMember, ParquetError> {
+        validate_digest("requested partition identifier", partition_id)?;
+        validate_digest(
+            "requested partition manifest digest",
+            partition_manifest_digest,
+        )?;
+        let key = identity.key()?;
+        #[cfg(not(unix))]
+        {
+            let _ = key;
+            Err(ParquetError::UnsupportedPlatform)
+        }
+        #[cfg(unix)]
+        {
+            let root = open_private_root_descriptor(&self.root)?;
+            let parent = open_legacy_partition_parent(&root, &key)?;
+            let directory = open_partition_directory(&parent, partition_id)?;
+            let verified = read_partition_directory_from_descriptor(
+                &directory,
+                &self.provenance,
+                &key,
+                partition_id,
+            )?;
+            self.open_verified_member(
+                directory,
+                verified.manifest,
+                partition_id,
+                partition_manifest_digest,
+                None,
+            )
+        }
+    }
+
+    /// Opens one capture member by its batch and partition commitments without
+    /// scanning the store root or the capture's member directories.
+    pub fn open_capture_member(
+        &self,
+        batch_id: &str,
+        identity: &PartitionIdentity,
+        partition_id: &str,
+        batch_manifest_digest: &str,
+        partition_manifest_digest: &str,
+    ) -> Result<OpenedPartitionMember, ParquetError> {
+        validate_digest("requested capture batch identifier", batch_id)?;
+        validate_digest(
+            "requested capture batch manifest digest",
+            batch_manifest_digest,
+        )?;
+        validate_digest("requested partition identifier", partition_id)?;
+        validate_digest(
+            "requested partition manifest digest",
+            partition_manifest_digest,
+        )?;
+        identity.key()?;
+        #[cfg(not(unix))]
+        {
+            Err(ParquetError::UnsupportedPlatform)
+        }
+        #[cfg(unix)]
+        {
+            let root = open_private_root_descriptor(&self.root)?;
+            let batches = open_private_directory_at(&root, CAPTURE_BATCHES_DIRECTORY)?;
+            let batch_name = capture_batch_directory_name(batch_id, false);
+            let batch_directory = open_private_directory_at(&batches, &batch_name)?;
+            let batch = read_capture_batch_manifest_from_directory(&batch_directory)?;
+            batch.validate()?;
+            if batch.batch_id() != batch_id {
+                return Err(ParquetError::InvalidCaptureBatch {
+                    reason: "capture batch identifier does not match its directory",
+                });
+            }
+            if batch.provenance() != &self.provenance {
+                return Err(ParquetError::ProvenanceMismatch);
+            }
+            if batch.manifest_digest() != batch_manifest_digest {
+                return Err(ParquetError::CaptureBatchManifestMismatch {
+                    batch_id: batch_id.to_owned(),
+                });
+            }
+            let member = batch
+                .partitions()
+                .iter()
+                .find(|candidate| {
+                    candidate.identity() == *identity && candidate.partition_id() == partition_id
+                })
+                .ok_or_else(|| ParquetError::MissingPartition {
+                    partition_id: partition_id.to_owned(),
+                })?;
+            let mut selected = None;
+            for committed in batch.partitions() {
+                let committed_key = committed.key()?;
+                let parent = open_capture_partition_parent(&batch_directory, &committed_key)?;
+                let directory = open_partition_directory(&parent, committed.partition_id())?;
+                let verified = read_partition_directory_from_descriptor(
+                    &directory,
+                    &self.provenance,
+                    &committed_key,
+                    committed.partition_id(),
+                )?;
+                let actual = verified.manifest;
+                if actual != *committed {
+                    return Err(ParquetError::ManifestMismatch {
+                        partition_id: committed.partition_id.clone(),
+                    });
+                }
+                if committed == member {
+                    selected = Some((directory, actual));
+                }
+            }
+            let (directory, actual) = selected.ok_or_else(|| ParquetError::MissingPartition {
+                partition_id: partition_id.to_owned(),
+            })?;
+            self.open_verified_member(
+                directory,
+                actual,
+                partition_id,
+                partition_manifest_digest,
+                Some(member),
+            )
+        }
+    }
+
     /// Returns the managed root path for read-only replay construction.
     #[must_use]
     pub fn root(&self) -> &Path {
@@ -805,6 +1039,32 @@ impl ParquetStore {
         let capture_batches = self.root.join(CAPTURE_BATCHES_DIRECTORY);
         ensure_private_directory(&capture_batches)?;
         Ok(capture_batches)
+    }
+
+    #[cfg(unix)]
+    fn open_verified_member(
+        &self,
+        directory: File,
+        actual: PartitionManifest,
+        partition_id: &str,
+        partition_manifest_digest: &str,
+        expected_member: Option<&PartitionManifest>,
+    ) -> Result<OpenedPartitionMember, ParquetError> {
+        if actual.manifest_digest() != partition_manifest_digest {
+            return Err(ParquetError::ManifestMismatch {
+                partition_id: partition_id.to_owned(),
+            });
+        }
+        if expected_member.is_some_and(|member| member != &actual) {
+            return Err(ParquetError::ManifestMismatch {
+                partition_id: partition_id.to_owned(),
+            });
+        }
+        Ok(OpenedPartitionMember {
+            directory: Arc::new(directory),
+            manifest: actual,
+            provenance: self.provenance.clone(),
+        })
     }
 
     fn validate_existing_capture_batch(
@@ -927,6 +1187,9 @@ pub enum ParquetError {
     /// A final partition did not match the expected content-addressed manifest.
     #[error("partition manifest mismatch for {partition_id}")]
     ManifestMismatch { partition_id: String },
+    /// A capture-batch marker did not match its requested canonical digest.
+    #[error("capture batch manifest mismatch for {batch_id}")]
+    CaptureBatchManifestMismatch { batch_id: String },
     /// A committed capture marker referenced a partition that is not present.
     #[error("committed partition {partition_id} is missing")]
     MissingPartition { partition_id: String },
@@ -1393,6 +1656,166 @@ fn read_manifest(path: &Path) -> Result<PartitionManifest, ParquetError> {
     serde_json::from_slice(&bytes).map_err(ParquetError::Json)
 }
 
+#[cfg(unix)]
+fn read_capture_batch_manifest_from_directory(
+    directory: &File,
+) -> Result<CaptureBatchManifest, ParquetError> {
+    let bytes = read_bounded_regular_file_at(
+        directory,
+        CAPTURE_BATCH_MANIFEST_FILE,
+        MAX_CAPTURE_BATCH_MANIFEST_BYTES,
+        "reading capture batch manifest descriptor",
+    )?;
+    serde_json::from_slice(&bytes).map_err(ParquetError::Json)
+}
+
+#[cfg(unix)]
+fn read_partition_directory_from_descriptor(
+    directory: &File,
+    expected_provenance: &DataProvenance,
+    physical_key: &PartitionKey,
+    physical_partition_id: &str,
+) -> Result<DescriptorPartitionRead, ParquetError> {
+    let manifest = read_partition_manifest_from_directory(directory)?;
+    manifest.validate()?;
+    if manifest.key()? != *physical_key || manifest.partition_id != physical_partition_id {
+        return Err(ParquetError::ManifestMismatch {
+            partition_id: physical_partition_id.to_owned(),
+        });
+    }
+    if &manifest.provenance != expected_provenance {
+        return Err(ParquetError::ProvenanceMismatch);
+    }
+    let events = read_events_file_from_directory(directory)?;
+    let expected =
+        PartitionManifest::from_events(&manifest.key()?, &events, manifest.provenance.clone())?;
+    if expected != manifest {
+        return Err(ParquetError::ManifestMismatch {
+            partition_id: manifest.partition_id.clone(),
+        });
+    }
+    Ok(DescriptorPartitionRead { manifest, events })
+}
+
+#[cfg(unix)]
+fn read_partition_manifest_from_directory(
+    directory: &File,
+) -> Result<PartitionManifest, ParquetError> {
+    let bytes = read_bounded_regular_file_at(
+        directory,
+        MANIFEST_FILE,
+        MAX_MANIFEST_BYTES,
+        "reading partition manifest descriptor",
+    )?;
+    serde_json::from_slice(&bytes).map_err(ParquetError::Json)
+}
+
+#[cfg(unix)]
+fn read_bounded_regular_file_at(
+    directory: &File,
+    name: &str,
+    limit: u64,
+    operation: &'static str,
+) -> Result<Vec<u8>, ParquetError> {
+    let (mut file, expected) = open_regular_file_at(directory, name, limit, operation)?;
+    let capacity = usize::try_from(expected).map_err(|_| ParquetError::InvalidPartition {
+        reason: "partition file length does not fit memory bounds",
+    })?;
+    let mut bytes = Vec::with_capacity(capacity);
+    Read::by_ref(&mut file)
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|source| ParquetError::Filesystem { operation, source })?;
+    ensure_regular_file_length(&file, expected, operation)?;
+    if u64::try_from(bytes.len()).ok() != Some(expected) {
+        return Err(ParquetError::InvalidPartition {
+            reason: "partition file changed while being read",
+        });
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn open_regular_file_at(
+    directory: &File,
+    name: &str,
+    limit: u64,
+    operation: &'static str,
+) -> Result<(File, u64), ParquetError> {
+    let descriptor = openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|source| ParquetError::Filesystem {
+        operation,
+        source: source.into(),
+    })?;
+    let file = File::from(descriptor);
+    let metadata = fstat(&file).map_err(|source| ParquetError::Filesystem {
+        operation,
+        source: source.into(),
+    })?;
+    if !FileType::from_raw_mode(metadata.st_mode).is_file() || metadata.st_size < 0 {
+        return Err(ParquetError::InvalidPartition {
+            reason: "partition file must be a regular non-symlink file",
+        });
+    }
+    let length = u64::try_from(metadata.st_size).map_err(|_| ParquetError::InvalidPartition {
+        reason: "partition file length does not fit memory bounds",
+    })?;
+    if length > limit {
+        return Err(ParquetError::InvalidPartition {
+            reason: "partition file exceeds its fixed byte bound",
+        });
+    }
+    Ok((file, length))
+}
+
+#[cfg(unix)]
+fn ensure_regular_file_length(
+    file: &File,
+    expected_length: u64,
+    operation: &'static str,
+) -> Result<(), ParquetError> {
+    let metadata = fstat(file).map_err(|source| ParquetError::Filesystem {
+        operation,
+        source: source.into(),
+    })?;
+    if !FileType::from_raw_mode(metadata.st_mode).is_file()
+        || u64::try_from(metadata.st_size).ok() != Some(expected_length)
+    {
+        return Err(ParquetError::InvalidPartition {
+            reason: "partition file changed while being read",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_events_file_from_directory(directory: &File) -> Result<Vec<MarketEvent>, ParquetError> {
+    let (file, length) = open_regular_file_at(
+        directory,
+        EVENT_FILE,
+        MAX_PARQUET_BYTES,
+        "opening parquet partition descriptor",
+    )?;
+    let verifier = file
+        .try_clone()
+        .map_err(|source| ParquetError::Filesystem {
+            operation: "cloning parquet partition descriptor",
+            source,
+        })?;
+    let events = decode_events_file(file, length)?;
+    ensure_regular_file_length(
+        &verifier,
+        length,
+        "revalidating parquet partition descriptor",
+    )?;
+    Ok(events)
+}
+
 fn read_events_file(path: &Path) -> Result<Vec<MarketEvent>, ParquetError> {
     ensure_regular_file(path)?;
     let metadata = fs::metadata(path).map_err(|source| ParquetError::Filesystem {
@@ -1404,11 +1827,15 @@ fn read_events_file(path: &Path) -> Result<Vec<MarketEvent>, ParquetError> {
             reason: "parquet file exceeds the fixed partition byte bound",
         });
     }
-    validate_parquet_footer(path, metadata.len())?;
     let file = File::open(path).map_err(|source| ParquetError::Filesystem {
         operation: "opening parquet partition",
         source,
     })?;
+    decode_events_file(file, metadata.len())
+}
+
+fn decode_events_file(mut file: File, length: u64) -> Result<Vec<MarketEvent>, ParquetError> {
+    validate_parquet_footer_file(&mut file, length)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
     validate_parquet_metadata(builder.metadata())?;
     if builder.schema().as_ref() != event_schema().as_ref() {
@@ -1477,16 +1904,12 @@ fn read_events_file(path: &Path) -> Result<Vec<MarketEvent>, ParquetError> {
     Ok(events)
 }
 
-fn validate_parquet_footer(path: &Path, length: u64) -> Result<(), ParquetError> {
+fn validate_parquet_footer_file(file: &mut File, length: u64) -> Result<(), ParquetError> {
     if length < 12 {
         return Err(ParquetError::InvalidPartition {
             reason: "parquet file is too short to contain a complete footer",
         });
     }
-    let mut file = File::open(path).map_err(|source| ParquetError::Filesystem {
-        operation: "opening parquet footer",
-        source,
-    })?;
     file.seek(SeekFrom::End(-8))
         .and_then(|_| {
             let mut footer = [0_u8; 8];
@@ -1512,7 +1935,13 @@ fn validate_parquet_footer(path: &Path, length: u64) -> Result<(), ParquetError>
                 });
             }
             Ok(())
-        })
+        })?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| ParquetError::Filesystem {
+            operation: "rewinding parquet footer",
+            source,
+        })?;
+    Ok(())
 }
 
 fn validate_parquet_metadata(
@@ -2018,6 +2447,150 @@ fn ensure_existing_private_directory(path: &Path) -> Result<(), ParquetError> {
 }
 
 #[cfg(unix)]
+fn open_private_root_descriptor(root: &Path) -> Result<File, ParquetError> {
+    let mut directory = File::from(
+        open(
+            "/",
+            OFlags::RDONLY
+                | OFlags::DIRECTORY
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|source| ParquetError::Filesystem {
+            operation: "opening filesystem root for direct parquet member",
+            source: source.into(),
+        })?,
+    );
+    ensure_directory_descriptor(&directory, "inspecting direct parquet root ancestor")?;
+    for component in root.components() {
+        let Component::Normal(component) = component else {
+            if matches!(component, Component::RootDir) {
+                continue;
+            }
+            return Err(ParquetError::InvalidRoot {
+                reason: "managed root path contains a non-normal component",
+            });
+        };
+        let opened = openat(
+            &directory,
+            component,
+            OFlags::RDONLY
+                | OFlags::DIRECTORY
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|source| ParquetError::Filesystem {
+            operation: "opening direct parquet root component",
+            source: source.into(),
+        })?;
+        directory = File::from(opened);
+        ensure_directory_descriptor(&directory, "inspecting direct parquet root ancestor")?;
+    }
+    ensure_private_directory_descriptor(&directory)
+}
+
+#[cfg(unix)]
+fn open_private_directory_at(parent: &File, name: &str) -> Result<File, ParquetError> {
+    let descriptor = openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|source| ParquetError::Filesystem {
+        operation: "opening direct parquet directory component",
+        source: source.into(),
+    })?;
+    ensure_private_directory_descriptor(&File::from(descriptor))
+}
+
+#[cfg(unix)]
+fn open_legacy_partition_parent(root: &File, key: &PartitionKey) -> Result<File, ParquetError> {
+    let partitions = open_private_directory_at(root, PARTITIONS_DIRECTORY)?;
+    let date = open_private_directory_at(&partitions, &format!("date={}", key.date))?;
+    let kind = open_private_directory_at(&date, &format!("kind={}", key.event_kind))?;
+    open_private_directory_at(&kind, &format!("market={}", encode_component(&key.market)))
+}
+
+#[cfg(unix)]
+fn open_capture_partition_parent(
+    capture_batch: &File,
+    key: &PartitionKey,
+) -> Result<File, ParquetError> {
+    let partitions = open_private_directory_at(capture_batch, PARTITIONS_DIRECTORY)?;
+    let date = open_private_directory_at(&partitions, &format!("date={}", key.date))?;
+    let kind = open_private_directory_at(&date, &format!("kind={}", key.event_kind))?;
+    open_private_directory_at(&kind, &format!("market={}", encode_component(&key.market)))
+}
+
+#[cfg(unix)]
+fn open_partition_directory(parent: &File, partition_id: &str) -> Result<File, ParquetError> {
+    let name = format!("part-{partition_id}.part");
+    match openat(
+        parent,
+        &name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(descriptor) => ensure_private_directory_descriptor(&File::from(descriptor)),
+        Err(source) => {
+            let source: io::Error = source.into();
+            if source.kind() == io::ErrorKind::NotFound {
+                Err(ParquetError::MissingPartition {
+                    partition_id: partition_id.to_owned(),
+                })
+            } else {
+                Err(ParquetError::Filesystem {
+                    operation: "opening exact direct partition member",
+                    source,
+                })
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn ensure_private_directory_descriptor(directory: &File) -> Result<File, ParquetError> {
+    ensure_directory_descriptor(directory, "inspecting direct parquet directory")?;
+    let metadata = fstat(directory).map_err(|source| ParquetError::Filesystem {
+        operation: "inspecting direct parquet directory permissions",
+        source: source.into(),
+    })?;
+    if metadata.st_uid != rustix::process::geteuid().as_raw() || metadata.st_mode & 0o077 != 0 {
+        return Err(ParquetError::InvalidRoot {
+            reason: "managed path must be an effective-user owned mode-0700 directory",
+        });
+    }
+    directory
+        .try_clone()
+        .map_err(|source| ParquetError::Filesystem {
+            operation: "retaining direct parquet directory descriptor",
+            source,
+        })
+}
+
+#[cfg(unix)]
+fn ensure_directory_descriptor(
+    directory: &File,
+    operation: &'static str,
+) -> Result<(), ParquetError> {
+    let metadata = fstat(directory).map_err(|source| ParquetError::Filesystem {
+        operation,
+        source: source.into(),
+    })?;
+    if !FileType::from_raw_mode(metadata.st_mode).is_dir() {
+        return Err(ParquetError::InvalidRoot {
+            reason: "managed path must be a non-symlink directory",
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn private_owned_directory(metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
 
@@ -2182,6 +2755,12 @@ pub(crate) fn events_digest(events: &[MarketEvent]) -> Result<String, ParquetErr
 
 fn digest_bytes(bytes: &[u8]) -> String {
     format!("b3:{}", blake3::hash(bytes).to_hex())
+}
+
+fn canonical_json_digest<T: Serialize>(value: &T) -> String {
+    let bytes = serde_json::to_vec(value)
+        .expect("partition manifests contain only infallibly serializable fields");
+    digest_bytes(&bytes)
 }
 
 fn validate_digest(field: &'static str, value: &str) -> Result<(), ParquetError> {

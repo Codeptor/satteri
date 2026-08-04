@@ -197,18 +197,18 @@ fn capture_batch_publishes_all_partition_kinds_at_one_commit_boundary() {
     secure(&root);
     let store = ParquetStore::open(root.path(), provenance()).expect("store should open");
 
-    let manifests = store
+    let batch = store
         .write_capture_batch(&[trade(1_000, 1), bbo(1_000, 7)])
         .expect("capture should publish");
 
-    assert_eq!(manifests.len(), 2);
+    assert_eq!(batch.partitions().len(), 2);
     assert_eq!(
         store
             .partitions()
             .expect("committed capture should be replayable"),
-        manifests
+        batch.partitions()
     );
-    for partition in &manifests {
+    for partition in batch.partitions() {
         assert_eq!(
             store
                 .read_partition(partition)
@@ -234,13 +234,16 @@ fn capture_batch_retry_is_idempotent_only_for_the_exact_committed_capture() {
         .expect("exact capture retry should validate and remain idempotent");
 
     assert_eq!(retried, committed);
-    assert_eq!(complete_partitions(&root).len(), committed.len());
+    assert_eq!(
+        complete_partitions(&root).len(),
+        committed.partitions().len()
+    );
     assert!(staged_capture_batches(&root).is_empty());
     assert_eq!(
         store
             .partitions()
             .expect("exact retry must leave a replayable store"),
-        committed
+        committed.partitions()
     );
 }
 
@@ -278,13 +281,16 @@ fn capture_batch_rejects_mixed_prior_capture_overlap_before_staging() {
         .expect_err("mixed capture overlap must fail before staging");
 
     assert!(matches!(error, ParquetError::DuplicateEvent { .. }));
-    assert_eq!(complete_partitions(&root).len(), committed.len());
+    assert_eq!(
+        complete_partitions(&root).len(),
+        committed.partitions().len()
+    );
     assert!(staged_capture_batches(&root).is_empty());
     assert_eq!(
         store
             .partitions()
             .expect("rejected overlap must preserve the old capture"),
-        committed
+        committed.partitions()
     );
 }
 
@@ -294,9 +300,12 @@ fn legacy_write_rejects_an_existing_capture_partition_before_staging() {
     secure(&root);
     let store = ParquetStore::open(root.path(), provenance()).expect("store should open");
     let event = trade(1_000, 1);
-    let [committed]: [PartitionManifest; 1] = store
+    let batch = store
         .write_capture_batch(std::slice::from_ref(&event))
-        .expect("capture should publish")
+        .expect("capture should publish");
+    let [committed]: [PartitionManifest; 1] = batch
+        .partitions()
+        .to_vec()
         .try_into()
         .expect("fixture capture should have one partition");
 
