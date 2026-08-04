@@ -10,10 +10,12 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::future::Future;
+use std::sync::Arc;
 
 use blake3::Hasher;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use trench_core::domain::{EventId, Market};
 use trench_core::event::{
     AssetContext as CoreAssetContext, Bbo, BookLevel as CoreBookLevel, BookSnapshot,
@@ -38,6 +40,65 @@ pub const MAX_CONTEXT_FUNDING_RECORDS: usize = 4_096;
 pub const MAX_CONTEXT_EVENTS: usize = 65_536;
 const MAX_CANDLES_PER_SERIES: usize = 5_000;
 const MILLISECOND_NS: i128 = 1_000_000;
+
+/// Shared permit pool for every public operation in one context batch.
+#[derive(Debug, Clone)]
+struct RequestLimiter {
+    permits: Arc<Semaphore>,
+    #[cfg(test)]
+    observed: Arc<ObservedConcurrency>,
+}
+
+impl RequestLimiter {
+    fn new() -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(MAX_CONTEXT_REQUEST_CONCURRENCY)),
+            #[cfg(test)]
+            observed: Arc::new(ObservedConcurrency::default()),
+        }
+    }
+
+    #[cfg(test)]
+    fn maximum_observed(&self) -> usize {
+        self.observed
+            .maximum
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ObservedConcurrency {
+    active: std::sync::atomic::AtomicUsize,
+    maximum: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl ObservedConcurrency {
+    fn request_started(&self) {
+        let active = self
+            .active
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let mut maximum = self.maximum.load(std::sync::atomic::Ordering::Relaxed);
+        while active > maximum {
+            match self.maximum.compare_exchange_weak(
+                maximum,
+                active,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => maximum = observed,
+            }
+        }
+    }
+
+    fn request_finished(&self) {
+        self.active
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// Supplies an explicit local receipt timestamp to the I/O adapter.
 ///
@@ -204,7 +265,18 @@ impl ContextCapture {
         request: &ContextCaptureRequest,
         clock: &C,
     ) -> Result<ContextCaptureBatch, ContextCaptureError> {
+        self.capture_with_limiter(request, clock, &RequestLimiter::new())
+            .await
+    }
+
+    async fn capture_with_limiter<C: ReceiptClock + ?Sized>(
+        &self,
+        request: &ContextCaptureRequest,
+        clock: &C,
+        limiter: &RequestLimiter,
+    ) -> Result<ContextCaptureBatch, ContextCaptureError> {
         let (metadata, metadata_received_at) = observed(
+            limiter,
             self.client.meta_and_asset_contexts(),
             clock,
             CaptureOperation::Metadata,
@@ -245,7 +317,7 @@ impl ContextCapture {
             .flatten()
             .collect::<Vec<_>>();
         let detailed_events = stream::iter(request.detailed_markets().iter().cloned())
-            .map(|market| self.capture_detailed_market(market, request, clock))
+            .map(|market| self.capture_detailed_market(market, request, clock, limiter))
             .buffer_unordered(MAX_CONTEXT_REQUEST_CONCURRENCY)
             .try_collect::<Vec<_>>()
             .await?
@@ -263,15 +335,18 @@ impl ContextCapture {
         market: Market,
         request: &ContextCaptureRequest,
         clock: &C,
+        limiter: &RequestLimiter,
     ) -> Result<Vec<MarketEvent>, ContextCaptureError> {
         let (book, fifteen_minute_candles, hourly_candles, funding) = tokio::try_join!(
             observed(
+                limiter,
                 self.client.l2_book(&market, L2BookPrecision::Full),
                 clock,
                 CaptureOperation::Book,
                 Some(market.clone()),
             ),
             observed(
+                limiter,
                 self.client.candle_snapshot(
                     &market,
                     CandleInterval::FifteenMinutes,
@@ -282,6 +357,7 @@ impl ContextCapture {
                 Some(market.clone()),
             ),
             observed(
+                limiter,
                 self.client
                     .candle_snapshot(&market, CandleInterval::OneHour, request.hourly_range,),
                 clock,
@@ -289,6 +365,7 @@ impl ContextCapture {
                 Some(market.clone()),
             ),
             observed(
+                limiter,
                 self.client.funding_history(&market, request.funding_range),
                 clock,
                 CaptureOperation::FundingHistory,
@@ -379,6 +456,9 @@ pub enum ContextCaptureError {
         /// Stable public-client failure.
         source: InfoError,
     },
+    /// The authority-local public-operation limiter became unavailable.
+    #[error("public context request limiter became unavailable")]
+    RequestLimiterUnavailable,
     /// A normalized core fact rejected source timestamps or payload values.
     #[error("public context source normalization failed")]
     Event(#[from] EventError),
@@ -453,6 +533,7 @@ pub enum CaptureOperation {
 }
 
 async fn observed<T, F, C>(
+    limiter: &RequestLimiter,
     request: F,
     clock: &C,
     operation: CaptureOperation,
@@ -462,7 +543,19 @@ where
     F: Future<Output = Result<T, InfoError>>,
     C: ReceiptClock + ?Sized,
 {
-    let value = request.await.map_err(|source| ContextCaptureError::Info {
+    let permit = limiter
+        .permits
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| ContextCaptureError::RequestLimiterUnavailable)?;
+    #[cfg(test)]
+    limiter.observed.request_started();
+    let result = request.await;
+    #[cfg(test)]
+    limiter.observed.request_finished();
+    drop(permit);
+    let value = result.map_err(|source| ContextCaptureError::Info {
         operation,
         market,
         source,
@@ -753,16 +846,18 @@ fn source_digest(events: &[MarketEvent]) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::time::Duration;
 
     use serde_json::{Value, json};
     use trench_core::domain::Market;
     use trench_core::event::{MarketEventKind, TimestampNs};
     use wiremock::matchers::{body_json, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     use super::{
-        ContextCapture, ContextCaptureError, ContextCaptureRequest, MAX_DETAILED_CONTEXT_MARKETS,
-        ReceiptClock,
+        ContextCapture, ContextCaptureError, ContextCaptureRequest,
+        MAX_CONTEXT_REQUEST_CONCURRENCY, MAX_DETAILED_CONTEXT_MARKETS, ReceiptClock,
+        RequestLimiter,
     };
     use crate::{InfoClient, TimeRange};
 
@@ -804,6 +899,12 @@ mod tests {
         })
     }
 
+    fn l2_body_for(symbol: &str) -> Value {
+        let mut body = l2_body();
+        body["coin"] = json!(symbol);
+        body
+    }
+
     fn candle_body(interval: &str, step_ms: i64, count: usize) -> Value {
         Value::Array(
             (0..count)
@@ -824,6 +925,28 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    fn candle_body_for(symbol: &str, interval: &str, step_ms: i64, count: usize) -> Value {
+        let mut body = candle_body(interval, step_ms, count);
+        for candle in body.as_array_mut().expect("fixture candle array") {
+            candle["s"] = json!(symbol);
+        }
+        body
+    }
+
+    fn three_market_metadata() -> Value {
+        let mut metadata =
+            serde_json::from_str::<Value>(META_FIXTURE).expect("fixture metadata must parse");
+        metadata[0]["universe"]
+            .as_array_mut()
+            .expect("fixture universe")
+            .truncate(3);
+        metadata[1]
+            .as_array_mut()
+            .expect("fixture contexts")
+            .truncate(3);
+        metadata
     }
 
     async fn mounted_capture(
@@ -976,6 +1099,75 @@ mod tests {
                         && funding.mark_price().is_some())
             }));
         }
+    }
+
+    #[tokio::test]
+    async fn detailed_capture_never_exceeds_the_global_individual_request_cap() {
+        const DELAY: Duration = Duration::from_millis(30);
+        let server = MockServer::start().await;
+        let client = InfoClient::new_loopback_for_test(&format!("{}/info", server.uri()))
+            .expect("loopback client");
+        let metadata = three_market_metadata();
+        Mock::given(method("POST"))
+            .and(path("/info"))
+            .respond_with(move |request: &Request| {
+                let body: Value = serde_json::from_slice(&request.body)
+                    .expect("capture request body must remain JSON");
+                let response = match body["type"].as_str() {
+                    Some("metaAndAssetCtxs") => metadata.clone(),
+                    Some("l2Book") => l2_body_for(
+                        body["coin"]
+                            .as_str()
+                            .expect("book request coin must remain present"),
+                    ),
+                    Some("candleSnapshot") => {
+                        let request = &body["req"];
+                        let symbol = request["coin"]
+                            .as_str()
+                            .expect("candle request coin must remain present");
+                        match request["interval"].as_str() {
+                            Some("15m") => candle_body_for(symbol, "15m", 900_000, 4),
+                            Some("1h") => candle_body_for(symbol, "1h", 3_600_000, 1),
+                            _ => Value::Null,
+                        }
+                    }
+                    Some("fundingHistory") => json!([{
+                        "coin": body["coin"]
+                            .as_str()
+                            .expect("funding request coin must remain present"),
+                        "fundingRate": "0.00001",
+                        "premium": "0.00002",
+                        "time": HOUR_START_MS,
+                    }]),
+                    _ => Value::Null,
+                };
+                ResponseTemplate::new(200)
+                    .set_body_json(response)
+                    .set_delay(DELAY)
+            })
+            .expect(13)
+            .mount(&server)
+            .await;
+        let capture = ContextCapture::new(client);
+        let request = ContextCaptureRequest::new(
+            vec![market("BTC"), market("ETH"), market("SOL")],
+            range(),
+            range(),
+            range(),
+        )
+        .expect("bounded detailed request");
+        let limiter = RequestLimiter::new();
+
+        capture
+            .capture_with_limiter(&request, &FixedClock, &limiter)
+            .await
+            .expect("complete bounded context capture");
+
+        assert_eq!(
+            limiter.maximum_observed(),
+            MAX_CONTEXT_REQUEST_CONCURRENCY,
+            "the test must saturate but never exceed the global operation cap"
+        );
     }
 
     #[test]
