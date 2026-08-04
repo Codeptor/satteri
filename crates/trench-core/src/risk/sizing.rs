@@ -601,7 +601,7 @@ impl RiskRequest {
         policy.request(snapshot)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn with_snapshot(&self, snapshot: RiskSnapshot) -> Self {
         Self {
             snapshot,

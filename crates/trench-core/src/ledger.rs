@@ -2,6 +2,8 @@
 
 use blake3::Hasher;
 use rust_decimal::Decimal;
+use serde::Serialize;
+use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::book::OrderBook;
@@ -13,7 +15,7 @@ const INITIAL_EQUITY: Decimal = Decimal::ONE_HUNDRED;
 const MANDATORY_EXIT_BOUNDARY_FRACTION: Decimal = Decimal::from_parts(2, 0, 0, false, 2);
 
 /// Direction of the one permitted isolated paper position.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum PositionSide {
     /// A position that profits when the executable bid rises.
     Long,
@@ -108,7 +110,7 @@ impl ExitFill {
 
 /// Exact signed funding cashflow. Positive values debit an isolated ledger;
 /// negative values credit it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct FundingCashflow(Decimal);
 
 impl FundingCashflow {
@@ -144,7 +146,7 @@ impl FundingCashflow {
 }
 
 /// Conservative charges reserved while marking an open position to executable depth.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct MarkCosts {
     estimated_exit_fee: Usdc,
     estimated_exit_funding: Usdc,
@@ -168,7 +170,7 @@ impl MarkCosts {
 }
 
 /// A finite, explicit upper bound for the age of an executable book source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct BookFreshness {
     max_age: DurationNs,
 }
@@ -188,7 +190,7 @@ impl BookFreshness {
 }
 
 /// Source timestamps used to prove a book was available at a ledger transition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct BookSourceTimes {
     event_time: TimestampNs,
     received_at: TimestampNs,
@@ -209,7 +211,7 @@ impl BookSourceTimes {
 }
 
 /// Why a supplied book cannot supply executable valuation at the transition time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum BookStaleReason {
     /// No source book was available for the mark.
     Missing,
@@ -222,7 +224,7 @@ pub enum BookStaleReason {
 }
 
 /// Freshness evidence retained by immutable ledger state after every book mark.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum BookFreshnessStatus {
     /// No book mark has occurred yet.
     Unmarked,
@@ -262,7 +264,7 @@ impl BookFreshnessStatus {
 }
 
 /// The sole open isolated position, when a ledger is not flat.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Position {
     market: Market,
     side: PositionSide,
@@ -305,7 +307,7 @@ impl Position {
 }
 
 /// Last full-exit valuation derived only from executable opposite-side depth.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ExecutableMark {
     exit_value: Usdc,
     liquidity_incomplete: bool,
@@ -395,6 +397,41 @@ impl LedgerTransition {
     pub fn into_state(self) -> LedgerState {
         self.state
     }
+
+    pub(crate) fn persistence_json(&self) -> Value {
+        json!({
+            "at_ns": self.at.value(),
+            "kind": ledger_transition_kind_name(self.kind),
+            "state": self.state,
+        })
+    }
+}
+
+const fn ledger_transition_kind_name(kind: LedgerTransitionKind) -> &'static str {
+    match kind {
+        LedgerTransitionKind::BookMarked {
+            stale: false,
+            liquidity_incomplete: false,
+        } => "book_marked",
+        LedgerTransitionKind::BookMarked {
+            stale: false,
+            liquidity_incomplete: true,
+        } => "book_marked_incomplete",
+        LedgerTransitionKind::BookMarked {
+            stale: true,
+            liquidity_incomplete: false,
+        } => "book_marked_stale",
+        LedgerTransitionKind::BookMarked {
+            stale: true,
+            liquidity_incomplete: true,
+        } => "book_marked_stale_incomplete",
+        LedgerTransitionKind::PositionOpened => "position_opened",
+        LedgerTransitionKind::FundingApplied => "funding_applied",
+        LedgerTransitionKind::PositionReduced => "position_reduced",
+        LedgerTransitionKind::PositionClosed => "position_closed",
+        LedgerTransitionKind::PositionLiquidated => "position_liquidated",
+        LedgerTransitionKind::Reconciled => "reconciled",
+    }
 }
 
 /// Errors raised before an invalid state transition can be committed.
@@ -448,7 +485,7 @@ pub enum LedgerError {
 }
 
 /// Immutable synthetic-USDC accounting for exactly one independent ledger.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LedgerState {
     ledger_id: LedgerId,
     cash: Usdc,

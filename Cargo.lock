@@ -2620,10 +2620,13 @@ dependencies = [
 name = "trench-storage"
 version = "0.1.0"
 dependencies = [
+ "rust_decimal",
+ "serde_json",
  "sqlx",
  "tempfile",
  "thiserror",
  "tokio",
+ "trench-core",
 ]
 
 [[package]]

@@ -18,6 +18,7 @@ use thiserror::Error;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ID_LENGTH: usize = 128;
 const MAX_CODE_LENGTH: usize = 64;
+const MAX_ENGINE_RECORDS: usize = 1_024;
 
 /// Errors returned by the SQLite journal.
 #[derive(Debug, Error)]
@@ -50,6 +51,9 @@ pub enum StoreError {
     /// A deterministic failure was requested after the event insert.
     #[error("deterministic transaction failure injected")]
     InjectedFailure,
+    /// The supplied event identity conflicts with immutable source evidence.
+    #[error("existing source event does not match this engine batch")]
+    EventConflict,
 }
 
 impl From<sqlx::Error> for StoreError {
@@ -92,7 +96,11 @@ pub struct EventInput<'a> {
     pub run_id: &'a str,
     /// Globally unique event identifier.
     pub event_id: &'a str,
-    /// Explicit UTC Unix timestamp in nanoseconds.
+    /// Authoritative normalized source/venue UTC Unix timestamp in nanoseconds.
+    ///
+    /// This is deliberately distinct from the engine processing/as-of boundary
+    /// stored by the companion checkpoint. Both are bound to the same immutable
+    /// causal event ID by the admission and foreign-key contract.
     pub event_time_ns: i64,
     /// Stable machine-readable event kind.
     pub kind: &'a str,
@@ -100,41 +108,184 @@ pub struct EventInput<'a> {
     pub payload_json: &'a str,
 }
 
-/// Rejected risk decision committed with its source event.
+/// Stable category for one persistence-ready engine record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EngineRecordKind {
+    /// Immutable source, universe, feature, or executable-book commitment.
+    Snapshot,
+    /// Un-sized strategy candidate or rejection evidence.
+    Signal,
+    /// Strategy cost-acceptance intent.
+    Intent,
+    /// Sealed-risk quote or consumption evidence.
+    Risk,
+    /// Paper broker order lifecycle evidence.
+    Order,
+    /// Actual primary-taker fill evidence.
+    Fill,
+    /// Isolated ledger state transition evidence.
+    Ledger,
+    /// Breaker or terminal-state transition evidence.
+    Breaker,
+}
+
+impl EngineRecordKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Snapshot => "snapshot",
+            Self::Signal => "signal",
+            Self::Intent => "intent",
+            Self::Risk => "risk",
+            Self::Order => "order",
+            Self::Fill => "fill",
+            Self::Ledger => "ledger",
+            Self::Breaker => "breaker",
+        }
+    }
+}
+
+/// One ordered immutable engine record serialized by the paper daemon.
 #[derive(Clone, Copy, Debug)]
-pub struct RiskRejectionInput<'a> {
-    /// Owning run identifier.
-    pub run_id: &'a str,
-    /// Globally unique decision identifier.
-    pub decision_id: &'a str,
-    /// Source event identifier.
-    pub event_id: &'a str,
-    /// Independently accounted paper ledger.
+pub(crate) struct EngineRecordInput<'a> {
+    kind: EngineRecordKind,
+    payload_json: &'a str,
+}
+
+impl<'a> EngineRecordInput<'a> {
+    /// Creates one typed, JSON-encoded engine record.
+    #[must_use]
+    pub(crate) const fn new(kind: EngineRecordKind, payload_json: &'a str) -> Self {
+        Self { kind, payload_json }
+    }
+}
+
+/// Deterministic replay checkpoint committed with an engine batch.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EngineCheckpointInput<'a> {
+    /// Stable checkpoint identifier.
+    pub checkpoint_id: &'a str,
+    /// Independently accounted paper ledger whose state this checkpoint captures.
     pub ledger_id: LedgerId,
     /// Explicit UTC Unix timestamp in nanoseconds.
-    pub decided_at_ns: i64,
-    /// Stable machine-readable rejection reason.
-    pub reason_code: &'a str,
-    /// JSON details for the rejection.
-    pub details_json: &'a str,
+    pub at_ns: i64,
+    /// Canonical digest of the complete post-batch engine state.
+    pub state_digest: &'a str,
+    /// Canonical JSON serialization of the complete post-batch engine state.
+    pub state_json: &'a str,
 }
 
-/// Controls the deterministic boundary of an event/rejection append.
+/// One source event, its ordered durable evidence, and successor-state checkpoint.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EngineBatchInput<'a> {
+    /// Owning normalized source event.
+    pub event: EventInput<'a>,
+    /// Independently accounted paper ledger that owns this durable evidence.
+    pub ledger_id: LedgerId,
+    /// Ordered source/signal/risk/broker/ledger/breaker evidence.
+    pub records: &'a [EngineRecordInput<'a>],
+    /// Exactly one complete successor-state checkpoint.
+    pub checkpoint: EngineCheckpointInput<'a>,
+}
+
+/// Deterministic engine-batch transaction behavior used by recovery tests.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AtomicAppend {
-    /// Commit both rows atomically.
+pub(crate) enum AtomicEngineAppend {
+    /// Commit the complete source event, evidence sequence, and checkpoint.
     Commit,
-    /// Roll back after inserting the event and before inserting the decision.
+    /// Roll back immediately after source-event insertion.
     FailAfterEvent,
+    /// Roll back after all evidence records and before the checkpoint.
+    FailAfterRecords,
 }
 
-/// Counts of the two transition rows written by the atomic append API.
+/// Result of admitting one engine batch at the sole SQLite writer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct JournalCounts {
-    /// Event rows for the requested run.
+pub enum EngineAppendOutcome {
+    /// A new source event and every accompanying record committed atomically.
+    Committed {
+        /// Number of ordered evidence records committed with the event.
+        record_count: usize,
+    },
+    /// An already-admitted event was ignored and only its audit counter advanced.
+    Duplicate {
+        /// Total durable duplicate attempts after this idempotent application.
+        duplicate_attempts: i64,
+    },
+}
+
+/// Durable admission status obtained before calling the pure engine.
+///
+/// The sole writer reads this for the exact `(run, ledger, event)` key and
+/// maps it to `trench_core::EventAdmission` before invoking `Engine::apply`.
+/// A duplicate must be forwarded as a core no-op, then acknowledged through
+/// [`SqliteStore::append_engine_outcome`] so its audit counter advances.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EngineAdmission {
+    /// No committed engine batch exists for this source event and ledger.
+    New,
+    /// A committed engine batch exists; the stored count excludes this attempt.
+    Duplicate {
+        /// Existing durable duplicate-attempt count before acknowledgement.
+        duplicate_attempts: i64,
+    },
+}
+
+/// Opaque durable-admission proof binding one core outcome to one writer key.
+///
+/// Only [`SqliteStore::engine_admission`] can create this proof. The daemon
+/// maps [`Self::admission`] to `trench_core::engine::EventAdmission` before
+/// applying the pure engine, then presents the exact proof to
+/// [`SqliteStore::append_engine_outcome`].
+#[derive(Debug, Eq, PartialEq)]
+pub struct EngineAdmissionPermit {
+    admission: EngineAdmission,
+    run_id: String,
+    ledger_id: LedgerId,
+    event_id: String,
+    event_time_ns: i64,
+    kind: String,
+    payload_json: String,
+}
+
+impl EngineAdmissionPermit {
+    /// Returns the durable pre-application admission result.
+    #[must_use]
+    pub const fn admission(&self) -> EngineAdmission {
+        self.admission
+    }
+
+    /// Maps the durable result to the pure core's explicit admission input.
+    #[must_use]
+    pub const fn core_admission(&self) -> trench_core::engine::EventAdmission {
+        match self.admission {
+            EngineAdmission::New => trench_core::engine::EventAdmission::New,
+            EngineAdmission::Duplicate { .. } => trench_core::engine::EventAdmission::Duplicate,
+        }
+    }
+
+    fn matches(&self, event: EventInput<'_>, ledger_id: LedgerId) -> bool {
+        self.run_id == event.run_id
+            && self.ledger_id == ledger_id
+            && self.event_id == event.event_id
+            && self.event_time_ns == event.event_time_ns
+            && self.kind == event.kind
+            && self.payload_json == event.payload_json
+    }
+}
+
+/// Durable row counts for the engine-specific atomic journal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EngineJournalCounts {
+    /// Immutable normalized source events, stored once per run/event.
     pub events: i64,
-    /// Risk-decision rows for the requested run.
-    pub risk_decisions: i64,
+    /// Ledger-scoped admitted engine batches.
+    pub admissions: i64,
+    /// Ordered source/signal/risk/broker/ledger/breaker records.
+    pub records: i64,
+    /// Complete successor-state checkpoints.
+    pub checkpoints: i64,
+    /// Reapplied event attempts retained for audit.
+    pub duplicate_attempts: i64,
 }
 
 /// Required connection durability settings observed from SQLite.
@@ -216,91 +367,375 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Appends an event and its risk rejection in one atomic transaction.
+    /// Reads ledger-scoped source-event admission before pure engine evaluation.
     ///
-    /// `AtomicAppend::FailAfterEvent` is a deterministic recovery probe: it
-    /// explicitly rolls back before returning [`StoreError::InjectedFailure`].
+    /// `trenchd` is the sole writer, so it must call this immediately before
+    /// mapping the result to `trench_core::EventAdmission` and applying the
+    /// pure engine. It must then call [`Self::append_engine_outcome`] with the
+    /// same immutable source event and ledger; that method rechecks admission
+    /// and increments duplicate audit state atomically when appropriate.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError`] for invalid inputs, inconsistent event/rejection
-    /// ownership, the recovery failpoint, or a database error.
-    pub async fn append_event_and_risk_rejection(
+    /// Returns [`StoreError`] for an invalid identity or a database error.
+    pub async fn engine_admission(
         &mut self,
         event: EventInput<'_>,
-        rejection: RiskRejectionInput<'_>,
-        behavior: AtomicAppend,
-    ) -> Result<(), StoreError> {
+        ledger_id: LedgerId,
+    ) -> Result<EngineAdmissionPermit, StoreError> {
         validate_event(event)?;
-        validate_rejection(rejection)?;
-        if event.run_id != rejection.run_id {
-            return Err(StoreError::InvalidInput {
-                field: "run_id",
-                reason: "event and rejection run IDs differ",
-            });
-        }
-        if event.event_id != rejection.event_id {
-            return Err(StoreError::InvalidInput {
-                field: "event_id",
-                reason: "event and rejection event IDs differ",
-            });
-        }
-
-        let mut transaction = self.connection.begin().await?;
-        sqlx::query(
-            "INSERT INTO events \
-             (event_id, run_id, event_time_ns, event_kind, payload_json) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+        validate_json("event payload", event.payload_json)?;
+        let existing_event = sqlx::query_as::<_, (String, i64, String, String)>(
+            "SELECT run_id, event_time_ns, event_kind, payload_json \
+             FROM events WHERE event_id = ?1",
         )
         .bind(event.event_id)
+        .fetch_optional(&mut self.connection)
+        .await?;
+        match existing_event {
+            Some((run_id, event_time_ns, kind, payload_json))
+                if run_id == event.run_id
+                    && event_time_ns == event.event_time_ns
+                    && kind == event.kind
+                    && payload_json == event.payload_json => {}
+            Some(_) => return Err(StoreError::EventConflict),
+            None => {
+                return Ok(EngineAdmissionPermit {
+                    admission: EngineAdmission::New,
+                    run_id: event.run_id.to_owned(),
+                    ledger_id,
+                    event_id: event.event_id.to_owned(),
+                    event_time_ns: event.event_time_ns,
+                    kind: event.kind.to_owned(),
+                    payload_json: event.payload_json.to_owned(),
+                });
+            }
+        }
+        let duplicate_attempts = sqlx::query_scalar::<_, i64>(
+            "SELECT duplicate_attempts \
+             FROM engine_event_admissions \
+             WHERE run_id = ?1 AND ledger_id = ?2 AND event_id = ?3",
+        )
         .bind(event.run_id)
-        .bind(event.event_time_ns)
-        .bind(event.kind)
-        .bind(event.payload_json)
+        .bind(ledger_id.as_str())
+        .bind(event.event_id)
+        .fetch_optional(&mut self.connection)
+        .await?;
+        Ok(EngineAdmissionPermit {
+            admission: match duplicate_attempts {
+                Some(duplicate_attempts) => EngineAdmission::Duplicate { duplicate_attempts },
+                None => EngineAdmission::New,
+            },
+            run_id: event.run_id.to_owned(),
+            ledger_id,
+            event_id: event.event_id.to_owned(),
+            event_time_ns: event.event_time_ns,
+            kind: event.kind.to_owned(),
+            payload_json: event.payload_json.to_owned(),
+        })
+    }
+
+    /// Atomically persists a new engine batch or acknowledges a known duplicate.
+    ///
+    /// The raw normalized source event is immutable and stored exactly once per
+    /// `(run, event)`. Every engine admission, ordered evidence record, and
+    /// checkpoint is independently scoped by `(run, ledger, event)`, allowing
+    /// rules-only and ML-champion ledgers to evaluate the same market event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for invalid inputs, a conflicting source event,
+    /// the requested recovery failpoint, or a database error. No partial batch
+    /// is durable on error.
+    pub(crate) async fn append_engine_batch(
+        &mut self,
+        batch: EngineBatchInput<'_>,
+        behavior: AtomicEngineAppend,
+    ) -> Result<EngineAppendOutcome, StoreError> {
+        validate_engine_batch(batch)?;
+
+        let mut transaction = self.connection.begin().await?;
+        let existing_event = sqlx::query_as::<_, (String, i64, String, String)>(
+            "SELECT run_id, event_time_ns, event_kind, payload_json \
+             FROM events WHERE event_id = ?1",
+        )
+        .bind(batch.event.event_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        match existing_event {
+            Some((run_id, event_time_ns, kind, payload_json))
+                if run_id == batch.event.run_id
+                    && event_time_ns == batch.event.event_time_ns
+                    && kind == batch.event.kind
+                    && payload_json == batch.event.payload_json => {}
+            Some(_) => return Err(StoreError::EventConflict),
+            None => {
+                sqlx::query(
+                    "INSERT INTO events \
+                     (event_id, run_id, event_time_ns, event_kind, payload_json) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )
+                .bind(batch.event.event_id)
+                .bind(batch.event.run_id)
+                .bind(batch.event.event_time_ns)
+                .bind(batch.event.kind)
+                .bind(batch.event.payload_json)
+                .execute(&mut *transaction)
+                .await?;
+            }
+        }
+
+        if behavior == AtomicEngineAppend::FailAfterEvent {
+            transaction.rollback().await?;
+            return Err(StoreError::InjectedFailure);
+        }
+
+        let duplicate_attempts = sqlx::query_scalar::<_, i64>(
+            "SELECT duplicate_attempts \
+             FROM engine_event_admissions \
+             WHERE run_id = ?1 AND ledger_id = ?2 AND event_id = ?3",
+        )
+        .bind(batch.event.run_id)
+        .bind(batch.ledger_id.as_str())
+        .bind(batch.event.event_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if duplicate_attempts.is_some() {
+            sqlx::query(
+                "UPDATE engine_event_admissions \
+                 SET duplicate_attempts = duplicate_attempts + 1 \
+                 WHERE run_id = ?1 AND ledger_id = ?2 AND event_id = ?3",
+            )
+            .bind(batch.event.run_id)
+            .bind(batch.ledger_id.as_str())
+            .bind(batch.event.event_id)
+            .execute(&mut *transaction)
+            .await?;
+            let duplicate_attempts = sqlx::query_scalar::<_, i64>(
+                "SELECT duplicate_attempts \
+                 FROM engine_event_admissions \
+                 WHERE run_id = ?1 AND ledger_id = ?2 AND event_id = ?3",
+            )
+            .bind(batch.event.run_id)
+            .bind(batch.ledger_id.as_str())
+            .bind(batch.event.event_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            return Ok(EngineAppendOutcome::Duplicate { duplicate_attempts });
+        }
+
+        sqlx::query(
+            "INSERT INTO engine_event_admissions \
+             (run_id, ledger_id, event_id, admitted_at_ns) \
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(batch.event.run_id)
+        .bind(batch.ledger_id.as_str())
+        .bind(batch.event.event_id)
+        .bind(batch.checkpoint.at_ns)
         .execute(&mut *transaction)
         .await?;
 
-        if behavior == AtomicAppend::FailAfterEvent {
+        for (sequence, record) in batch.records.iter().enumerate() {
+            let sequence = i64::try_from(sequence).map_err(|_| StoreError::InvalidInput {
+                field: "record sequence",
+                reason: "exceeds SQLite integer range",
+            })?;
+            sqlx::query(
+                "INSERT INTO engine_batch_records \
+                 (run_id, ledger_id, event_id, sequence, record_kind, payload_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )
+            .bind(batch.event.run_id)
+            .bind(batch.ledger_id.as_str())
+            .bind(batch.event.event_id)
+            .bind(sequence)
+            .bind(record.kind.as_str())
+            .bind(record.payload_json)
+            .execute(&mut *transaction)
+            .await?;
+        }
+
+        if behavior == AtomicEngineAppend::FailAfterRecords {
             transaction.rollback().await?;
             return Err(StoreError::InjectedFailure);
         }
 
         sqlx::query(
-            "INSERT INTO risk_decisions \
-             (decision_id, run_id, event_id, ledger_id, decided_at_ns, outcome, reason_code, details_json) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 'rejected', ?6, ?7)",
+            "INSERT INTO engine_checkpoints \
+             (checkpoint_id, run_id, ledger_id, event_id, as_of_time_ns, state_digest, state_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
-        .bind(rejection.decision_id)
-        .bind(rejection.run_id)
-        .bind(rejection.event_id)
-        .bind(rejection.ledger_id.as_str())
-        .bind(rejection.decided_at_ns)
-        .bind(rejection.reason_code)
-        .bind(rejection.details_json)
+        .bind(batch.checkpoint.checkpoint_id)
+        .bind(batch.event.run_id)
+        .bind(batch.ledger_id.as_str())
+        .bind(batch.event.event_id)
+        .bind(batch.checkpoint.at_ns)
+        .bind(batch.checkpoint.state_digest)
+        .bind(batch.checkpoint.state_json)
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
-        Ok(())
+        Ok(EngineAppendOutcome::Committed {
+            record_count: batch.records.len(),
+        })
     }
 
-    /// Returns event and risk-decision row counts for one validated run ID.
+    /// Persists a real core-engine outcome through the sole atomic journal path.
+    ///
+    /// This is the production writer boundary. It accepts no caller-authored
+    /// record JSON: the pure core supplies a one-way, secret-free persistence
+    /// projection whose event identity is verified against `event` before any
+    /// durable mutation is attempted. `event.event_time_ns` retains the raw
+    /// source/venue time, while the projection checkpoint retains the engine
+    /// processing/as-of time; their intentional two-time relationship is
+    /// causally bound by this exact admitted event ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] for a causality mismatch or any atomic batch
+    /// persistence error.
+    pub async fn append_engine_outcome(
+        &mut self,
+        permit: EngineAdmissionPermit,
+        event: EventInput<'_>,
+        outcome: &trench_core::engine::EngineOutcome,
+    ) -> Result<EngineAppendOutcome, StoreError> {
+        self.append_engine_outcome_with_behavior(permit, event, outcome, AtomicEngineAppend::Commit)
+            .await
+    }
+
+    /// Internal outcome path with a deterministic transaction failpoint.
+    ///
+    /// Production always uses [`Self::append_engine_outcome`]; crate-local
+    /// recovery tests use this to prove that a real core projection cannot
+    /// leave partial source, evidence, or checkpoint rows behind.
+    pub(crate) async fn append_engine_outcome_with_behavior(
+        &mut self,
+        permit: EngineAdmissionPermit,
+        event: EventInput<'_>,
+        outcome: &trench_core::engine::EngineOutcome,
+        behavior: AtomicEngineAppend,
+    ) -> Result<EngineAppendOutcome, StoreError> {
+        let projection = outcome.persistence_batch();
+        if projection.event_id() != event.event_id {
+            return Err(StoreError::InvalidInput {
+                field: "event_id",
+                reason: "event and engine outcome causality IDs differ",
+            });
+        }
+        let ledger_id = match outcome.state().ledger().ledger_id() {
+            trench_core::domain::LedgerId::RulesOnly => LedgerId::RulesOnly,
+            trench_core::domain::LedgerId::MlChampion => LedgerId::MlChampion,
+        };
+        if !permit.matches(event, ledger_id) {
+            return Err(StoreError::InvalidInput {
+                field: "engine admission",
+                reason: "permit does not match this outcome key",
+            });
+        }
+        let current_permit = self.engine_admission(event, ledger_id).await?;
+        if current_permit.admission() != permit.admission() {
+            return Err(StoreError::InvalidInput {
+                field: "engine admission",
+                reason: "permit is stale relative to durable admission",
+            });
+        }
+        match (permit.admission(), outcome.is_duplicate_noop()) {
+            (EngineAdmission::New, true) => {
+                return Err(StoreError::InvalidInput {
+                    field: "engine admission",
+                    reason: "new admission cannot persist a duplicate no-op",
+                });
+            }
+            (EngineAdmission::Duplicate { .. }, false) => {
+                return Err(StoreError::InvalidInput {
+                    field: "engine admission",
+                    reason: "duplicate admission must persist the duplicate no-op",
+                });
+            }
+            _ => {}
+        }
+        let records = projection
+            .records()
+            .iter()
+            .map(|record| {
+                EngineRecordInput::new(
+                    match record.kind() {
+                        trench_core::engine::EnginePersistenceKind::Snapshot => {
+                            EngineRecordKind::Snapshot
+                        }
+                        trench_core::engine::EnginePersistenceKind::Signal => {
+                            EngineRecordKind::Signal
+                        }
+                        trench_core::engine::EnginePersistenceKind::Intent => {
+                            EngineRecordKind::Intent
+                        }
+                        trench_core::engine::EnginePersistenceKind::Risk => EngineRecordKind::Risk,
+                        trench_core::engine::EnginePersistenceKind::Order => {
+                            EngineRecordKind::Order
+                        }
+                        trench_core::engine::EnginePersistenceKind::Fill => EngineRecordKind::Fill,
+                        trench_core::engine::EnginePersistenceKind::Ledger => {
+                            EngineRecordKind::Ledger
+                        }
+                        trench_core::engine::EnginePersistenceKind::Breaker => {
+                            EngineRecordKind::Breaker
+                        }
+                    },
+                    record.payload_json(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let checkpoint = projection.checkpoint();
+        self.append_engine_batch(
+            EngineBatchInput {
+                event,
+                ledger_id,
+                records: &records,
+                checkpoint: EngineCheckpointInput {
+                    checkpoint_id: checkpoint.checkpoint_id(),
+                    ledger_id,
+                    at_ns: checkpoint.at().value(),
+                    state_digest: checkpoint.state_digest(),
+                    state_json: checkpoint.state_json(),
+                },
+            },
+            behavior,
+        )
+        .await
+    }
+
+    /// Returns durable raw-event and ledger-scoped engine-journal counts.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] for an invalid run ID or a database error.
-    pub async fn journal_counts(&mut self, run_id: &str) -> Result<JournalCounts, StoreError> {
+    pub async fn engine_journal_counts(
+        &mut self,
+        run_id: &str,
+    ) -> Result<EngineJournalCounts, StoreError> {
         validate_id("run_id", run_id)?;
-        let (events, risk_decisions) = sqlx::query_as::<_, (i64, i64)>(
-            "SELECT \
-                 (SELECT COUNT(*) FROM events WHERE run_id = ?1), \
-                 (SELECT COUNT(*) FROM risk_decisions WHERE run_id = ?1)",
-        )
-        .bind(run_id)
-        .fetch_one(&mut self.connection)
-        .await?;
-        Ok(JournalCounts {
+        let (events, admissions, records, checkpoints, duplicate_attempts) =
+            sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
+                "SELECT \
+                     (SELECT COUNT(*) FROM events WHERE run_id = ?1), \
+                     (SELECT COUNT(*) FROM engine_event_admissions WHERE run_id = ?1), \
+                     (SELECT COUNT(*) FROM engine_batch_records WHERE run_id = ?1), \
+                     (SELECT COUNT(*) FROM engine_checkpoints WHERE run_id = ?1), \
+                     COALESCE((SELECT SUM(duplicate_attempts) \
+                               FROM engine_event_admissions WHERE run_id = ?1), 0)",
+            )
+            .bind(run_id)
+            .fetch_one(&mut self.connection)
+            .await?;
+        Ok(EngineJournalCounts {
             events,
-            risk_decisions,
+            admissions,
+            records,
+            checkpoints,
+            duplicate_attempts,
         })
     }
 
@@ -561,12 +996,37 @@ fn validate_event(input: EventInput<'_>) -> Result<(), StoreError> {
     validate_timestamp("event_time_ns", input.event_time_ns)
 }
 
-fn validate_rejection(input: RiskRejectionInput<'_>) -> Result<(), StoreError> {
-    validate_id("run_id", input.run_id)?;
-    validate_id("decision_id", input.decision_id)?;
-    validate_id("event_id", input.event_id)?;
-    validate_code("reason code", input.reason_code)?;
-    validate_timestamp("decided_at_ns", input.decided_at_ns)
+fn validate_engine_batch(input: EngineBatchInput<'_>) -> Result<(), StoreError> {
+    validate_event(input.event)?;
+    validate_json("event payload", input.event.payload_json)?;
+    if input.records.is_empty() || input.records.len() > MAX_ENGINE_RECORDS {
+        return Err(StoreError::InvalidInput {
+            field: "engine records",
+            reason: "must contain between 1 and 1024 records",
+        });
+    }
+    for record in input.records {
+        validate_json("engine record payload", record.payload_json)?;
+    }
+    validate_id("checkpoint_id", input.checkpoint.checkpoint_id)?;
+    validate_timestamp("checkpoint as_of_time_ns", input.checkpoint.at_ns)?;
+    validate_id("checkpoint state_digest", input.checkpoint.state_digest)?;
+    validate_json("checkpoint state_json", input.checkpoint.state_json)?;
+    if input.ledger_id != input.checkpoint.ledger_id {
+        return Err(StoreError::InvalidInput {
+            field: "ledger_id",
+            reason: "batch and checkpoint ledgers differ",
+        });
+    }
+    Ok(())
+}
+
+fn validate_json(field: &'static str, value: &str) -> Result<(), StoreError> {
+    serde_json::from_str::<serde_json::Value>(value).map_err(|_| StoreError::InvalidInput {
+        field,
+        reason: "must be valid JSON",
+    })?;
+    Ok(())
 }
 
 fn validate_id(field: &'static str, value: &str) -> Result<(), StoreError> {

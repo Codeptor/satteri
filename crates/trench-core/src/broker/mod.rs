@@ -4,6 +4,8 @@
 //! approval; all book use requires an explicit fresh, post-recovery proof.
 
 use rust_decimal::Decimal;
+use serde::Serialize;
+use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::book::OrderBook;
@@ -31,7 +33,7 @@ const MANDATORY_CAP: Decimal = Decimal::from_parts(200, 0, 0, false, 0);
 const NORMAL_EXIT_GRACE_NS: i64 = 5_000_000_000;
 
 /// The exhaustive state machine for one isolated paper ledger.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum BrokerState {
     /// A sealed order is waiting for the first strictly later executable book.
     PendingEntry,
@@ -50,7 +52,7 @@ pub enum BrokerState {
 }
 
 /// Why an exit transition was requested.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ExitReason {
     /// Strategy discretionary exit.
     Strategy,
@@ -112,7 +114,7 @@ pub enum LatencyKind {
 }
 
 /// Immutable binding attached to every measured latency sample.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BrokerRunContext {
     run_id: RunId,
     run_digest: String,
@@ -321,13 +323,13 @@ impl ExecutableMark {
 }
 
 /// Stable ordering for distinct normalized market events at one venue instant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 enum MarketObservationKind {
     Mark,
     Funding,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 struct MarketObservationCursor {
     event_time: TimestampNs,
     kind: MarketObservationKind,
@@ -427,7 +429,7 @@ impl ExecutableFunding {
 }
 
 /// Frozen broker thresholds recorded with the run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct BrokerConfig {
     minimum_notional: Usdc,
     maximum_book_age: DurationNs,
@@ -495,7 +497,7 @@ impl BrokerConfig {
 }
 
 /// Exact actual position state exposed to the engine and journal.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BrokerPosition {
     market: Market,
     side: PositionSide,
@@ -574,6 +576,179 @@ impl BrokerTransition {
     #[must_use]
     pub fn records(&self) -> &[BrokerRecord] {
         &self.records
+    }
+
+    pub(crate) fn persistence_json(&self) -> Value {
+        json!({
+            "at_ns": self.at.value(),
+            "state": broker_state_name(self.state),
+            "records": self.records.iter().map(broker_record_json).collect::<Vec<_>>(),
+        })
+    }
+}
+
+fn broker_record_json(record: &BrokerRecord) -> Value {
+    match record {
+        BrokerRecord::EntryQueued {
+            requested_quantity,
+            decision_complete_at,
+        } => json!({
+            "type": "entry_queued",
+            "requested_quantity": requested_quantity.value().to_string(),
+            "decision_complete_at_ns": decision_complete_at.value(),
+        }),
+        BrokerRecord::TakerFill {
+            role,
+            side,
+            book_event_id,
+            walk,
+            fees,
+            cost,
+        } => json!({
+            "type": "taker_fill",
+            "role": execution_role_name(*role),
+            "side": side_name(*side),
+            "book_event_id": book_event_id.as_str(),
+            "walk": quantity_walk_json(walk),
+            "fees": fee_breakdown_json(*fees),
+            "cost": execution_cost_json(*cost),
+        }),
+        BrokerRecord::EntryResidualCancelled { quantity } => json!({
+            "type": "entry_residual_cancelled",
+            "quantity": quantity.value().to_string(),
+        }),
+        BrokerRecord::ExitPending {
+            reason,
+            quantity,
+            next_limit_band,
+        } => json!({
+            "type": "exit_pending",
+            "reason": exit_reason_name(*reason),
+            "quantity": quantity.value().to_string(),
+            "next_limit_band_bps": next_limit_band.map(|band| band.value().to_string()),
+        }),
+        BrokerRecord::Latency(sample) => json!({
+            "type": "latency",
+            "kind": latency_kind_name(sample.kind()),
+            "origin_at_ns": sample.origin_at().value(),
+            "book_received_at_ns": sample.book_received_at().value(),
+            "observed_ns": sample.observed().value(),
+            "source_book_event_id": sample.source_book_event_id().as_str(),
+            "run_id": sample.context().run_id().as_str(),
+            "run_digest": sample.context().run_digest(),
+            "deployment_digest": sample.context().deployment_digest(),
+        }),
+        BrokerRecord::Funding {
+            venue_at,
+            source_event_id,
+            rate,
+            mark_price,
+            amount,
+        } => json!({
+            "type": "funding",
+            "venue_at_ns": venue_at.value(),
+            "source_event_id": source_event_id.as_str(),
+            "rate": rate.value().to_string(),
+            "mark_price": mark_price.value().to_string(),
+            "amount": amount.value().to_string(),
+        }),
+        BrokerRecord::LiquidationLoss {
+            quantity,
+            forfeited_isolated_equity,
+            uncharged_gap_loss,
+        } => json!({
+            "type": "liquidation_loss",
+            "quantity": quantity.value().to_string(),
+            "forfeited_isolated_equity": forfeited_isolated_equity.value().to_string(),
+            "uncharged_gap_loss": uncharged_gap_loss.value().to_string(),
+        }),
+        BrokerRecord::StateChanged { from, to, reason } => json!({
+            "type": "state_changed",
+            "from": broker_state_name(*from),
+            "to": broker_state_name(*to),
+            "reason": reason.map(exit_reason_name),
+        }),
+    }
+}
+
+fn quantity_walk_json(walk: &QuantityWalk) -> Value {
+    json!({
+        "requested_quantity": walk.requested_quantity().value().to_string(),
+        "filled_quantity": walk.filled_quantity().value().to_string(),
+        "remaining_quantity": walk.remaining_quantity().value().to_string(),
+        "filled_notional": walk.filled_notional().value().to_string(),
+        "levels": walk.levels().iter().map(|level| json!({
+            "price": level.price().value().to_string(),
+            "quantity": level.quantity().value().to_string(),
+            "notional": level.notional().value().to_string(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn fee_breakdown_json(fees: FeeBreakdown) -> Value {
+    json!({
+        "protocol_fee": fees.protocol_fee().value().to_string(),
+        "builder_fee": fees.builder_fee().value().to_string(),
+        "total_fee": fees.total_fee().value().to_string(),
+    })
+}
+
+fn execution_cost_json(cost: ExecutionCost) -> Value {
+    json!({
+        "fees": fee_breakdown_json(cost.fees()),
+        "spread": cost.spread().value().to_string(),
+        "depth_slippage": cost.depth_slippage().value().to_string(),
+        "latency_loss": cost.latency_loss().value().to_string(),
+        "funding": cost.funding().value().to_string(),
+        "gross_alpha": cost.gross_alpha().value().to_string(),
+    })
+}
+
+const fn broker_state_name(state: BrokerState) -> &'static str {
+    match state {
+        BrokerState::PendingEntry => "pending_entry",
+        BrokerState::Open => "open",
+        BrokerState::NormalExit => "normal_exit",
+        BrokerState::MandatoryExit => "mandatory_exit",
+        BrokerState::Flat => "flat",
+        BrokerState::Liquidated => "liquidated",
+        BrokerState::Unresolved => "unresolved",
+    }
+}
+
+const fn exit_reason_name(reason: ExitReason) -> &'static str {
+    match reason {
+        ExitReason::Strategy => "strategy",
+        ExitReason::TakeProfit => "take_profit",
+        ExitReason::Time => "time",
+        ExitReason::OppositeSignal => "opposite_signal",
+        ExitReason::Stop => "stop",
+        ExitReason::Breaker => "breaker",
+        ExitReason::Dust => "dust",
+        ExitReason::Liquidation => "liquidation",
+    }
+}
+
+const fn execution_role_name(role: ExecutionRole) -> &'static str {
+    match role {
+        ExecutionRole::Entry => "entry",
+        ExecutionRole::NormalExit => "normal_exit",
+        ExecutionRole::MandatoryExit => "mandatory_exit",
+        ExecutionRole::Liquidation => "liquidation",
+    }
+}
+
+const fn side_name(side: Side) -> &'static str {
+    match side {
+        Side::Buy => "buy",
+        Side::Sell => "sell",
+    }
+}
+
+const fn latency_kind_name(kind: LatencyKind) -> &'static str {
+    match kind {
+        LatencyKind::DecisionToBook => "decision_to_book",
+        LatencyKind::TriggerToBook => "trigger_to_book",
     }
 }
 
@@ -720,7 +895,7 @@ impl ExecutableExitQuote {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct PaperOrder {
     market: Market,
     side: PositionSide,
@@ -756,26 +931,26 @@ impl PaperOrder {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct PendingEntry {
     order: PaperOrder,
     decision_complete_at: TimestampNs,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 struct ExitRequest {
     reason: ExitReason,
     trigger_at: TimestampNs,
     mark_price: Price,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct MandatoryExit {
     request: ExitRequest,
     next_band: Option<Bps>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct ActivePosition {
     view: BrokerPosition,
     collateral: Decimal,
@@ -976,7 +1151,7 @@ impl ActivePosition {
 }
 
 /// One sealed-order paper broker. It owns no clock, I/O, signer, or live action.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PaperBroker {
     config: BrokerConfig,
     context: BrokerRunContext,

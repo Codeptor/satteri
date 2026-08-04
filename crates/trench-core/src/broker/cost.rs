@@ -1,6 +1,7 @@
 //! Frozen primary taker fees for deterministic paper execution.
 
 use rust_decimal::Decimal;
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::{
@@ -99,7 +100,7 @@ impl FeeBreakdown {
 
 /// A signed synthetic-USDC attribution. Positive values are debits/losses;
 /// negative values are funding receipts or favorable price movement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SignedUsdc(Decimal);
 
 impl SignedUsdc {

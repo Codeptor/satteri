@@ -5,6 +5,7 @@ use std::fmt;
 
 use blake3::Hasher;
 use rust_decimal::Decimal;
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::domain::{DomainError, EventId, Market, Price, Quantity, Side, Usdc};
@@ -82,7 +83,7 @@ pub enum EventError {
 }
 
 /// Nonnegative Unix time in nanoseconds bounded to SQLite-compatible `i64`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct TimestampNs(i64);
 
 impl TimestampNs {
@@ -141,7 +142,7 @@ impl fmt::Display for TimestampNs {
 }
 
 /// Nonnegative duration in nanoseconds bounded to `i64::MAX`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct DurationNs(i64);
 
 impl DurationNs {

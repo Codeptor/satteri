@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 
 use blake3::Hasher;
 use rust_decimal::Decimal;
+use serde::Serialize;
+use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::book::OrderBook;
@@ -17,12 +19,17 @@ use crate::ledger::{
     BookFreshness, EntryFill, LedgerError, LedgerState, LedgerTransition, MarkCosts,
 };
 use crate::risk::sizing::{
-    RiskEngine, RiskError, RiskInputError, RiskPolicy, RiskQuote, RiskRequest, RiskSnapshot,
+    RiskEngine, RiskError, RiskInputError, RiskPolicy, RiskQuote, RiskRejection, RiskRequest,
+    RiskSnapshot,
 };
 use crate::strategy::{
-    CostDecision, CostRejection, OrderIntent, QuoteId, SignalCandidate, Strategy, StrategyKind,
+    CostAttribution, CostDecision, CostFeasibilityReason, CostRejection, OrderIntent, QuoteId,
+    SignalCandidate, Strategy, StrategyKind,
 };
 use crate::universe::UniverseActivation;
+
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 /// Immutable causal identity shared by every record emitted from one input event.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -306,6 +313,15 @@ pub struct EngineState {
     recovered_markets: BTreeMap<Market, TimestampNs>,
 }
 
+#[derive(Serialize)]
+struct EngineCheckpointState<'a> {
+    schema_version: u8,
+    ledger: &'a LedgerState,
+    broker: &'a PaperBroker,
+    risk_policy_digests: BTreeMap<&'a str, String>,
+    recovered_markets: &'a BTreeMap<Market, TimestampNs>,
+}
+
 impl EngineState {
     /// Starts an engine state from independently constructed paper components.
     #[must_use]
@@ -333,6 +349,22 @@ impl EngineState {
     #[must_use]
     pub const fn broker(&self) -> &PaperBroker {
         &self.broker
+    }
+
+    fn persistence_state_json(&self) -> String {
+        let risk_policy_digests = self
+            .risk_policies
+            .iter()
+            .map(|(market, policy)| (market.as_str(), policy.commitment_digest()))
+            .collect::<BTreeMap<_, _>>();
+        serde_json::to_string(&EngineCheckpointState {
+            schema_version: 1,
+            ledger: &self.ledger,
+            broker: &self.broker,
+            risk_policy_digests,
+            recovered_markets: &self.recovered_markets,
+        })
+        .expect("engine checkpoint state contains only serializable fields")
     }
 
     #[cfg(test)]
@@ -550,6 +582,400 @@ impl EngineOutcome {
     #[must_use]
     pub fn into_parts(self) -> (EngineState, EngineBatch) {
         (self.state, self.batch)
+    }
+
+    /// Produces the one-way, secret-free durability projection for this outcome.
+    ///
+    /// The projection deliberately excludes the risk engine's private approval
+    /// cache. It retains the complete broker and isolated-ledger successor state
+    /// plus every causal record required to audit paper execution.
+    #[must_use]
+    pub fn persistence_batch(&self) -> EnginePersistenceBatch {
+        let state_json = self.state.persistence_state_json();
+        let mut hasher = Hasher::new_derive_key("trench.engine-checkpoint.v1");
+        hasher.update(state_json.as_bytes());
+        let state_digest = hasher.finalize().to_hex().to_string();
+        let mut checkpoint_hasher = Hasher::new_derive_key("trench.engine-checkpoint-id.v1");
+        checkpoint_hasher.update(self.batch.causality_id.event_id().as_str().as_bytes());
+        checkpoint_hasher.update(state_digest.as_bytes());
+        let checkpoint_id = format!("b3:{}", checkpoint_hasher.finalize().to_hex());
+        EnginePersistenceBatch {
+            event_id: self.batch.causality_id.event_id().as_str().to_owned(),
+            at: self.batch.at,
+            records: self
+                .batch
+                .records
+                .iter()
+                .map(|record| EnginePersistenceRecord {
+                    kind: persistence_kind(record.record()),
+                    payload_json: json!({
+                        "schema_version": 1,
+                        "causality_id": record.causality_id().event_id().as_str(),
+                        "record": persistence_record_json(record.record()),
+                    })
+                    .to_string(),
+                })
+                .collect(),
+            checkpoint: EnginePersistenceCheckpoint {
+                checkpoint_id,
+                at: self.batch.at,
+                state_digest,
+                state_json,
+            },
+        }
+    }
+
+    /// Returns whether this outcome is the exact durable-duplicate no-op.
+    #[must_use]
+    pub fn is_duplicate_noop(&self) -> bool {
+        matches!(
+            self.batch.records.as_slice(),
+            [record] if matches!(record.record(), EngineRecord::DuplicateIgnored)
+        )
+    }
+}
+
+/// Stable storage category for a secret-free causal engine record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnginePersistenceKind {
+    /// Source, universe, recovery, or executable-snapshot evidence.
+    Snapshot,
+    /// Strategy signal or cost-decision evidence.
+    Signal,
+    /// Intent-selection evidence.
+    Intent,
+    /// Sealed-risk lifecycle evidence with no sealed order data.
+    Risk,
+    /// Paper order lifecycle evidence.
+    Order,
+    /// Primary-taker execution evidence.
+    Fill,
+    /// Isolated-ledger state transition evidence.
+    Ledger,
+    /// Breaker, terminal, or no-op evidence.
+    Breaker,
+}
+
+/// One serialized causal record produced only by the pure core engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnginePersistenceRecord {
+    kind: EnginePersistenceKind,
+    payload_json: String,
+}
+
+impl EnginePersistenceRecord {
+    /// Returns the stable durability category.
+    #[must_use]
+    pub const fn kind(&self) -> EnginePersistenceKind {
+        self.kind
+    }
+
+    /// Returns canonical JSON evidence for this causal record.
+    #[must_use]
+    pub fn payload_json(&self) -> &str {
+        &self.payload_json
+    }
+}
+
+/// Deterministic successor-state checkpoint for the storage boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnginePersistenceCheckpoint {
+    checkpoint_id: String,
+    at: TimestampNs,
+    state_digest: String,
+    state_json: String,
+}
+
+impl EnginePersistenceCheckpoint {
+    /// Returns the event-bound unique checkpoint identity.
+    #[must_use]
+    pub fn checkpoint_id(&self) -> &str {
+        &self.checkpoint_id
+    }
+
+    /// Returns the explicit successor-state boundary time.
+    #[must_use]
+    pub const fn at(&self) -> TimestampNs {
+        self.at
+    }
+
+    /// Returns the BLAKE3 digest of the canonical successor-state JSON.
+    #[must_use]
+    pub fn state_digest(&self) -> &str {
+        &self.state_digest
+    }
+
+    /// Returns canonical successor-state JSON without risk approval seals.
+    #[must_use]
+    pub fn state_json(&self) -> &str {
+        &self.state_json
+    }
+}
+
+/// Complete one-way persistence projection for a real [`EngineOutcome`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnginePersistenceBatch {
+    event_id: String,
+    at: TimestampNs,
+    records: Vec<EnginePersistenceRecord>,
+    checkpoint: EnginePersistenceCheckpoint,
+}
+
+impl EnginePersistenceBatch {
+    /// Returns the normalized source event identity.
+    #[must_use]
+    pub fn event_id(&self) -> &str {
+        &self.event_id
+    }
+
+    /// Returns the explicit engine processing/as-of boundary.
+    ///
+    /// This is intentionally separate from a normalized source event's
+    /// venue/source time, which the storage boundary retains with the same
+    /// causality ID in its immutable raw-event record.
+    #[must_use]
+    pub const fn at(&self) -> TimestampNs {
+        self.at
+    }
+
+    /// Returns ordered, secret-free causal records.
+    #[must_use]
+    pub fn records(&self) -> &[EnginePersistenceRecord] {
+        &self.records
+    }
+
+    /// Returns the complete successor-state checkpoint.
+    #[must_use]
+    pub const fn checkpoint(&self) -> &EnginePersistenceCheckpoint {
+        &self.checkpoint
+    }
+}
+
+fn persistence_kind(record: &EngineRecord) -> EnginePersistenceKind {
+    match record {
+        EngineRecord::EventReceived
+        | EngineRecord::SnapshotRejected
+        | EngineRecord::MarketRecovered { .. }
+        | EngineRecord::RecoveryRejected { .. } => EnginePersistenceKind::Snapshot,
+        EngineRecord::StrategyContextRejected { .. }
+        | EngineRecord::CostAccepted { .. }
+        | EngineRecord::CostRejected { .. } => EnginePersistenceKind::Signal,
+        EngineRecord::QuoteConsumed { .. } => EnginePersistenceKind::Intent,
+        EngineRecord::RiskQuoted { .. } | EngineRecord::QuoteDiscarded { .. } => {
+            EnginePersistenceKind::Risk
+        }
+        EngineRecord::EntryQueued { .. } => EnginePersistenceKind::Order,
+        EngineRecord::BrokerApplied { .. } => EnginePersistenceKind::Fill,
+        EngineRecord::LedgerApplied { .. } => EnginePersistenceKind::Ledger,
+        EngineRecord::TerminalInputRejected { .. }
+        | EngineRecord::EntryBlocked { .. }
+        | EngineRecord::DuplicateIgnored => EnginePersistenceKind::Breaker,
+    }
+}
+
+fn persistence_record_json(record: &EngineRecord) -> Value {
+    match record {
+        EngineRecord::EventReceived => json!({ "type": "event_received" }),
+        EngineRecord::SnapshotRejected => json!({ "type": "snapshot_rejected" }),
+        EngineRecord::StrategyContextRejected { candidate } => json!({
+            "type": "strategy_context_rejected",
+            "candidate": candidate_json(candidate),
+        }),
+        EngineRecord::RiskQuoted { candidate, quote } => json!({
+            "type": "risk_quoted",
+            "candidate": candidate_json(candidate),
+            "quote": risk_quote_json(quote),
+        }),
+        EngineRecord::CostAccepted {
+            candidate,
+            net_edge,
+        } => json!({
+            "type": "cost_accepted",
+            "candidate": candidate_json(candidate),
+            "net_edge": net_edge.to_string(),
+        }),
+        EngineRecord::CostRejected { candidate, reason } => json!({
+            "type": "cost_rejected",
+            "candidate": candidate_json(candidate),
+            "reason": cost_rejection_name(*reason),
+        }),
+        EngineRecord::QuoteDiscarded {
+            candidate,
+            quote_id,
+        } => json!({
+            "type": "quote_discarded",
+            "candidate": candidate_json(candidate),
+            "quote_id": quote_id.as_str(),
+        }),
+        EngineRecord::QuoteConsumed {
+            candidate,
+            quote_id,
+        } => json!({
+            "type": "quote_consumed",
+            "candidate": candidate_json(candidate),
+            "quote_id": quote_id.as_str(),
+        }),
+        EngineRecord::EntryQueued {
+            candidate,
+            transition,
+        } => json!({
+            "type": "entry_queued",
+            "candidate": candidate_json(candidate),
+            "broker_transition": transition.persistence_json(),
+        }),
+        EngineRecord::MarketRecovered { market } => json!({
+            "type": "market_recovered",
+            "market": market.as_str(),
+        }),
+        EngineRecord::RecoveryRejected { market } => json!({
+            "type": "recovery_rejected",
+            "market": market.as_str(),
+        }),
+        EngineRecord::TerminalInputRejected { broker_state } => json!({
+            "type": "terminal_input_rejected",
+            "broker_state": broker_state_name(*broker_state),
+        }),
+        EngineRecord::BrokerApplied { transition } => json!({
+            "type": "broker_applied",
+            "broker_transition": transition.persistence_json(),
+        }),
+        EngineRecord::LedgerApplied { transition } => json!({
+            "type": "ledger_applied",
+            "ledger_transition": transition.persistence_json(),
+        }),
+        EngineRecord::EntryBlocked { broker_state } => json!({
+            "type": "entry_blocked",
+            "broker_state": broker_state_name(*broker_state),
+        }),
+        EngineRecord::DuplicateIgnored => json!({ "type": "duplicate_ignored" }),
+    }
+}
+
+fn candidate_json(candidate: &SignalCandidate) -> Value {
+    json!({
+        "strategy": strategy_kind_name(candidate.strategy()),
+        "market": candidate.market().as_str(),
+        "side": side_name(candidate.side()),
+        "sleeve": sleeve_name(candidate.sleeve()),
+        "decision_time_ns": candidate.decision_time().value(),
+        "gross_edge": candidate.gross_edge().to_string(),
+        "reference_entry": candidate.reference_entry().value().to_string(),
+        "stop": candidate.stop().value().to_string(),
+        "target": candidate.target().value().to_string(),
+        "time_exit_ns": candidate.time_exit().value(),
+        "snapshot_digest": candidate.snapshot_digest(),
+        "universe_digest": candidate.universe_digest(),
+        "history_digest": candidate.history_digest(),
+        "strategy_fingerprint": candidate.strategy_fingerprint(),
+        "explanation_json": candidate.explanation_json(),
+        "digest": candidate.digest(),
+    })
+}
+
+fn risk_quote_json(quote: &RiskQuote) -> Value {
+    let cost_quote = quote.cost_quote();
+    let freshness = cost_quote.freshness();
+    let source_digests = cost_quote.source_digests();
+    json!({
+        "quote_id": cost_quote.quote_id().as_str(),
+        "market": cost_quote.market().as_str(),
+        "candidate_digest": cost_quote.candidate_digest(),
+        "as_of_time_ns": freshness.as_of_time().value(),
+        "valid_through_ns": freshness.valid_through().value(),
+        "book_digest": source_digests.book(),
+        "risk_digest": source_digests.risk(),
+        "total_cost_fraction": cost_quote.total_cost_fraction().to_string(),
+        "attributions": cost_quote
+            .attributions()
+            .iter()
+            .map(cost_attribution_json)
+            .collect::<Vec<_>>(),
+        "infeasibility_reasons": cost_quote
+            .infeasibility_reasons()
+            .iter()
+            .map(|reason| cost_feasibility_reason_name(*reason))
+            .collect::<Vec<_>>(),
+        "risk_rejections": quote
+            .rejections()
+            .iter()
+            .map(|reason| risk_rejection_name(*reason))
+            .collect::<Vec<_>>(),
+        "approved": quote.is_approved(),
+    })
+}
+
+fn cost_attribution_json(attribution: &CostAttribution) -> Value {
+    let (kind, fraction) = match attribution {
+        CostAttribution::EntryFee(fraction) => ("entry_fee", fraction),
+        CostAttribution::ExitFee(fraction) => ("exit_fee", fraction),
+        CostAttribution::FundingReserve(fraction) => ("funding_reserve", fraction),
+        CostAttribution::MarketImpact(fraction) => ("market_impact", fraction),
+    };
+    json!({ "kind": kind, "fraction": fraction.to_string() })
+}
+
+const fn strategy_kind_name(kind: StrategyKind) -> &'static str {
+    match kind {
+        StrategyKind::RulesOnly => "rules_only",
+        StrategyKind::MlChampion => "ml_champion",
+    }
+}
+
+const fn side_name(side: crate::domain::Side) -> &'static str {
+    match side {
+        crate::domain::Side::Buy => "buy",
+        crate::domain::Side::Sell => "sell",
+    }
+}
+
+const fn sleeve_name(sleeve: crate::domain::Sleeve) -> &'static str {
+    match sleeve {
+        crate::domain::Sleeve::FifteenMinute => "15m",
+        crate::domain::Sleeve::OneHour => "1h",
+    }
+}
+
+const fn cost_rejection_name(reason: CostRejection) -> &'static str {
+    match reason {
+        CostRejection::Mismatch => "mismatch",
+        CostRejection::Stale => "stale",
+        CostRejection::Infeasible => "infeasible",
+        CostRejection::InsufficientGrossEdge => "insufficient_gross_edge",
+    }
+}
+
+const fn cost_feasibility_reason_name(reason: CostFeasibilityReason) -> &'static str {
+    match reason {
+        CostFeasibilityReason::InsufficientDepth => "insufficient_depth",
+        CostFeasibilityReason::PriceBand => "price_band",
+        CostFeasibilityReason::VenueConstraint => "venue_constraint",
+        CostFeasibilityReason::RiskBlocked => "risk_blocked",
+    }
+}
+
+const fn risk_rejection_name(reason: RiskRejection) -> &'static str {
+    match reason {
+        RiskRejection::CandidateTimeMismatch => "candidate_time_mismatch",
+        RiskRejection::UniverseDigestMismatch => "universe_digest_mismatch",
+        RiskRejection::RiskBudget => "risk_budget",
+        RiskRejection::VenueConstraint => "venue_constraint",
+        RiskRejection::MarginCap => "margin_cap",
+        RiskRejection::LiquidationDistance => "liquidation_distance",
+        RiskRejection::Liquidation => "liquidation",
+        RiskRejection::PriceBand => "price_band",
+        RiskRejection::ApprovalCapacity => "approval_capacity",
+    }
+}
+
+const fn broker_state_name(state: BrokerState) -> &'static str {
+    match state {
+        BrokerState::PendingEntry => "pending_entry",
+        BrokerState::Open => "open",
+        BrokerState::NormalExit => "normal_exit",
+        BrokerState::MandatoryExit => "mandatory_exit",
+        BrokerState::Flat => "flat",
+        BrokerState::Liquidated => "liquidated",
+        BrokerState::Unresolved => "unresolved",
     }
 }
 
@@ -1951,6 +2377,30 @@ mod tests {
                 transition,
             } if transition.kind() == crate::ledger::LedgerTransitionKind::PositionReduced
         )));
+        let persisted = outcome
+            .persistence_batch()
+            .records()
+            .iter()
+            .map(|record| {
+                serde_json::from_str::<serde_json::Value>(record.payload_json())
+                    .expect("typed persistence evidence should serialize")
+            })
+            .collect::<Vec<_>>();
+        assert!(persisted.iter().any(|record| {
+            record["record"]["type"] == "broker_applied"
+                && record["record"]["broker_transition"]["records"]
+                    .as_array()
+                    .is_some_and(|records| {
+                        records.iter().any(|broker_record| {
+                            broker_record["type"] == "taker_fill"
+                                && broker_record["walk"]["remaining_quantity"] != "0"
+                        })
+                    })
+        }));
+        assert!(persisted.iter().any(|record| {
+            record["record"]["type"] == "ledger_applied"
+                && record["record"]["ledger_transition"]["kind"] == "position_reduced"
+        }));
     }
 
     #[test]
@@ -1981,6 +2431,29 @@ mod tests {
                 transition,
             } if transition.kind() == crate::ledger::LedgerTransitionKind::FundingApplied
         )));
+        let persisted = debit
+            .persistence_batch()
+            .records()
+            .iter()
+            .map(|record| {
+                serde_json::from_str::<serde_json::Value>(record.payload_json())
+                    .expect("typed persistence evidence should serialize")
+            })
+            .collect::<Vec<_>>();
+        assert!(persisted.iter().any(|record| {
+            record["record"]["type"] == "broker_applied"
+                && record["record"]["broker_transition"]["records"]
+                    .as_array()
+                    .is_some_and(|records| {
+                        records.iter().any(|broker_record| {
+                            broker_record["type"] == "funding" && broker_record["amount"] != "0"
+                        })
+                    })
+        }));
+        assert!(persisted.iter().any(|record| {
+            record["record"]["type"] == "ledger_applied"
+                && record["record"]["ledger_transition"]["kind"] == "funding_applied"
+        }));
 
         let credit_at = timestamp(i128::from(at.value()) + 3);
         let credit = Engine::apply(
@@ -2053,6 +2526,29 @@ mod tests {
                 transition,
             } if transition.kind() == crate::ledger::LedgerTransitionKind::PositionLiquidated
         )));
+        let persisted = outcome
+            .persistence_batch()
+            .records()
+            .iter()
+            .map(|record| {
+                serde_json::from_str::<serde_json::Value>(record.payload_json())
+                    .expect("typed persistence evidence should serialize")
+            })
+            .collect::<Vec<_>>();
+        assert!(persisted.iter().any(|record| {
+            record["record"]["type"] == "broker_applied"
+                && record["record"]["broker_transition"]["records"]
+                    .as_array()
+                    .is_some_and(|records| {
+                        records
+                            .iter()
+                            .any(|broker_record| broker_record["type"] == "liquidation_loss")
+                    })
+        }));
+        assert!(persisted.iter().any(|record| {
+            record["record"]["type"] == "ledger_applied"
+                && record["record"]["ledger_transition"]["kind"] == "position_liquidated"
+        }));
     }
 
     #[test]

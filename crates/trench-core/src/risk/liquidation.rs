@@ -5,13 +5,14 @@
 //! belongs to the same maintenance tier used to solve it.
 
 use rust_decimal::Decimal;
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::domain::{DomainError, Price, Quantity, Usdc};
 use crate::ledger::PositionSide;
 
 /// One point-in-time venue maintenance tier, represented as `[lower, upper)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct MaintenanceTier {
     lower_notional: Usdc,
     upper_notional: Option<Usdc>,
@@ -78,7 +79,7 @@ impl MaintenanceTier {
 }
 
 /// A complete contiguous point-in-time venue maintenance table.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MaintenanceTiers(Vec<MaintenanceTier>);
 
 impl MaintenanceTiers {
@@ -190,7 +191,7 @@ impl LiquidationInput {
 }
 
 /// A tier-valid liquidation result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct LiquidationResult {
     price: Price,
     tier_index: usize,

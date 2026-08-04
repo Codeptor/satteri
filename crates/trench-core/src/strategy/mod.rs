@@ -348,6 +348,12 @@ impl QuoteId {
         }
         Ok(Self(value))
     }
+
+    /// Returns the opaque stable quote identity without exposing sealed order data.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Explicit validity interval for one risk-sized public cost quote.

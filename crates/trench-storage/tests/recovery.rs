@@ -8,9 +8,7 @@ use std::process::Command;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Connection, SqliteConnection};
 use tempfile::TempDir;
-use trench_storage::sqlite::{
-    AtomicAppend, EventInput, LedgerId, RiskRejectionInput, RunInput, SqliteStore, StoreError,
-};
+use trench_storage::sqlite::{RunInput, SqliteStore, StoreError};
 
 const RUN_ID: &str = "run-2026-08-03";
 const EVENT_ID: &str = "event-0001";
@@ -298,26 +296,43 @@ async fn open_with_run(path: &Path) -> SqliteStore {
     store
 }
 
-fn event() -> EventInput<'static> {
-    EventInput {
-        run_id: RUN_ID,
-        event_id: EVENT_ID,
-        event_time_ns: EVENT_TIME_NS,
-        kind: "risk_evaluation",
-        payload_json: r#"{"market":"BTC"}"#,
-    }
-}
-
-fn rejection() -> RiskRejectionInput<'static> {
-    RiskRejectionInput {
-        run_id: RUN_ID,
-        decision_id: DECISION_ID,
-        event_id: EVENT_ID,
-        ledger_id: LedgerId::RulesOnly,
-        decided_at_ns: EVENT_TIME_NS + 1,
-        reason_code: "daily_loss_limit",
-        details_json: r#"{"remaining_equity":"98.50"}"#,
-    }
+async fn seed_event_and_rejection(path: &Path) {
+    let mut connection = open_schema_connection(path).await;
+    let mut transaction = connection
+        .begin()
+        .await
+        .expect("fixture transaction should begin");
+    sqlx::query(
+        "INSERT INTO events (event_id, run_id, event_time_ns, event_kind, payload_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )
+    .bind(EVENT_ID)
+    .bind(RUN_ID)
+    .bind(EVENT_TIME_NS)
+    .bind("risk_evaluation")
+    .bind(r#"{"market":"BTC"}"#)
+    .execute(&mut *transaction)
+    .await
+    .expect("fixture source event should be inserted");
+    sqlx::query(
+        "INSERT INTO risk_decisions \
+         (decision_id, run_id, event_id, ledger_id, decided_at_ns, outcome, reason_code, details_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 'rejected', ?6, ?7)",
+    )
+    .bind(DECISION_ID)
+    .bind(RUN_ID)
+    .bind(EVENT_ID)
+    .bind("rules_only")
+    .bind(EVENT_TIME_NS + 1)
+    .bind("daily_loss_limit")
+    .bind(r#"{"remaining_equity":"98.50"}"#)
+    .execute(&mut *transaction)
+    .await
+    .expect("fixture risk rejection should be inserted");
+    transaction
+        .commit()
+        .await
+        .expect("fixture transaction should commit");
 }
 
 impl ControlPlacement {
@@ -374,12 +389,9 @@ fn copy_insert_statement(table: DecimalTable, decimal_column: &str) -> String {
 }
 
 async fn seed_canonical_journal(path: &Path) {
-    let mut store = open_with_run(path).await;
-    store
-        .append_event_and_risk_rejection(event(), rejection(), AtomicAppend::Commit)
-        .await
-        .expect("source event and risk decision should be committed");
+    let store = open_with_run(path).await;
     drop(store);
+    seed_event_and_rejection(path).await;
 
     let mut connection = open_schema_connection(path).await;
     let mut transaction = connection
@@ -603,12 +615,9 @@ async fn seed_canonical_journal(path: &Path) {
 }
 
 async fn seed_transition_pair(path: &Path) {
-    let mut store = open_with_run(path).await;
-    store
-        .append_event_and_risk_rejection(event(), rejection(), AtomicAppend::Commit)
-        .await
-        .expect("source event should be committed");
+    let store = open_with_run(path).await;
     drop(store);
+    seed_event_and_rejection(path).await;
 
     let mut connection = open_schema_connection(path).await;
     sqlx::query(
@@ -763,50 +772,24 @@ async fn assert_rejected_transition_mutation_preserves_journal(
 }
 
 #[tokio::test]
-async fn committed_event_and_rejection_survive_reopen() {
+async fn fixture_event_and_rejection_survive_reopen() {
     let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
     let path = database_path(&temp_dir);
-    let mut store = open_with_run(&path).await;
-
-    store
-        .append_event_and_risk_rejection(event(), rejection(), AtomicAppend::Commit)
-        .await
-        .expect("atomic append should commit");
+    let store = open_with_run(&path).await;
     drop(store);
+    seed_event_and_rejection(&path).await;
 
-    let mut reopened = SqliteStore::open(&path)
-        .await
-        .expect("database should reopen");
-    let counts = reopened
-        .journal_counts(RUN_ID)
-        .await
-        .expect("journal counts should be readable");
-
-    assert_eq!((counts.events, counts.risk_decisions), (1, 1));
-}
-
-#[tokio::test]
-async fn failure_between_inserts_rolls_back_both_rows() {
-    let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
-    let path = database_path(&temp_dir);
-    let mut store = open_with_run(&path).await;
-
-    let error = store
-        .append_event_and_risk_rejection(event(), rejection(), AtomicAppend::FailAfterEvent)
-        .await
-        .expect_err("injected failure should abort the transaction");
-    assert!(matches!(error, StoreError::InjectedFailure));
-    drop(store);
-
-    let mut reopened = SqliteStore::open(&path)
-        .await
-        .expect("database should reopen");
-    let counts = reopened
-        .journal_counts(RUN_ID)
-        .await
-        .expect("journal counts should be readable");
-
-    assert_eq!((counts.events, counts.risk_decisions), (0, 0));
+    let mut connection = open_schema_connection(&path).await;
+    let counts = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT \
+             (SELECT COUNT(*) FROM events WHERE run_id = ?1), \
+             (SELECT COUNT(*) FROM risk_decisions WHERE run_id = ?1)",
+    )
+    .bind(RUN_ID)
+    .fetch_one(&mut connection)
+    .await
+    .expect("fixture rows should be readable");
+    assert_eq!(counts, (1, 1));
 }
 
 #[tokio::test]
@@ -837,10 +820,7 @@ async fn event_times_round_trip_as_unix_nanoseconds() {
     let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
     let path = database_path(&temp_dir);
     let mut store = open_with_run(&path).await;
-    store
-        .append_event_and_risk_rejection(event(), rejection(), AtomicAppend::Commit)
-        .await
-        .expect("atomic append should commit");
+    seed_event_and_rejection(&path).await;
 
     let stored_time = store
         .event_time_ns(EVENT_ID)
@@ -860,7 +840,14 @@ async fn schema_rejects_ascii_controls_in_every_decimal_column() {
     let public_tables = sqlx::query_scalar::<_, String>(
         "SELECT name FROM sqlite_schema \
          WHERE type = 'table' \
-           AND name NOT IN ('_sqlx_migrations', 'config_manifest_owners', 'transition_ids') \
+           AND name NOT IN ( \
+               '_sqlx_migrations', \
+               'config_manifest_owners', \
+               'transition_ids', \
+               'engine_event_admissions', \
+               'engine_batch_records', \
+               'engine_checkpoints' \
+           ) \
            AND name NOT LIKE 'sqlite_%' \
          ORDER BY name",
     )
@@ -1165,12 +1152,9 @@ async fn insert_or_replace_cannot_modify_immutable_config_manifest() {
 async fn transition_ids_are_unique_across_transition_tables() {
     let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
     let path = database_path(&temp_dir);
-    let mut store = open_with_run(&path).await;
-    store
-        .append_event_and_risk_rejection(event(), rejection(), AtomicAppend::Commit)
-        .await
-        .expect("source event should be committed");
+    let store = open_with_run(&path).await;
     drop(store);
+    seed_event_and_rejection(&path).await;
 
     let mut connection = open_schema_connection(&path).await;
     sqlx::query(
@@ -1235,12 +1219,9 @@ async fn transition_ids_are_unique_across_transition_tables() {
 async fn ignored_invalid_transitions_do_not_claim_registry_ids() {
     let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
     let path = database_path(&temp_dir);
-    let mut store = open_with_run(&path).await;
-    store
-        .append_event_and_risk_rejection(event(), rejection(), AtomicAppend::Commit)
-        .await
-        .expect("source event should be committed");
+    let store = open_with_run(&path).await;
     drop(store);
+    seed_event_and_rejection(&path).await;
 
     let mut connection = open_schema_connection(&path).await;
     for (transition_id, expected_counts) in [
@@ -1373,12 +1354,9 @@ async fn schema_rejects_cross_run_and_cross_ledger_relationships() {
 
     let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
     let path = database_path(&temp_dir);
-    let mut store = open_with_run(&path).await;
-    store
-        .append_event_and_risk_rejection(event(), rejection(), AtomicAppend::Commit)
-        .await
-        .expect("first run event should be committed");
+    let store = open_with_run(&path).await;
     drop(store);
+    seed_event_and_rejection(&path).await;
 
     let mut connection = open_schema_connection(&path).await;
     sqlx::query("INSERT INTO runs (run_id, started_at_ns) VALUES (?1, ?2)")
@@ -1848,13 +1826,10 @@ async fn open_reopens_existing_dedicated_database_without_mutating_permissions()
         .expect("existing dedicated database should remain writable");
     drop(store);
 
-    let mut reopened = SqliteStore::open(&path)
+    let reopened = SqliteStore::open(&path)
         .await
         .expect("existing dedicated database should reopen");
-    let counts = reopened
-        .journal_counts(RUN_ID)
-        .await
-        .expect("reopened dedicated database should remain readable");
+    drop(reopened);
     let parent_mode = std::fs::metadata(&dedicated)
         .expect("dedicated directory metadata should be readable")
         .permissions()
@@ -1866,12 +1841,5 @@ async fn open_reopens_existing_dedicated_database_without_mutating_permissions()
         .mode()
         & 0o777;
 
-    assert_eq!(
-        counts,
-        trench_storage::sqlite::JournalCounts {
-            events: 0,
-            risk_decisions: 0
-        }
-    );
     assert_eq!((parent_mode, file_mode), (0o700, 0o600));
 }

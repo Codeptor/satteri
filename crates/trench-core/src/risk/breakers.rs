@@ -230,6 +230,7 @@ mod tests {
 }
 
 use rust_decimal::Decimal;
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::domain::{DomainError, Usdc};
@@ -245,7 +246,7 @@ const MAX_ENTRIES_PER_DAY: u8 = 6;
 const CONSECUTIVE_LOSS_LIMIT: u8 = 3;
 
 /// One frozen loss budget measured from a reconciled UTC-period anchor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LossBudget {
     anchor: TimestampNs,
     starting_equity: Usdc,
@@ -338,7 +339,7 @@ impl LossBudget {
 }
 
 /// Immutable breaker/accounting state owned by exactly one ledger.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BreakerState {
     daily: LossBudget,
     weekly: LossBudget,

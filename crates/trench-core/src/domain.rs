@@ -3,6 +3,7 @@
 use std::str::FromStr;
 
 use rust_decimal::Decimal;
+use serde::Serialize;
 use thiserror::Error;
 
 /// A validation or checked-arithmetic failure for a domain value.
@@ -53,7 +54,7 @@ pub enum DomainError {
 }
 
 /// A strictly positive decimal market price.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Price(Decimal);
 
 impl Price {
@@ -104,7 +105,7 @@ impl Price {
 }
 
 /// A nonnegative decimal asset quantity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Quantity(Decimal);
 
 impl Quantity {
@@ -141,7 +142,7 @@ impl Quantity {
 }
 
 /// A nonnegative decimal amount of synthetic USDC.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Usdc(Decimal);
 
 impl Usdc {
@@ -201,7 +202,7 @@ impl Usdc {
 }
 
 /// A nonnegative decimal rate measured in basis points.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Bps(Decimal);
 
 impl Bps {
@@ -225,7 +226,7 @@ impl Bps {
 }
 
 /// Integer isolated leverage constrained to the approved `5..=20` range.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Leverage(u8);
 
 impl Leverage {
@@ -251,7 +252,7 @@ impl Leverage {
 macro_rules! text_identifier {
     ($name:ident, $kind:literal, $docs:literal) => {
         #[doc = $docs]
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
         pub struct $name(String);
 
         impl $name {
@@ -291,7 +292,7 @@ text_identifier!(
 );
 
 /// Aggressor direction of a market event or executable paper order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum Side {
     /// Buy from visible asks.
     Buy,
@@ -300,7 +301,7 @@ pub enum Side {
 }
 
 /// Decision cadence that owns a paper position.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum Sleeve {
     /// Completed 15-minute bars.
     FifteenMinute,
@@ -309,7 +310,7 @@ pub enum Sleeve {
 }
 
 /// One of the two independently accounted user-visible paper ledgers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum LedgerId {
     /// The deterministic rules-only ledger.
     RulesOnly,
@@ -351,7 +352,7 @@ impl FromStr for RulesMode {
 }
 
 /// The only supported paper-position margin mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum MarginMode {
     /// Margin isolated to a single paper position.
     Isolated,

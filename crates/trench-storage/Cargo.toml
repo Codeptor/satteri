@@ -9,9 +9,13 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+trench-core = { path = "../trench-core" }
 
 [dev-dependencies]
+rust_decimal.workspace = true
 tempfile.workspace = true
+trench-core = { path = "../trench-core", features = ["test-support"] }
