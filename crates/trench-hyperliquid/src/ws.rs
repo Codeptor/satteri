@@ -3958,6 +3958,7 @@ mod tests {
                     .await
                     .expect("send L2 frame");
             }
+            while let Some(Ok(_)) = socket.next().await {}
         });
 
         let config = WsConfig::with_limits(vec![market("BTC")], WsLimits::fast_for_test())
