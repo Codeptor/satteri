@@ -213,8 +213,13 @@ pub enum RecoveryEvidence<'a> {
     /// Verified historical archive input. It is L2-only and therefore can
     /// never supply the trade evidence required to build a candle.
     ArchiveL2(&'a ArchiveBatch),
-    /// No trustworthy trade evidence is available for the interval.
-    Unavailable,
+    /// The required evidence source was explicitly unavailable for the
+    /// interval. This is a completed conservative recovery outcome, never an
+    /// inferred continuation.
+    Unavailable {
+        /// Stable reason the required evidence could not be obtained.
+        reason: RecoveryUnavailable,
+    },
 }
 
 /// The final, non-readiness result of one recovery request.
@@ -297,6 +302,9 @@ pub enum RecoveryUnavailable {
     ArchiveL2Only,
     /// No independent local trade evidence was supplied.
     MissingTradeEvidence,
+    /// The documented public candle endpoint could not provide the requested
+    /// verified comparison facts.
+    OfficialCandleEvidenceUnavailable,
     /// Local trade aggregation did not exactly match the supplied official
     /// candle snapshots.
     CandleConflict,
@@ -326,6 +334,16 @@ impl GapRecovery {
     #[must_use]
     pub fn pending_len(&self) -> usize {
         self.queue.len()
+    }
+
+    /// Returns the oldest request awaiting evidence without removing it.
+    ///
+    /// A producer must build evidence only for this head request, then call
+    /// [`Self::process_next`] with that evidence. This preserves WebSocket
+    /// output order across asynchronous public-data fetches.
+    #[must_use]
+    pub fn next_request(&self) -> Option<&GapRecoveryRequest> {
+        self.queue.front()
     }
 
     /// Returns only verified archived L2 facts for durable import.
@@ -548,8 +566,8 @@ fn reconcile(
                 Vec::new(),
             )
         }
-        RecoveryEvidence::Unavailable => (
-            mark_unavailable(request, candles, RecoveryUnavailable::MissingTradeEvidence)?,
+        RecoveryEvidence::Unavailable { reason } => (
+            mark_unavailable(request, candles, reason)?,
             RecoverySource::Unavailable,
             Vec::new(),
         ),
@@ -802,6 +820,40 @@ fn venue_candle_key(candle: &Candle) -> Option<(CoreCandleInterval, TimestampNs)
 }
 
 #[cfg(test)]
+pub(crate) fn recovery_request_for_test(
+    market: Market,
+    generation: u64,
+    trade_predecessor: Option<TimestampNs>,
+    snapshot: TimestampNs,
+) -> GapRecoveryRequest {
+    let market_name = market.as_str().to_owned();
+    GapRecoveryRequest {
+        generation,
+        market,
+        reason: GapReason::TransportClosed,
+        predecessor_event_time: trade_predecessor,
+        predecessor_received_at: trade_predecessor,
+        trade_predecessor_event_time: trade_predecessor,
+        trade_predecessor_received_at: trade_predecessor,
+        trade_predecessor_event_id: trade_predecessor.map(|time| {
+            EventId::new(format!(
+                "recovery-test-predecessor-{market_name}-{generation}-{}",
+                time.value()
+            ))
+            .expect("test recovery predecessor ID must be valid")
+        }),
+        snapshot_event_id: EventId::new(format!(
+            "recovery-test-snapshot-{market_name}-{generation}-{}",
+            snapshot.value()
+        ))
+        .expect("test recovery snapshot ID must be valid"),
+        snapshot_event_time: snapshot,
+        snapshot_received_at: snapshot,
+        reconnect_attempt: 1,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::PathBuf;
@@ -1039,7 +1091,12 @@ mod tests {
         assert!(candles.unavailable_gaps().is_empty());
 
         let second = recovery
-            .process_next(RecoveryEvidence::Unavailable, &mut candles)
+            .process_next(
+                RecoveryEvidence::Unavailable {
+                    reason: RecoveryUnavailable::MissingTradeEvidence,
+                },
+                &mut candles,
+            )
             .expect("unavailable evidence is an explicit result")
             .expect("second request must produce a result");
         assert_eq!(second.request(), &eth);
@@ -1321,7 +1378,12 @@ mod tests {
                 .enqueue(request)
                 .expect("request below processed cap must queue");
             recovery
-                .process_next(RecoveryEvidence::Unavailable, &mut candles)
+                .process_next(
+                    RecoveryEvidence::Unavailable {
+                        reason: RecoveryUnavailable::MissingTradeEvidence,
+                    },
+                    &mut candles,
+                )
                 .expect("unavailable work below processed cap must process");
         }
         assert!(matches!(

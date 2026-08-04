@@ -4,6 +4,7 @@ mod archive;
 mod info;
 mod normalize;
 mod recovery;
+mod recovery_producer;
 mod ws;
 
 pub use archive::{
@@ -23,6 +24,9 @@ pub use recovery::{
     MAX_PROCESSED_RECOVERY_REQUESTS, MAX_RECOVERY_LOCAL_TRADES, MAX_RECOVERY_OFFICIAL_CANDLES,
     RecoveryError, RecoveryEvidence, RecoveryResult, RecoverySource, RecoveryStatus,
     RecoveryUnavailable,
+};
+pub use recovery_producer::{
+    MAX_RETAINED_RECOVERY_TRADES_PER_MARKET, RecoveryEvidenceProducer, RecoveryProducerError,
 };
 pub use ws::{
     GapEvent, GapExhausted, GapOpened, GapReason, RejectedUpdate, RejectionReason,
