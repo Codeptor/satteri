@@ -16,7 +16,6 @@ use trench_core::engine::{
 };
 use trench_core::event::{DurationNs, MarketEvent, MarketEventKind, TimestampNs};
 use trench_core::ledger::LedgerState;
-use trench_core::strategy::Strategy;
 use trench_core::universe::UniverseSelector;
 use trench_hyperliquid::{GapEvent, InfoClient, WsClient, WsConfig, WsOutput, WsStream};
 use trench_storage::parquet::{DataProvenance, ParquetError, ParquetStore};
@@ -109,19 +108,12 @@ pub async fn run(
     authority
         .readiness
         .set_ntp_synchronized(local_ntp_synchronized());
-    authority
-        .readiness
-        .set_rules_configuration_valid(rules_startup.strategy().is_some());
+    authority.readiness.set_rules_configuration_valid(false);
     authority.readiness.set_rules_sleeve_warm(false);
-    if let Some(strategy) = rules_startup.strategy() {
-        tracing::info!(
-            rules_artifact = %strategy.fingerprint(),
-            "verified frozen rules artifact; entries remain unavailable pending typed reactor warmup"
-        );
-    } else if let Some(error) = rules_startup.error() {
+    if let Some(error) = rules_startup.error() {
         tracing::warn!(
             reason = %error,
-            "rules artifact is unready; keeping collection and mandatory-exit paths available"
+            "rules are unready; keeping collection and mandatory-exit paths available"
         );
     }
     tracing::info!(

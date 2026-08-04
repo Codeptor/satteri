@@ -12,8 +12,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use trench_core::config::{PaperConfig, RulesConfig};
 use trench_core::domain::Market;
-use trench_core::strategy::rules::RulesStrategy;
-use trench_core::validation::{ResearchProvenance, RulesArtifact, RulesValidationReport};
+use trench_core::validation::{ResearchProvenance, RulesValidationReport};
 use trench_hyperliquid::{
     ArchiveDataKind, ArchiveDigest, ArchiveManifest, ArchiveReader, ArchiveRequirement,
     ArchiveSource, ArchiveSpan, GapRecovery,
@@ -361,34 +360,26 @@ impl LoadedConfig {
     }
 }
 
-/// Startup result for the rules-only ledger. A failed artifact leaves the
-/// collection daemon and every mandatory-exit path available while keeping new
-/// rules entries unready.
+/// Startup result for the rules-only ledger.
+///
+/// Collection remains available while active rules fail closed until the
+/// verified source-to-point-in-time-universe/features-to-engine replay adapter
+/// exists.
 pub(crate) enum RulesStartup {
     /// No strategy may generate entries while only collecting market data.
     CollectOnly,
-    /// The configured sibling artifact/report pair passed every active gate.
-    Active(ResolvedRules),
-    /// Active configuration was present but its immutable evidence failed closed.
+    /// Active configuration was present but cannot establish verified runtime
+    /// replay provenance.
     Unready(RulesArtifactError),
 }
 
 impl RulesStartup {
-    /// Resolves active artifact state without widening a config failure into a
-    /// global daemon failure.
+    /// Rejects active artifacts until their evidence is emitted by the verified
+    /// source-to-engine replay adapter.
     pub(crate) fn resolve(loaded: &LoadedConfig) -> Self {
-        match resolve_active_rules(loaded) {
-            Ok(Some(resolved)) => Self::Active(resolved),
-            Ok(None) => Self::CollectOnly,
-            Err(error) => Self::Unready(error),
-        }
-    }
-
-    /// Returns the artifact-derived strategy only after complete verification.
-    pub(crate) fn strategy(&self) -> Option<&RulesStrategy> {
-        match self {
-            Self::Active(resolved) => Some(&resolved.strategy),
-            Self::CollectOnly | Self::Unready(_) => None,
+        match loaded.config.rules() {
+            RulesConfig::CollectOnly => Self::CollectOnly,
+            _ => Self::Unready(RulesArtifactError::ReplayAdapterUnavailable),
         }
     }
 
@@ -396,106 +387,23 @@ impl RulesStartup {
     pub(crate) fn error(&self) -> Option<&RulesArtifactError> {
         match self {
             Self::Unready(error) => Some(error),
-            Self::CollectOnly | Self::Active(_) => None,
+            Self::CollectOnly => None,
         }
     }
 }
 
-/// Complete active rules strategy resolved from physical config siblings only.
-pub(crate) struct ResolvedRules {
-    strategy: RulesStrategy,
-}
-
-/// Active artifact resolution failure. Details stay stable and path-free so a
-/// local status response cannot disclose an operator's filesystem layout.
+/// Active rules admission failure. Details stay stable and path-free so a local
+/// status response cannot disclose an operator's filesystem layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub(crate) enum RulesArtifactError {
     /// Supplied config could not be bound to a physical regular-file target.
     #[error("rules configuration target is invalid")]
     ConfigTarget,
-    /// Named artifact was not a bounded non-symlink regular sibling file.
-    #[error("rules artifact file is invalid")]
-    ArtifactFile,
-    /// Named report was not a bounded non-symlink regular sibling file.
-    #[error("rules validation report file is invalid")]
-    ReportFile,
-    /// Artifact JSON was not exactly canonical immutable bytes.
-    #[error("rules artifact is not canonical")]
-    NonCanonicalArtifact,
-    /// Report JSON was not exactly canonical immutable bytes.
-    #[error("rules validation report is not canonical")]
-    NonCanonicalReport,
-    /// Configured content address did not equal the independently verified artifact.
-    #[error("rules artifact digest does not match configuration")]
-    ArtifactDigest,
-    /// Configured content address did not equal the independently verified report.
-    #[error("rules validation report digest does not match configuration")]
-    ReportDigest,
-    /// Artifact/report eligibility or provenance could not authorize active mode.
-    #[error("rules artifact/report validation failed")]
-    Validation,
-}
-
-fn resolve_active_rules(
-    loaded: &LoadedConfig,
-) -> Result<Option<ResolvedRules>, RulesArtifactError> {
-    let RulesConfig::Active(active) = loaded.config.rules() else {
-        return Ok(None);
-    };
-    let parent = loaded
-        .physical_path
-        .parent()
-        .ok_or(RulesArtifactError::ConfigTarget)?;
-    let artifact_path = parent.join(active.artifact_file());
-    let report_path = parent.join(active.validation_report_file());
-    let artifact_bytes =
-        read_bounded_regular_file(&artifact_path, MAX_RULE_ARTIFACT_BYTES, "rules artifact")
-            .map_err(|_| RulesArtifactError::ArtifactFile)?;
-    let report_bytes = read_bounded_regular_file(
-        &report_path,
-        MAX_RULE_ARTIFACT_BYTES,
-        "rules validation report",
-    )
-    .map_err(|_| RulesArtifactError::ReportFile)?;
-    let artifact = RulesArtifact::from_canonical_json(&artifact_bytes)
-        .map_err(|_| RulesArtifactError::Validation)?;
-    if artifact
-        .canonical_json()
-        .map_err(|_| RulesArtifactError::Validation)?
-        != artifact_bytes
-    {
-        return Err(RulesArtifactError::NonCanonicalArtifact);
-    }
-    let report = RulesValidationReport::from_canonical_json(&report_bytes)
-        .map_err(|_| RulesArtifactError::Validation)?;
-    if report
-        .canonical_json()
-        .map_err(|_| RulesArtifactError::Validation)?
-        != report_bytes
-    {
-        return Err(RulesArtifactError::NonCanonicalReport);
-    }
-    if artifact.digest() != active.artifact_digest() {
-        return Err(RulesArtifactError::ArtifactDigest);
-    }
-    if report.digest() != active.validation_report_digest() {
-        return Err(RulesArtifactError::ReportDigest);
-    }
-    let config_text =
-        std::str::from_utf8(&loaded.bytes).map_err(|_| RulesArtifactError::ConfigTarget)?;
-    let config_digest =
-        PaperConfig::research_digest(config_text).map_err(|_| RulesArtifactError::ConfigTarget)?;
-    let code_digest =
-        option_env!("TRENCH_WORKSPACE_BUILD_DIGEST").ok_or(RulesArtifactError::Validation)?;
-    let embedded = report
-        .validate_for_active(&config_digest, code_digest)
-        .map_err(|_| RulesArtifactError::Validation)?;
-    if embedded != &artifact {
-        return Err(RulesArtifactError::Validation);
-    }
-    let strategy =
-        RulesStrategy::from_artifact(&artifact).map_err(|_| RulesArtifactError::Validation)?;
-    Ok(Some(ResolvedRules { strategy }))
+    /// Canonical artifact/report bytes are insufficient without a verified
+    /// source-to-engine replay adapter; public synthetic replay outputs cannot
+    /// authorize entries.
+    #[error("verified source-to-engine rules replay adapter is unavailable")]
+    ReplayAdapterUnavailable,
 }
 
 fn physical_config_target(config_path: &Path) -> Result<PathBuf, RulesArtifactError> {
@@ -1531,7 +1439,6 @@ mod rules_research_tests {
     use rust_decimal::Decimal;
     use trench_core::domain::{Market, Price, Quantity, Side};
     use trench_core::event::{MarketEvent, TimestampNs, Trade};
-    use trench_core::strategy::Strategy;
     use trench_core::validation::{
         EngineReplayOutcome, IneligibleReason, ReplayPhase, ResearchEligibility,
         ResearchProvenance, RuleReplay, RuleReplayRequest, RulesValidationReport, ValidationPlan,
@@ -1760,86 +1667,16 @@ mod rules_research_tests {
     }
 
     #[test]
-    fn active_rules_read_only_the_physical_staged_config_siblings_and_fail_closed_on_symlink_or_digest()
-     {
+    fn synthetic_eligible_canonical_pair_cannot_ready_active_rules() {
         let root = tempfile::tempdir().expect("fixture root");
         secure(root.path());
         let config = active_fixture(root.path());
-        let current = root.path().join("current");
-        symlink(config.parent().expect("staged parent"), &current).expect("current symlink");
-        let loaded = load_config(&current.join("paper.toml")).expect("staged config loads");
-
-        let current_target = root.path().join("current-target");
-        fs::create_dir(&current_target).expect("current target");
-        secure(&current_target);
-        fs::write(current_target.join("rules-artifact.json"), b"unrelated")
-            .expect("unrelated current artifact");
-        fs::remove_file(&current).expect("remove current alias");
-        symlink(&current_target, &current).expect("switch current symlink");
-
-        let startup = RulesStartup::resolve(&loaded);
-        let strategy = startup.strategy().expect("staged siblings activate rules");
-        assert_eq!(strategy.fingerprint().len(), 64);
-
-        let artifact = config
-            .parent()
-            .expect("staged parent")
-            .join("rules-artifact.json");
-        let target = config
-            .parent()
-            .expect("staged parent")
-            .join("artifact-target.json");
-        fs::rename(&artifact, &target).expect("move artifact target");
-        symlink(&target, &artifact).expect("artifact symlink");
-        let startup = RulesStartup::resolve(&loaded);
-        assert_eq!(startup.error(), Some(&RulesArtifactError::ArtifactFile));
-
-        fs::remove_file(&artifact).expect("remove symlink");
-        fs::rename(&target, &artifact).expect("restore artifact");
-        let body = fs::read_to_string(&config).expect("config body");
-        let invalid = body
-            .lines()
-            .map(|line| {
-                if line.starts_with("artifact_digest =") {
-                    format!("artifact_digest = \"b3:{}\"", "0".repeat(64))
-                } else {
-                    line.to_owned()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        fs::write(&config, invalid).expect("wrong digest config");
-        let loaded = load_config(&config).expect("wrong digest still parses");
-        let startup = RulesStartup::resolve(&loaded);
-        assert_eq!(startup.error(), Some(&RulesArtifactError::ArtifactDigest));
-
-        fs::write(&config, body).expect("restore active config");
-        let report_digest_mismatch = fs::read_to_string(&config)
-            .expect("config body")
-            .lines()
-            .map(|line| {
-                if line.starts_with("validation_report_digest =") {
-                    format!("validation_report_digest = \"b3:{}\"", "0".repeat(64))
-                } else {
-                    line.to_owned()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        fs::write(&config, report_digest_mismatch).expect("wrong report digest config");
-        let loaded = load_config(&config).expect("wrong report digest still parses");
-        let startup = RulesStartup::resolve(&loaded);
-        assert_eq!(startup.error(), Some(&RulesArtifactError::ReportDigest));
-    }
-
-    #[test]
-    fn active_rules_reject_report_provenance_that_does_not_match_this_build() {
-        let root = tempfile::tempdir().expect("fixture root");
-        secure(root.path());
-        let config = active_fixture_with_code(root.path(), digest(99));
         let loaded = load_config(&config).expect("active config loads");
         let startup = RulesStartup::resolve(&loaded);
-        assert_eq!(startup.error(), Some(&RulesArtifactError::Validation));
+        assert_eq!(
+            startup.error(),
+            Some(&RulesArtifactError::ReplayAdapterUnavailable)
+        );
     }
 
     #[test]
