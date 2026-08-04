@@ -150,7 +150,7 @@ impl StrategyFingerprints {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineContext {
     admission: EventAdmission,
-    bindings: SnapshotBindings,
+    bindings: Option<SnapshotBindings>,
     strategy_fingerprints: StrategyFingerprints,
 }
 
@@ -164,8 +164,23 @@ impl EngineContext {
     ) -> Self {
         Self {
             admission,
-            bindings,
+            bindings: Some(bindings),
             strategy_fingerprints,
+        }
+    }
+
+    /// Creates a verified no-entry context for typed source transitions.
+    ///
+    /// Book, mark, funding, recovery, and terminal transitions carry no
+    /// strategy or universe assertion. Supplying a fabricated empty universe
+    /// would blur that boundary, so passive source handling has no entry
+    /// bindings at all. An entry arbitration under this context is rejected.
+    #[must_use]
+    pub fn passive(admission: EventAdmission) -> Self {
+        Self {
+            admission,
+            bindings: None,
+            strategy_fingerprints: StrategyFingerprints::new("unavailable", "unavailable"),
         }
     }
 }
@@ -1144,10 +1159,12 @@ impl Engine {
             return Ok(EngineOutcome { state, batch });
         }
         batch.push(EngineRecord::EventReceived);
-        if !context
-            .bindings
-            .supports(at, state.broker.maximum_book_age(), &candidates)
-            || !state.supports_risk_policies(&context.bindings, &candidates)
+        let Some(bindings) = context.bindings.as_ref() else {
+            batch.push(EngineRecord::SnapshotRejected);
+            return Ok(EngineOutcome { state, batch });
+        };
+        if !bindings.supports(at, state.broker.maximum_book_age(), &candidates)
+            || !state.supports_risk_policies(bindings, &candidates)
         {
             batch.push(EngineRecord::SnapshotRejected);
             return Ok(EngineOutcome { state, batch });
@@ -1709,9 +1726,15 @@ fn canonical_snapshot(
         at,
         state.ledger.equity(),
         state.ledger.commitment_digest(),
-        context.bindings.book_digest(),
         context
             .bindings
+            .as_ref()
+            .ok_or(EngineError::MissingVerifiedSource)?
+            .book_digest(),
+        context
+            .bindings
+            .as_ref()
+            .ok_or(EngineError::MissingVerifiedSource)?
             .universe_digest()
             .ok_or(EngineError::MissingVerifiedSource)?,
         configuration_digest(state),
