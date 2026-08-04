@@ -6,7 +6,7 @@ use std::{
 };
 
 use blake3::Hasher;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use trench_core::domain::{EventId, Market};
 use trench_core::event::{MarketEvent, MarketEventKind, TimestampNs};
@@ -30,7 +30,8 @@ const MAX_TOTAL_REST_PAGE_WITNESSES: usize = 1_024;
 const BLAKE3_DIGEST_BYTES: usize = 67;
 
 /// A read-only, exact locator for one selected committed source member.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ResearchMemberLocator {
     /// A partition committed through the legacy partition layout.
     LegacyPartition {
@@ -146,7 +147,7 @@ impl ResearchMemberLocator {
         }
     }
 
-    fn open(&self, store: &ParquetStore) -> Result<OpenedPartitionMember, ParquetError> {
+    pub(crate) fn open(&self, store: &ParquetStore) -> Result<OpenedPartitionMember, ParquetError> {
         match self {
             Self::LegacyPartition {
                 identity,
@@ -184,7 +185,8 @@ enum MemberIdentity {
 }
 
 /// A normalized source stream for which continuity may be declared.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum SourceStreamKind {
     /// Point-in-time venue metadata.
     Metadata,
@@ -236,6 +238,24 @@ pub struct CoverageTarget {
     stream: SourceStreamKind,
 }
 
+impl<'de> Deserialize<'de> for CoverageTarget {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            market: String,
+            stream: SourceStreamKind,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let market = Market::new(wire.market).map_err(serde::de::Error::custom)?;
+        Ok(Self::new(market, wire.stream))
+    }
+}
+
 impl CoverageTarget {
     /// Creates one typed coverage target.
     #[must_use]
@@ -269,6 +289,30 @@ pub struct CoverageEventRef {
     partition_manifest_digest: String,
     event_id: EventId,
     event_time_ns: i64,
+}
+
+impl<'de> Deserialize<'de> for CoverageEventRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            partition_manifest_digest: String,
+            event_id: String,
+            event_time_ns: i64,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let event_id = EventId::new(wire.event_id).map_err(serde::de::Error::custom)?;
+        TimestampNs::new(i128::from(wire.event_time_ns)).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            partition_manifest_digest: wire.partition_manifest_digest,
+            event_id,
+            event_time_ns: wire.event_time_ns,
+        })
+    }
 }
 
 impl CoverageEventRef {
@@ -329,8 +373,18 @@ impl BoundedSourceBytes {
     }
 }
 
+impl<'de> Deserialize<'de> for BoundedSourceBytes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(Vec::<u8>::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
 /// A typed upstream continuity artifact, never a Boolean or assertion string.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ContinuitySource {
     /// A bounded archive-manifest payload.
     ArchiveManifest { source_bytes: BoundedSourceBytes },
@@ -415,7 +469,8 @@ impl ContinuitySource {
 }
 
 /// One selected member whose exact normalized content supports a proof.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContinuityMemberBinding {
     partition_manifest_digest: String,
     partition_content_digest: String,
@@ -438,7 +493,8 @@ impl ContinuityMemberBinding {
 }
 
 /// Bounded, typed continuity evidence over one exact half-open interval.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContinuityProof {
     source: ContinuitySource,
     supporting_members: Vec<ContinuityMemberBinding>,
@@ -535,7 +591,8 @@ impl ContinuityProof {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 enum CoverageObservation {
     Events {
         first: CoverageEventRef,
@@ -545,7 +602,8 @@ enum CoverageObservation {
 }
 
 /// Evidence for either an observed eventful interval or a proved quiet interval.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompleteCoverage {
     proof: ContinuityProof,
     observation: CoverageObservation,
@@ -581,7 +639,8 @@ impl CompleteCoverage {
 }
 
 /// Closed reasons for an explicitly unavailable source interval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum CoverageUnavailableReason {
     /// The collector never committed this interval.
     NotCaptured,
@@ -594,7 +653,8 @@ pub enum CoverageUnavailableReason {
 }
 
 /// A coverage result: proved eventful, proved quiet, or explicitly unavailable.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum CoverageWitness {
     /// Complete continuity with observed source events.
     Complete(CompleteCoverage),
@@ -608,7 +668,8 @@ pub enum CoverageWitness {
 }
 
 /// One exact coverage declaration for one target and one half-open interval.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CoverageDeclaration {
     target: CoverageTarget,
     range: TimeRangeWire,
@@ -683,6 +744,10 @@ impl ResearchSourcePlanDraft {
         &self.member_set_digest
     }
 
+    pub(crate) const fn provenance(&self) -> &DataProvenance {
+        &self.provenance
+    }
+
     /// Returns bounded canonical JSON for inspection and later Task 3 staging.
     pub fn canonical_json(&self) -> Result<Vec<u8>, ResearchPlanError> {
         let mut writer = BoundedJsonWriter::new(MAX_SOURCE_PLAN_JSON_BYTES);
@@ -701,6 +766,69 @@ impl ResearchSourcePlanDraft {
             Err(error) => Err(ResearchPlanError::Json(error)),
         }
     }
+
+    pub(crate) fn wire(&self) -> ResearchSourcePlanWire {
+        ResearchSourcePlanWire {
+            version: SOURCE_PLAN_VERSION,
+            provenance: self.provenance.clone(),
+            warmup: self.warmup.into(),
+            evaluation: self.evaluation.into(),
+            members: self.members.clone(),
+            coverage: self.coverage.clone(),
+            member_set_digest: self.member_set_digest.clone(),
+        }
+    }
+
+    pub(crate) fn from_wire(
+        store: &ParquetStore,
+        wire: ResearchSourcePlanWire,
+    ) -> Result<Self, ResearchPlanError> {
+        if wire.version != SOURCE_PLAN_VERSION {
+            return Err(ResearchPlanError::InvalidFinalPlan);
+        }
+        let warmup = wire.warmup.try_range()?;
+        let evaluation = wire.evaluation.try_range()?;
+        validate_deserialized_coverage(&wire.coverage)?;
+        let draft = ResearchSourcePlanBuilder::new(warmup, evaluation)?.build(
+            store,
+            wire.members,
+            wire.coverage,
+        )?;
+        if draft.provenance != wire.provenance || draft.member_set_digest != wire.member_set_digest
+        {
+            return Err(ResearchPlanError::InvalidFinalPlan);
+        }
+        Ok(draft)
+    }
+}
+
+fn validate_deserialized_coverage(
+    coverage: &[CoverageDeclaration],
+) -> Result<(), ResearchPlanError> {
+    for declaration in coverage {
+        let declared_range = declaration.range.try_range()?;
+        let Some(complete) = complete_coverage(declaration) else {
+            continue;
+        };
+        if complete.proof.range.try_range()? != declared_range {
+            return Err(ResearchPlanError::InvalidCoverageEvidence);
+        }
+        complete.proof.validate()?;
+    }
+    Ok(())
+}
+
+/// Canonical owned source-plan fields persisted only by the Task-3 final-plan writer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResearchSourcePlanWire {
+    pub(crate) version: u8,
+    pub(crate) provenance: DataProvenance,
+    pub(crate) warmup: TimeRangeWire,
+    pub(crate) evaluation: TimeRangeWire,
+    pub(crate) members: Vec<ResearchMemberLocator>,
+    pub(crate) coverage: Vec<CoverageDeclaration>,
+    pub(crate) member_set_digest: String,
 }
 
 /// Validates exact selected members beneath a configured store before producing a draft.
@@ -1156,8 +1284,9 @@ impl Write for BoundedJsonWriter {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-struct TimeRangeWire {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TimeRangeWire {
     start_ns: i64,
     end_ns: i64,
 }
@@ -1172,14 +1301,17 @@ impl From<TimeRange> for TimeRangeWire {
 }
 
 impl TimeRangeWire {
+    fn try_range(self) -> Result<TimeRange, ResearchPlanError> {
+        let start = TimestampNs::new(i128::from(self.start_ns))
+            .map_err(|_| ResearchPlanError::InvalidFinalPlan)?;
+        let end = TimestampNs::new(i128::from(self.end_ns))
+            .map_err(|_| ResearchPlanError::InvalidFinalPlan)?;
+        TimeRange::new(start, end).map_err(|_| ResearchPlanError::InvalidFinalPlan)
+    }
+
     fn range(self) -> TimeRange {
-        TimeRange::new(
-            TimestampNs::new(i128::from(self.start_ns))
-                .expect("source plan ranges retain validated timestamps"),
-            TimestampNs::new(i128::from(self.end_ns))
-                .expect("source plan ranges retain validated timestamps"),
-        )
-        .expect("source plan ranges retain a nonempty half-open interval")
+        self.try_range()
+            .expect("source plan ranges retain validated timestamps")
     }
 }
 
@@ -1216,4 +1348,7 @@ pub enum ResearchPlanError {
     /// Canonical JSON serialization failed.
     #[error("research source plan JSON serialization failed")]
     Json(#[from] serde_json::Error),
+    /// A persisted final-plan payload was malformed, noncanonical, or internally inconsistent.
+    #[error("research final plan is invalid")]
+    InvalidFinalPlan,
 }

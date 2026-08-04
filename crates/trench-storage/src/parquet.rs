@@ -2753,6 +2753,30 @@ pub(crate) fn events_digest(events: &[MarketEvent]) -> Result<String, ParquetErr
     Ok(format!("b3:{}", hasher.finalize().to_hex()))
 }
 
+/// Encodes one normalized event into the exact canonical wire used by committed rows.
+pub(crate) fn canonical_event_wire(event: &MarketEvent) -> Result<Vec<u8>, ParquetError> {
+    Ok(StoredEvent::from_event(event)?
+        .canonical_json()?
+        .into_bytes())
+}
+
+/// Decodes and re-encodes one canonical normalized event wire without accepting aliases.
+pub(crate) fn event_from_canonical_wire(bytes: &[u8]) -> Result<MarketEvent, ParquetError> {
+    if bytes.len() > MAX_EVENT_WIRE_BYTES {
+        return Err(ParquetError::InvalidPartition {
+            reason: "normalized event wire exceeds its fixed byte bound",
+        });
+    }
+    let stored = serde_json::from_slice::<StoredEvent>(bytes)?;
+    let event = stored.into_event()?;
+    if canonical_event_wire(&event)? != bytes {
+        return Err(ParquetError::InvalidPartition {
+            reason: "normalized event wire is not canonical",
+        });
+    }
+    Ok(event)
+}
+
 fn digest_bytes(bytes: &[u8]) -> String {
     format!("b3:{}", blake3::hash(bytes).to_hex())
 }
