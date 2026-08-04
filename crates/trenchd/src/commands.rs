@@ -1,8 +1,11 @@
 //! Paper-only daemon commands composed from the tested storage boundaries.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::io::Read;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -15,6 +18,9 @@ use trench_hyperliquid::{
 };
 use trench_storage::parquet::{DataProvenance, ParquetError, ParquetStore};
 use trench_storage::replay::{ReplayError, ReplayPlan};
+
+use crate::admin;
+use crate::app::{self, RuntimeMode};
 
 const MAX_CONFIG_BYTES: u64 = 65_536;
 const MAX_ARCHIVE_MANIFEST_BYTES: u64 = 1_048_576;
@@ -30,7 +36,7 @@ pub struct Cli {
 
 impl Cli {
     /// Executes the one requested paper-only command.
-    pub fn execute(self) -> Result<(), CommandError> {
+    pub async fn execute(self) -> Result<(), CommandError> {
         match self.command {
             Command::ImportArchive(arguments) => {
                 let result = import_archive(arguments)?;
@@ -42,6 +48,63 @@ impl Cli {
                 );
                 Ok(())
             }
+            Command::Doctor(arguments) => {
+                let report = doctor(&arguments.config)?;
+                write_stdout_json(&report)?;
+                if report.ok {
+                    Ok(())
+                } else {
+                    Err(CommandError::DoctorFailed)
+                }
+            }
+            Command::Collect(arguments) => {
+                let loaded = load_config(&arguments.config.config)?;
+                app::run(
+                    &arguments.config.config,
+                    &loaded.bytes,
+                    &loaded.config,
+                    RuntimeMode::Collect,
+                    arguments.duration,
+                )
+                .await?;
+                Ok(())
+            }
+            Command::Run(arguments) => {
+                let loaded = load_config(&arguments.config)?;
+                app::run(
+                    &arguments.config,
+                    &loaded.bytes,
+                    &loaded.config,
+                    RuntimeMode::Run,
+                    None,
+                )
+                .await?;
+                Ok(())
+            }
+            Command::Replay(arguments) => {
+                let loaded = load_config(&arguments.config.config)?;
+                let report = app::replay(
+                    &arguments.config.config,
+                    &loaded.bytes,
+                    &loaded.config,
+                    &arguments.manifest,
+                )?;
+                tracing::info!(
+                    event_count = report.event_count,
+                    replay_digest = %report.digest,
+                    "validated deterministic paper source replay"
+                );
+                Ok(())
+            }
+            Command::Status(arguments) => {
+                let status = admin::request_status(&arguments.socket).await?;
+                if arguments.json {
+                    write_stdout_json(&status)?;
+                } else {
+                    write_status_text(&status)?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -49,8 +112,57 @@ impl Cli {
 /// Paper-only durable import commands.
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Read local configuration and filesystem state without creating paths or network I/O.
+    Doctor(ConfigArgs),
+    /// Start the read-only market-data collection lifecycle for a bounded interval.
+    Collect(CollectArgs),
+    /// Start the long-running collection/readiness daemon until Ctrl-C; active rules are refused.
+    Run(ConfigArgs),
+    /// Validate and inspect one explicit immutable deterministic replay plan.
+    Replay(ReplayArgs),
+    /// Request daemon readiness/status over its private Unix socket.
+    Status(StatusArgs),
     /// Verify a local official archive and persist only normalized L2 facts.
     ImportArchive(ImportArchiveArgs),
+}
+
+/// A command that needs one fully validated paper configuration file.
+#[derive(Debug, Clone, Args)]
+struct ConfigArgs {
+    /// Fully validated paper configuration TOML.
+    #[arg(long)]
+    config: PathBuf,
+}
+
+/// Bounded public-data collection arguments.
+#[derive(Debug, Clone, Args)]
+struct CollectArgs {
+    #[command(flatten)]
+    config: ConfigArgs,
+    /// Bounded run duration such as `60s`, `15m`, or `1h`.
+    #[arg(long, value_parser = parse_duration)]
+    duration: Option<Duration>,
+}
+
+/// One immutable deterministic replay-plan input.
+#[derive(Debug, Clone, Args)]
+struct ReplayArgs {
+    #[command(flatten)]
+    config: ConfigArgs,
+    /// Absolute immutable replay-plan manifest created by `import-archive`.
+    #[arg(long)]
+    manifest: PathBuf,
+}
+
+/// Local status query formatting and socket target.
+#[derive(Debug, Clone, Args)]
+struct StatusArgs {
+    /// Private Unix socket exposed by the running daemon.
+    #[arg(long)]
+    socket: PathBuf,
+    /// Emit the complete protocol status as one JSON value.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Explicit local paths for an immutable official archive import.
@@ -84,17 +196,15 @@ pub struct ImportArchiveResult {
 pub fn import_archive(arguments: ImportArchiveArgs) -> Result<ImportArchiveResult, CommandError> {
     require_absolute(&arguments.source, "source")?;
     require_absolute(&arguments.manifest, "manifest")?;
-    let config_bytes = read_bounded_regular_file(&arguments.config, MAX_CONFIG_BYTES, "config")?;
-    let config = std::str::from_utf8(&config_bytes)
-        .map_err(|_| CommandError::InvalidConfigEncoding)
-        .and_then(|text| PaperConfig::from_toml(text).map_err(CommandError::Config))?;
+    let loaded = load_config(&arguments.config)?;
     let archive_input = read_archive_manifest(&arguments.manifest)?;
     let archive = ArchiveReader::open(&arguments.source, archive_input.manifest)?.read_all()?;
     let events = GapRecovery::archive_l2_events(&archive)?;
 
-    let parquet_root = resolve_configured_path(&arguments.config, config.storage().parquet_path())?;
+    let parquet_root =
+        resolve_configured_path(&arguments.config, loaded.config.storage().parquet_path())?;
     let provenance = DataProvenance::new(
-        digest_bytes(&config_bytes),
+        digest_bytes(&loaded.bytes),
         code_digest()?,
         ParquetStore::schema_hash(),
     )?;
@@ -150,6 +260,23 @@ pub fn import_archive(arguments: ImportArchiveArgs) -> Result<ImportArchiveResul
         import_digest,
         replay_plan_digest,
     })
+}
+
+/// A descriptor-safely read, fully validated paper configuration.
+pub(crate) struct LoadedConfig {
+    /// Original immutable TOML bytes used in provenance commitments.
+    pub(crate) bytes: Vec<u8>,
+    /// Strict parsed configuration with no secret-bearing raw fields retained.
+    pub(crate) config: PaperConfig,
+}
+
+/// Reads a bounded non-symlink config and parses it with the strict paper schema.
+pub(crate) fn load_config(path: &Path) -> Result<LoadedConfig, CommandError> {
+    let bytes = read_bounded_regular_file(path, MAX_CONFIG_BYTES, "config")?;
+    let config = std::str::from_utf8(&bytes)
+        .map_err(|_| CommandError::InvalidConfigEncoding)
+        .and_then(|text| PaperConfig::from_toml(text).map_err(CommandError::Config))?;
+    Ok(LoadedConfig { bytes, config })
 }
 
 #[derive(Debug, Serialize)]
@@ -529,9 +656,143 @@ fn code_digest() -> Result<String, CommandError> {
         .ok_or(CommandError::MissingBuildDigest)
 }
 
+/// Offline, non-mutating local preflight report.
+#[derive(Debug, Serialize)]
+struct DoctorReport {
+    ok: bool,
+    reasons: Vec<&'static str>,
+}
+
+/// Inspects only validated local paths. This function creates no path, opens no
+/// database connection, and performs no network operation.
+fn doctor(config_path: &Path) -> Result<DoctorReport, CommandError> {
+    let loaded = load_config(config_path)?;
+    let sqlite_path = app::configured_path(config_path, loaded.config.storage().sqlite_path())?;
+    let parquet_path = app::configured_path(config_path, loaded.config.storage().parquet_path())?;
+    let runtime_path = PathBuf::from(loaded.config.runtime().admin_socket_path());
+    let mut reasons = Vec::new();
+    inspect_regular_file(&sqlite_path, "sqlite_database", &mut reasons);
+    inspect_directory(&parquet_path, "parquet_store", &mut reasons);
+    match runtime_path.parent() {
+        Some(parent) => inspect_directory(parent, "runtime_directory", &mut reasons),
+        None => reasons.push("runtime_directory_invalid"),
+    }
+    Ok(DoctorReport {
+        ok: reasons.is_empty(),
+        reasons,
+    })
+}
+
+fn inspect_regular_file(path: &Path, label: &'static str, reasons: &mut Vec<&'static str>) {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => reasons.push(match label {
+            "sqlite_database" => "sqlite_database_invalid",
+            _ => "local_file_invalid",
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => reasons.push(match label {
+            "sqlite_database" => "sqlite_database_missing",
+            _ => "local_file_missing",
+        }),
+        Err(_) => reasons.push(match label {
+            "sqlite_database" => "sqlite_database_unreadable",
+            _ => "local_file_unreadable",
+        }),
+    }
+}
+
+fn inspect_directory(path: &Path, label: &'static str, reasons: &mut Vec<&'static str>) {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => reasons.push(match label {
+            "parquet_store" => "parquet_store_invalid",
+            "runtime_directory" => "runtime_directory_invalid",
+            _ => "local_directory_invalid",
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => reasons.push(match label {
+            "parquet_store" => "parquet_store_missing",
+            "runtime_directory" => "runtime_directory_missing",
+            _ => "local_directory_missing",
+        }),
+        Err(_) => reasons.push(match label {
+            "parquet_store" => "parquet_store_unreadable",
+            "runtime_directory" => "runtime_directory_unreadable",
+            _ => "local_directory_unreadable",
+        }),
+    }
+}
+
+fn parse_duration(value: &str) -> Result<Duration, String> {
+    let split = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (digits, suffix) = value.split_at(split);
+    let count = digits
+        .parse::<u64>()
+        .map_err(|_| "duration must start with a positive integer".to_owned())?;
+    if count == 0 {
+        return Err("duration must be greater than zero".to_owned());
+    }
+    let seconds = match suffix {
+        "s" => count,
+        "m" => count
+            .checked_mul(60)
+            .ok_or_else(|| "duration is too large".to_owned())?,
+        "h" => count
+            .checked_mul(3_600)
+            .ok_or_else(|| "duration is too large".to_owned())?,
+        _ => return Err("duration must use s, m, or h units".to_owned()),
+    };
+    Ok(Duration::from_secs(seconds))
+}
+
+fn write_stdout_json(value: &impl Serialize) -> Result<(), CommandError> {
+    let mut bytes = serde_json::to_vec(value)?;
+    bytes.push(b'\n');
+    std::io::stdout()
+        .lock()
+        .write_all(&bytes)
+        .map_err(|source| CommandError::Filesystem {
+            operation: "writing command output",
+            source,
+        })
+}
+
+fn write_status_text(status: &serde_json::Value) -> Result<(), CommandError> {
+    let run_id = status
+        .pointer("/status/run_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let reconciled = status
+        .pointer("/status/reconciled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let mode = status
+        .pointer("/status/mode")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let execution_enabled = status
+        .pointer("/status/execution_enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let output = format!(
+        "run_id={run_id} reconciled={reconciled} mode={mode} execution_enabled={execution_enabled}\n"
+    );
+    std::io::stdout()
+        .lock()
+        .write_all(output.as_bytes())
+        .map_err(|source| CommandError::Filesystem {
+            operation: "writing command output",
+            source,
+        })
+}
+
 /// A command input, archive, recovery, or durable-import failure.
 #[derive(Debug, Error)]
 pub enum CommandError {
+    /// Offline doctor found a non-mutating local preflight failure.
+    #[error("doctor reported failed local preflight")]
+    DoctorFailed,
     /// Descriptor-safe local archive imports require Unix no-follow semantics.
     #[cfg(not(unix))]
     #[error("archive import is unsupported on this platform")]
@@ -555,6 +816,7 @@ pub enum CommandError {
     #[error("archive manifest is invalid")]
     InvalidArchiveManifest,
     /// A supplied local input path was not a bounded regular file.
+    #[cfg(unix)]
     #[error("{operation} must be a bounded non-symlink regular file")]
     InvalidInputFile { operation: &'static str },
     /// An immutable import-manifest output path was invalid.
@@ -588,6 +850,12 @@ pub enum CommandError {
     /// The frozen replay-plan construction or persistence failed.
     #[error(transparent)]
     Replay(#[from] ReplayError),
+    /// Daemon lifecycle or deterministic replay orchestration failed.
+    #[error(transparent)]
+    App(#[from] crate::app::AppError),
+    /// Local Unix admin status protocol failed.
+    #[error(transparent)]
+    Admin(#[from] crate::admin::AdminError),
     /// A checked normalized market identifier was invalid.
     #[error(transparent)]
     Domain(#[from] trench_core::domain::DomainError),
@@ -795,5 +1063,39 @@ pub(crate) mod import_archive_tests {
             })
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod doctor_tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::doctor;
+
+    #[test]
+    fn doctor_is_offline_read_only_and_never_creates_runtime_paths() {
+        let root = tempfile::tempdir().expect("fixture root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("private fixture root");
+        let runtime = root.path().join("runtime/trenchd.sock");
+        let config = root.path().join("paper.toml");
+        let body = include_str!("../../../config/paper.example.toml")
+            .replace("/run/trench/trenchd.sock", &runtime.display().to_string());
+        fs::write(&config, body).expect("fixture config");
+
+        let report = doctor(&config).expect("offline doctor report");
+        assert!(!report.ok);
+        assert_eq!(
+            report.reasons,
+            vec![
+                "sqlite_database_missing",
+                "parquet_store_missing",
+                "runtime_directory_missing",
+            ]
+        );
+        assert!(!root.path().join("state").exists());
+        assert!(!root.path().join("data").exists());
+        assert!(!root.path().join("runtime").exists());
     }
 }

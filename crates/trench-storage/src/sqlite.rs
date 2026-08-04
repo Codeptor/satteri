@@ -367,6 +367,22 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Returns whether any prior engine admission/checkpoint history exists.
+    ///
+    /// The daemon checks this before creating a new run. A nonempty journal
+    /// requires full deterministic reconstruction rather than a silent fresh
+    /// ledger, so callers must fail closed if no verified replay adapter exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when SQLite cannot inspect the journal.
+    pub async fn has_engine_history(&mut self) -> Result<bool, StoreError> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM engine_checkpoints")
+            .fetch_one(&mut self.connection)
+            .await?;
+        Ok(count > 0)
+    }
+
     /// Reads ledger-scoped source-event admission before pure engine evaluation.
     ///
     /// `trenchd` is the sole writer, so it must call this immediately before
