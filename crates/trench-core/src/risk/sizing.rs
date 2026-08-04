@@ -513,7 +513,10 @@ impl RiskPolicy {
         }
     }
 
-    pub(crate) fn commitment_digest(&self) -> String {
+    /// Returns the deterministic commitment for the frozen venue constraints,
+    /// costs, limits, and executable-book binding.
+    #[must_use]
+    pub fn commitment_digest(&self) -> String {
         let mut hasher = Hasher::new_derive_key("trench.risk-policy.v1");
         for value in [
             self.book_digest.clone(),
@@ -1820,6 +1823,18 @@ mod tests {
             ImpactBand::new(None, dec!(0.75), dec!(0.75)),
             Err(RiskInputError::UnsafeImpactFraction { .. })
         ));
+    }
+
+    #[test]
+    fn policy_commitment_is_stable_for_frozen_inputs() {
+        let commitment = request(costs(), dec!(0.5))
+            .into_policy()
+            .commitment_digest();
+
+        assert_eq!(
+            commitment,
+            "ee42c395675ce042201689e6d17b22161b5bbef7bdcecd84b2142cf8a234ecb6"
+        );
     }
 
     #[test]
