@@ -1,6 +1,7 @@
 //! Read-only public Hyperliquid market-data adapters.
 
 mod archive;
+mod capture;
 mod info;
 mod normalize;
 mod recovery;
@@ -10,6 +11,11 @@ mod ws;
 pub use archive::{
     ArchiveBatch, ArchiveDataKind, ArchiveDigest, ArchiveError, ArchiveManifest, ArchiveReader,
     ArchiveRequirement, ArchiveSource, ArchiveSpan,
+};
+pub use capture::{
+    CaptureOperation, ContextCapture, ContextCaptureBatch, ContextCaptureError,
+    ContextCaptureRequest, MAX_CONTEXT_EVENTS, MAX_CONTEXT_FUNDING_RECORDS, MAX_CONTEXT_MARKETS,
+    MAX_CONTEXT_REQUEST_CONCURRENCY, MAX_DETAILED_CONTEXT_MARKETS, ReceiptClock,
 };
 pub use info::{
     CandleInterval, INFO_RESPONSE_MAX_BYTES, InfoClient, InfoError, L2BookPrecision, L2Mantissa,

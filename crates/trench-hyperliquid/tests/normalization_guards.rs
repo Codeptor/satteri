@@ -190,6 +190,23 @@ async fn metadata_nullable_fields_must_still_be_present() {
 }
 
 #[tokio::test]
+async fn metadata_retains_explicit_venue_delisting_state() {
+    let mut body = meta_fixture();
+    body[0]["universe"][3]["isDelisted"] = json!(true);
+
+    let metadata = meta_result(body)
+        .await
+        .expect("explicit delisting state must normalize");
+    let old = metadata
+        .assets()
+        .iter()
+        .find(|asset| asset.market().as_str() == "OLD")
+        .expect("fixture OLD market");
+    assert!(old.is_delisted());
+    assert!(!metadata.assets()[0].is_delisted());
+}
+
+#[tokio::test]
 async fn metadata_rejects_invalid_exact_decimals_and_numeric_domains() {
     for (pointer, replacement, field, requirement) in [
         (

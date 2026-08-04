@@ -108,6 +108,7 @@ pub struct PerpAsset {
     market: Market,
     size_decimals: u8,
     max_leverage: VenueMaxLeverage,
+    is_delisted: bool,
     only_isolated: bool,
     margin_table_id: Option<u32>,
     context: AssetContext,
@@ -130,6 +131,12 @@ impl PerpAsset {
     #[must_use]
     pub const fn max_leverage(&self) -> VenueMaxLeverage {
         self.max_leverage
+    }
+
+    /// Returns whether the venue has explicitly delisted this market.
+    #[must_use]
+    pub const fn is_delisted(&self) -> bool {
+        self.is_delisted
     }
 
     /// Returns whether the venue marks the asset isolated-only.
@@ -356,6 +363,8 @@ struct RawUniverseAsset {
     size_decimals: u8,
     #[serde(rename = "maxLeverage")]
     max_leverage: u32,
+    #[serde(rename = "isDelisted", default)]
+    is_delisted: bool,
     #[serde(rename = "onlyIsolated", default)]
     only_isolated: bool,
     #[serde(rename = "marginTableId")]
@@ -452,6 +461,7 @@ pub(crate) fn decode_meta(body: &[u8]) -> Result<MetaAndAssetContexts, InfoError
                 market,
                 size_decimals: asset.size_decimals,
                 max_leverage: VenueMaxLeverage(asset.max_leverage),
+                is_delisted: asset.is_delisted,
                 only_isolated: asset.only_isolated,
                 margin_table_id: asset.margin_table_id,
                 context: normalize_context(context)?,
