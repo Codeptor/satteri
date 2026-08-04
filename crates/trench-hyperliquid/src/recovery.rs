@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use serde::Serialize;
 use thiserror::Error;
 use trench_core::candle::{
     Candle as DerivedCandle, CandleAggregator, CandleError, CandleGap,
@@ -267,6 +268,7 @@ pub struct RecoveryResult {
     status: RecoveryStatus,
     source: RecoverySource,
     backfill_events: Vec<MarketEvent>,
+    verified_witness: Option<VerifiedRecoveryWitness>,
 }
 
 impl RecoveryResult {
@@ -302,6 +304,259 @@ impl RecoveryResult {
     #[must_use]
     pub fn backfill_events(&self) -> &[MarketEvent] {
         &self.backfill_events
+    }
+
+    /// Returns the opaque witness minted only after exact trade/candle reconciliation.
+    #[must_use]
+    pub fn verified_witness(&self) -> Option<&VerifiedRecoveryWitness> {
+        self.verified_witness.as_ref()
+    }
+}
+
+/// Opaque, immutable evidence minted only after `candles_match` succeeds.
+///
+/// It retains the full actual reconciliation inputs and outputs. There is no
+/// public constructor: consumers may bind the witness to durable source refs,
+/// but cannot manufacture a reconciled result from raw shape alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedRecoveryWitness {
+    request: GapRecoveryRequest,
+    completed_through: TimestampNs,
+    local_trades: Vec<MarketEvent>,
+    official_candles: Vec<Candle>,
+    derived_candles: Vec<DerivedCandle>,
+    commitment: String,
+}
+
+impl VerifiedRecoveryWitness {
+    fn new(
+        request: &GapRecoveryRequest,
+        completed_through: TimestampNs,
+        local_trades: &[MarketEvent],
+        official_candles: &[Candle],
+        derived_candles: &[DerivedCandle],
+    ) -> Result<Self, RecoveryError> {
+        let commitment = verified_recovery_commitment(
+            request,
+            completed_through,
+            local_trades,
+            official_candles,
+            derived_candles,
+        )?;
+        Ok(Self {
+            request: request.clone(),
+            completed_through,
+            local_trades: local_trades.to_vec(),
+            official_candles: official_candles.to_vec(),
+            derived_candles: derived_candles.to_vec(),
+            commitment,
+        })
+    }
+
+    /// Returns the immutable recovery request whose retained state was reconciled.
+    #[must_use]
+    pub const fn request(&self) -> &GapRecoveryRequest {
+        &self.request
+    }
+
+    /// Returns the completed common candle boundary covered by this witness.
+    #[must_use]
+    pub const fn completed_through(&self) -> TimestampNs {
+        self.completed_through
+    }
+
+    /// Returns every actual local-trade input supplied to `reconcile_trades`.
+    #[must_use]
+    pub fn local_trades(&self) -> &[MarketEvent] {
+        &self.local_trades
+    }
+
+    /// Returns every actual official-candle input supplied to `reconcile_trades`.
+    #[must_use]
+    pub fn official_candles(&self) -> &[Candle] {
+        &self.official_candles
+    }
+
+    /// Returns the exact derived core-candle outputs that matched the official inputs.
+    #[must_use]
+    pub fn derived_candles(&self) -> &[DerivedCandle] {
+        &self.derived_candles
+    }
+
+    /// Returns the canonical commitment over immutable request, all inputs, and outputs.
+    #[must_use]
+    pub fn commitment(&self) -> &str {
+        &self.commitment
+    }
+}
+
+#[derive(Serialize)]
+struct VerifiedRecoveryWitnessWire {
+    version: u8,
+    generation: u64,
+    market: String,
+    reason: String,
+    reconnect_attempt: u32,
+    predecessor_event_time_ns: Option<i64>,
+    predecessor_received_at_ns: Option<i64>,
+    trade_predecessor_event_time_ns: Option<i64>,
+    trade_predecessor_received_at_ns: Option<i64>,
+    trade_predecessor_event_id: Option<String>,
+    snapshot_event_time_ns: i64,
+    snapshot_received_at_ns: i64,
+    snapshot_event_id: String,
+    completed_through_ns: i64,
+    local_trades: Vec<RecoveryTradeWire>,
+    official_candles: Vec<RecoveryCandleWire>,
+    derived_candles: Vec<RecoveryCandleWire>,
+}
+
+#[derive(Serialize)]
+struct RecoveryTradeWire {
+    event_id: String,
+    event_time_ns: i64,
+    received_at_ns: i64,
+    market: String,
+    trade_id: u64,
+    side: String,
+    price: String,
+    quantity: String,
+}
+
+#[derive(Serialize)]
+struct RecoveryCandleWire {
+    market: String,
+    interval: String,
+    open_time_ns: i64,
+    open: String,
+    high: String,
+    low: String,
+    close: String,
+    volume: String,
+    trade_count: u64,
+}
+
+fn verified_recovery_commitment(
+    request: &GapRecoveryRequest,
+    completed_through: TimestampNs,
+    local_trades: &[MarketEvent],
+    official_candles: &[Candle],
+    derived_candles: &[DerivedCandle],
+) -> Result<String, RecoveryError> {
+    let wire = VerifiedRecoveryWitnessWire {
+        version: 1,
+        generation: request.generation(),
+        market: request.market().as_str().to_owned(),
+        reason: gap_reason_name(request.reason()).to_owned(),
+        reconnect_attempt: request.reconnect_attempt(),
+        predecessor_event_time_ns: request.predecessor_event_time().map(TimestampNs::value),
+        predecessor_received_at_ns: request.predecessor_received_at().map(TimestampNs::value),
+        trade_predecessor_event_time_ns: request
+            .trade_predecessor_event_time()
+            .map(TimestampNs::value),
+        trade_predecessor_received_at_ns: request
+            .trade_predecessor_received_at()
+            .map(TimestampNs::value),
+        trade_predecessor_event_id: request
+            .trade_predecessor_event_id()
+            .map(|event_id| event_id.as_str().to_owned()),
+        snapshot_event_time_ns: request.snapshot_event_time().value(),
+        snapshot_received_at_ns: request.snapshot_received_at().value(),
+        snapshot_event_id: request.snapshot_event_id().as_str().to_owned(),
+        completed_through_ns: completed_through.value(),
+        local_trades: local_trades
+            .iter()
+            .map(recovery_trade_wire)
+            .collect::<Result<Vec<_>, _>>()?,
+        official_candles: official_candles
+            .iter()
+            .map(official_candle_wire)
+            .collect::<Result<Vec<_>, _>>()?,
+        derived_candles: derived_candles
+            .iter()
+            .map(|candle| core_candle_wire(candle.candle(), candle.market()))
+            .collect(),
+    };
+    let bytes = serde_json::to_vec(&wire).map_err(|_| RecoveryError::WitnessEncoding)?;
+    Ok(format!("b3:{}", blake3::hash(&bytes).to_hex()))
+}
+
+fn recovery_trade_wire(event: &MarketEvent) -> Result<RecoveryTradeWire, RecoveryError> {
+    let MarketEventKind::Trade(trade) = event.kind() else {
+        return Err(RecoveryError::ExpectedTrade {
+            event_id: event.event_id().clone(),
+        });
+    };
+    Ok(RecoveryTradeWire {
+        event_id: event.event_id().as_str().to_owned(),
+        event_time_ns: event.event_time().value(),
+        received_at_ns: event.received_at().value(),
+        market: event.market().as_str().to_owned(),
+        trade_id: trade.trade_id(),
+        side: match trade.side() {
+            trench_core::domain::Side::Buy => "buy".to_owned(),
+            trench_core::domain::Side::Sell => "sell".to_owned(),
+        },
+        price: trade.price().value().to_string(),
+        quantity: trade.quantity().value().to_string(),
+    })
+}
+
+fn official_candle_wire(candle: &Candle) -> Result<RecoveryCandleWire, RecoveryError> {
+    let open_time_ns = candle
+        .open_time_ms()
+        .checked_mul(1_000_000)
+        .ok_or(RecoveryError::WitnessEncoding)?;
+    Ok(RecoveryCandleWire {
+        market: candle.market().as_str().to_owned(),
+        interval: venue_interval_name(candle.interval()).to_owned(),
+        open_time_ns,
+        open: candle.open().value().to_string(),
+        high: candle.high().value().to_string(),
+        low: candle.low().value().to_string(),
+        close: candle.close().value().to_string(),
+        volume: candle.volume().value().to_string(),
+        trade_count: candle.trade_count(),
+    })
+}
+
+fn core_candle_wire(
+    candle: &trench_core::event::CompletedCandle,
+    market: &Market,
+) -> RecoveryCandleWire {
+    RecoveryCandleWire {
+        market: market.as_str().to_owned(),
+        interval: core_interval_name(candle.interval()).to_owned(),
+        open_time_ns: candle.open_time().value(),
+        open: candle.open().value().to_string(),
+        high: candle.high().value().to_string(),
+        low: candle.low().value().to_string(),
+        close: candle.close().value().to_string(),
+        volume: candle.volume().value().to_string(),
+        trade_count: candle.trade_count(),
+    }
+}
+
+const fn venue_interval_name(interval: crate::info::CandleInterval) -> &'static str {
+    match interval {
+        crate::info::CandleInterval::FifteenMinutes => "15m",
+        crate::info::CandleInterval::OneHour => "1h",
+    }
+}
+
+const fn core_interval_name(interval: CoreCandleInterval) -> &'static str {
+    match interval {
+        CoreCandleInterval::FifteenMinutes => "15m",
+        CoreCandleInterval::OneHour => "1h",
+    }
+}
+
+const fn gap_reason_name(reason: GapReason) -> &'static str {
+    match reason {
+        GapReason::TransportClosed => "transport_closed",
+        GapReason::TransportError => "transport_error",
+        GapReason::ReadTimeout => "read_timeout",
+        GapReason::SnapshotRecoveryTimeout => "snapshot_recovery_timeout",
     }
 }
 
@@ -544,6 +799,9 @@ impl GapRecovery {
 /// A bounded recovery request or explicit evidence failure.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum RecoveryError {
+    /// The immutable recovery witness could not be canonically encoded.
+    #[error("recovery witness canonical encoding failed")]
+    WitnessEncoding,
     /// The request cursor did not prove forward recovery from its predecessor.
     #[error("recovery request for market {market:?} has invalid predecessor or snapshot cursors")]
     InvalidCursor {
@@ -644,12 +902,12 @@ fn reconcile(
     completed_through: TimestampNs,
     candles: &mut CandleAggregator,
 ) -> Result<RecoveryResult, RecoveryError> {
-    let (status, source, backfill_events) = match evidence {
+    let (status, source, backfill_events, verified_witness) = match evidence {
         RecoveryEvidence::Reconciled {
             local_trades,
             official_candles,
         } => {
-            let (status, backfill_events) = reconcile_trades(
+            let (status, backfill_events, verified_witness) = reconcile_trades(
                 request,
                 local_trades,
                 official_candles,
@@ -660,6 +918,7 @@ fn reconcile(
                 status,
                 RecoverySource::LocalTradesAndOfficialCandles,
                 backfill_events,
+                verified_witness,
             )
         }
         RecoveryEvidence::ArchiveL2(batch) => {
@@ -674,12 +933,14 @@ fn reconcile(
                 mark_unavailable(request, candles, RecoveryUnavailable::ArchiveL2Only)?,
                 RecoverySource::ArchiveL2Only,
                 Vec::new(),
+                None,
             )
         }
         RecoveryEvidence::Unavailable { reason } => (
             mark_unavailable(request, candles, reason)?,
             RecoverySource::Unavailable,
             Vec::new(),
+            None,
         ),
     };
     Ok(RecoveryResult {
@@ -688,6 +949,7 @@ fn reconcile(
         status,
         source,
         backfill_events,
+        verified_witness,
     })
 }
 
@@ -697,7 +959,14 @@ fn reconcile_trades(
     official_candles: &[Candle],
     completed_through: TimestampNs,
     candles: &mut CandleAggregator,
-) -> Result<(RecoveryStatus, Vec<MarketEvent>), RecoveryError> {
+) -> Result<
+    (
+        RecoveryStatus,
+        Vec<MarketEvent>,
+        Option<VerifiedRecoveryWitness>,
+    ),
+    RecoveryError,
+> {
     if local_trades.len() > MAX_RECOVERY_LOCAL_TRADES {
         return Err(RecoveryError::EvidenceCapacity {
             field: "local_trades",
@@ -732,7 +1001,7 @@ fn reconcile_trades(
         None
     };
     if let Some(reason) = unavailable_reason {
-        return mark_unavailable(request, candles, reason).map(|status| (status, Vec::new()));
+        return mark_unavailable(request, candles, reason).map(|status| (status, Vec::new(), None));
     }
 
     let Some(expected_candle_keys) = required_candle_keys(request, completed_through) else {
@@ -741,7 +1010,7 @@ fn reconcile_trades(
             candles,
             RecoveryUnavailable::CandleCoverageUnavailable,
         )
-        .map(|status| (status, Vec::new()));
+        .map(|status| (status, Vec::new(), None));
     };
     if !has_exact_candle_coverage(&expected_candle_keys, official_candles) {
         return mark_unavailable(
@@ -749,7 +1018,7 @@ fn reconcile_trades(
             candles,
             RecoveryUnavailable::CandleCoverageUnavailable,
         )
-        .map(|status| (status, Vec::new()));
+        .map(|status| (status, Vec::new(), None));
     }
 
     let mut candidate = candles.clone();
@@ -758,6 +1027,13 @@ fn reconcile_trades(
     }
     let completed = candidate.complete_market_through(request.market(), completed_through)?;
     if candles_match(&expected_candle_keys, &completed, official_candles) {
+        let witness = VerifiedRecoveryWitness::new(
+            request,
+            completed_through,
+            local_trades,
+            official_candles,
+            &completed,
+        )?;
         *candles = candidate;
         return Ok((
             RecoveryStatus::Reconciled { candles: completed },
@@ -766,10 +1042,11 @@ fn reconcile_trades(
                 .filter(|event| event.event_time() < request.snapshot_event_time())
                 .cloned()
                 .collect(),
+            Some(witness),
         ));
     }
     mark_unavailable(request, candles, RecoveryUnavailable::CandleConflict)
-        .map(|status| (status, Vec::new()))
+        .map(|status| (status, Vec::new(), None))
 }
 
 fn validate_trade(

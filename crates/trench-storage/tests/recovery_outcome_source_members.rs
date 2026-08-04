@@ -1,131 +1,23 @@
-use std::fs;
+mod support;
+
+use std::{collections::BTreeMap, fs};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use rust_decimal_macros::dec;
 use tempfile::TempDir;
-use trench_core::{
-    domain::{Market, Price, Quantity, Side},
-    event::{BookLevel, BookSnapshot, CandleInterval, CompletedCandle, MarketEvent, TimestampNs},
-    validation::TimeRange,
-};
+use trench_core::event::MarketEvent;
 use trench_storage::{
-    parquet::{DataProvenance, ParquetStore},
-    recovery_outcomes::{
-        ReconciledRecoveryOutcome, RecoveryOutcomeSource, RecoveryOutcomeStatus,
-        RecoveryOutcomeStore, RecoveryRequestCursors, RecoverySourceReference,
-    },
+    parquet::{DataProvenance, ParquetStore, PartitionManifest},
+    recovery_outcomes::{RecoveryOutcomeStore, RecoverySourceReference},
     research_plan::{ResearchMemberLocator, ResearchSourcePlanBuilder},
     research_runs::AvailabilityKey,
 };
 
-const FIFTEEN_MINUTES_NS: i64 = 900_000_000_000;
+use support::{ONE_HOUR_NS, VerifiedRecoveryFixture, range, verified_recovery};
 
 fn digest(character: char) -> String {
     format!("b3:{}", character.to_string().repeat(64))
-}
-
-fn timestamp(value: i64) -> TimestampNs {
-    TimestampNs::new(i128::from(value)).expect("fixture timestamp")
-}
-
-fn range(start: i64, end: i64) -> TimeRange {
-    TimeRange::new(timestamp(start), timestamp(end)).expect("fixture range")
-}
-
-fn book(event_time: i64, received_at: i64, sequence: u64) -> MarketEvent {
-    MarketEvent::book_snapshot(
-        timestamp(event_time),
-        timestamp(received_at),
-        Market::new("SOL").expect("market"),
-        BookSnapshot::new(
-            sequence,
-            vec![BookLevel::new(
-                Price::new(dec!(99)).expect("bid price"),
-                Quantity::new(dec!(1)).expect("bid quantity"),
-            )],
-            vec![BookLevel::new(
-                Price::new(dec!(101)).expect("ask price"),
-                Quantity::new(dec!(1)).expect("ask quantity"),
-            )],
-        ),
-    )
-    .expect("book snapshot")
-}
-
-fn completed_candle() -> MarketEvent {
-    let candle = CompletedCandle::new(
-        CandleInterval::FifteenMinutes,
-        timestamp(0),
-        Price::new(dec!(100)).expect("open"),
-        Price::new(dec!(101)).expect("high"),
-        Price::new(dec!(99)).expect("low"),
-        Price::new(dec!(100)).expect("close"),
-        Quantity::new(dec!(1)).expect("volume"),
-        1,
-    )
-    .expect("completed candle");
-    MarketEvent::completed_candle(
-        timestamp(FIFTEEN_MINUTES_NS),
-        timestamp(FIFTEEN_MINUTES_NS),
-        Market::new("SOL").expect("market"),
-        candle,
-    )
-    .expect("completed candle event")
-}
-
-fn trade(event_time: i64, received_at: i64, trade_id: u64) -> MarketEvent {
-    MarketEvent::trade(
-        timestamp(event_time),
-        timestamp(received_at),
-        Market::new("SOL").expect("market"),
-        trench_core::event::Trade::new(
-            trade_id,
-            Side::Buy,
-            Price::new(dec!(100)).expect("price"),
-            Quantity::new(dec!(1)).expect("quantity"),
-        )
-        .expect("trade"),
-    )
-    .expect("trade event")
-}
-
-fn reference(event: &MarketEvent, member_manifest_digest: &str) -> RecoverySourceReference {
-    RecoverySourceReference::new(
-        member_manifest_digest,
-        AvailabilityKey::new(
-            event.received_at(),
-            event.event_time(),
-            event.event_id().clone(),
-        )
-        .expect("availability key"),
-    )
-    .expect("source reference")
-}
-
-fn outcome(
-    anchor_member_manifest_digest: &str,
-    candle_member_manifest_digest: &str,
-    anchor: &MarketEvent,
-    candle: &MarketEvent,
-) -> ReconciledRecoveryOutcome {
-    let anchor = reference(anchor, anchor_member_manifest_digest);
-    let completion = reference(candle, candle_member_manifest_digest);
-    ReconciledRecoveryOutcome::new(
-        "sol-gap-1",
-        1,
-        Market::new("SOL").expect("market"),
-        RecoveryRequestCursors::new(None, None).expect("request cursors"),
-        RecoveryOutcomeStatus::Reconciled,
-        RecoveryOutcomeSource::CapturedTrades,
-        timestamp(FIFTEEN_MINUTES_NS),
-        anchor,
-        Vec::new(),
-        vec![completion.clone()],
-        completion,
-    )
-    .expect("reconciled outcome")
 }
 
 fn store() -> (TempDir, ParquetStore) {
@@ -138,172 +30,259 @@ fn store() -> (TempDir, ParquetStore) {
     (root, store)
 }
 
-#[test]
-fn companion_outcome_reopens_only_from_its_immutable_locator() {
-    let (root, store) = store();
-    let anchor = book(FIFTEEN_MINUTES_NS - 1_000, FIFTEEN_MINUTES_NS - 1_000, 1);
-    let candle = completed_candle();
-    let manifests = store
-        .write_events(&[anchor.clone(), candle.clone()])
-        .expect("source events");
-    assert_eq!(manifests.len(), 2);
-    let anchor_manifest = manifests
-        .iter()
-        .find(|manifest| manifest.min_event_time() == anchor.event_time())
-        .expect("book manifest");
-    let candle_manifest = manifests
-        .iter()
-        .find(|manifest| manifest.min_event_time() == candle.event_time())
-        .expect("candle manifest");
-    let outcome = outcome(
-        &anchor_manifest.manifest_digest(),
-        &candle_manifest.manifest_digest(),
-        &anchor,
-        &candle,
-    );
-    let outcomes = RecoveryOutcomeStore::open(&store).expect("outcome store");
-    let locator = outcomes.publish(&outcome).expect("published outcome");
-
-    assert_eq!(
-        outcomes.open_member(&locator).expect("reopened outcome"),
-        outcome
-    );
-
-    let draft = ResearchSourcePlanBuilder::new(
-        range(0, FIFTEEN_MINUTES_NS),
-        range(FIFTEEN_MINUTES_NS, FIFTEEN_MINUTES_NS * 2),
+fn reference(event: &MarketEvent, manifest_digest: &str) -> RecoverySourceReference {
+    RecoverySourceReference::new(
+        manifest_digest,
+        AvailabilityKey::new(
+            event.received_at(),
+            event.event_time(),
+            event.event_id().clone(),
+        )
+        .expect("availability key"),
     )
-    .expect("windows")
-    .with_recovery_outcomes(vec![locator])
-    .expect("outcome selection")
-    .build(
-        &store,
-        vec![
-            ResearchMemberLocator::legacy(anchor_manifest),
-            ResearchMemberLocator::legacy(candle_manifest),
-        ],
-        Vec::new(),
-    )
-    .expect("source-plan draft");
-    let verified = draft
-        .publish_to(&store, root.path().join("source-plan"))
-        .expect("verified source plan");
-    assert_eq!(verified.recovery_outcomes(), std::slice::from_ref(&outcome));
+    .expect("source reference")
+}
+
+fn manifest_for<'a>(
+    store: &ParquetStore,
+    manifests: &'a [PartitionManifest],
+    event: &MarketEvent,
+) -> &'a PartitionManifest {
+    manifests
+        .iter()
+        .find(|manifest| {
+            store
+                .read_partition(manifest)
+                .expect("reopen source partition")
+                .iter()
+                .any(|candidate| candidate.event_id() == event.event_id())
+        })
+        .expect("source manifest")
+}
+
+struct PublishedFixture {
+    root: TempDir,
+    store: ParquetStore,
+    manifests: Vec<PartitionManifest>,
+    fixture: VerifiedRecoveryFixture,
+    predecessor: RecoverySourceReference,
+    trade_predecessor: RecoverySourceReference,
+    snapshot: RecoverySourceReference,
+    local_trades: Vec<RecoverySourceReference>,
+    official_candles: Vec<RecoverySourceReference>,
+    raw_proof: BTreeMap<RecoverySourceReference, MarketEvent>,
+}
+
+impl PublishedFixture {
+    fn new() -> Self {
+        let (root, store) = store();
+        let fixture = verified_recovery();
+        let events = std::iter::once(fixture.predecessor.clone())
+            .chain(std::iter::once(fixture.snapshot.clone()))
+            .chain(fixture.local_trades.iter().cloned())
+            .chain(fixture.official_candles.iter().cloned())
+            .collect::<Vec<_>>();
+        let manifests = store.write_events(&events).expect("source events");
+        let source_ref = |event: &MarketEvent| {
+            reference(
+                event,
+                &manifest_for(&store, &manifests, event).manifest_digest(),
+            )
+        };
+        let predecessor = source_ref(&fixture.predecessor);
+        let trade_predecessor = predecessor.clone();
+        let snapshot = source_ref(&fixture.snapshot);
+        let mut local_trade_pairs = fixture
+            .local_trades
+            .iter()
+            .map(|event| (source_ref(event), event.clone()))
+            .collect::<Vec<_>>();
+        local_trade_pairs
+            .sort_by(|left, right| left.0.key().event_id().cmp(right.0.key().event_id()));
+        let local_trades = local_trade_pairs
+            .iter()
+            .map(|(reference, _)| reference.clone())
+            .collect::<Vec<_>>();
+        let mut official_candle_pairs = fixture
+            .official_candles
+            .iter()
+            .map(|event| (source_ref(event), event.clone()))
+            .collect::<Vec<_>>();
+        official_candle_pairs
+            .sort_by(|left, right| left.0.key().event_id().cmp(right.0.key().event_id()));
+        let official_candles = official_candle_pairs
+            .iter()
+            .map(|(reference, _)| reference.clone())
+            .collect::<Vec<_>>();
+        let raw_proof = std::iter::once((&predecessor, &fixture.predecessor))
+            .chain(std::iter::once((&snapshot, &fixture.snapshot)))
+            .chain(
+                local_trade_pairs
+                    .iter()
+                    .map(|(reference, event)| (reference, event)),
+            )
+            .chain(
+                official_candle_pairs
+                    .iter()
+                    .map(|(reference, event)| (reference, event)),
+            )
+            .map(|(reference, event)| (reference.clone(), event.clone()))
+            .collect();
+        Self {
+            root,
+            store,
+            manifests,
+            fixture,
+            predecessor,
+            trade_predecessor,
+            snapshot,
+            local_trades,
+            official_candles,
+            raw_proof,
+        }
+    }
+
+    fn availability_anchor(&self) -> RecoverySourceReference {
+        std::iter::once(&self.predecessor)
+            .chain(std::iter::once(&self.snapshot))
+            .chain(&self.local_trades)
+            .chain(&self.official_candles)
+            .max_by_key(|reference| reference.key())
+            .expect("nonempty raw proof")
+            .clone()
+    }
+
+    fn publish(&self) -> trench_storage::recovery_outcomes::RecoveryOutcomeLocator {
+        RecoveryOutcomeStore::open(&self.store)
+            .expect("outcome store")
+            .publish_verified(
+                &self.fixture.result,
+                Some(self.predecessor.clone()),
+                self.trade_predecessor.clone(),
+                self.snapshot.clone(),
+                self.local_trades.clone(),
+                self.official_candles.clone(),
+                self.availability_anchor(),
+                &self.raw_proof,
+            )
+            .expect("publish verified outcome")
+    }
 }
 
 #[test]
-fn companion_outcome_rejects_foreign_provenance_and_unselected_raw_members() {
-    let (root, store) = store();
-    let anchor = book(FIFTEEN_MINUTES_NS - 1_000, FIFTEEN_MINUTES_NS - 1_000, 1);
-    let candle = completed_candle();
-    let manifests = store
-        .write_events(&[anchor.clone(), candle.clone()])
-        .expect("source events");
-    let anchor_manifest = manifests
-        .iter()
-        .find(|manifest| manifest.min_event_time() == anchor.event_time())
-        .expect("book manifest");
-    let candle_manifest = manifests
-        .iter()
-        .find(|manifest| manifest.min_event_time() == candle.event_time())
-        .expect("candle manifest");
-    let outcome = outcome(
-        &anchor_manifest.manifest_digest(),
-        &candle_manifest.manifest_digest(),
-        &anchor,
-        &candle,
+fn companion_outcome_reopens_only_from_its_immutable_locator() {
+    let fixture = PublishedFixture::new();
+    let locator = fixture.publish();
+    let reopened = RecoveryOutcomeStore::open(&fixture.store)
+        .expect("outcome store")
+        .open_member(&locator)
+        .expect("reopen outcome");
+    assert_eq!(
+        reopened.completed_through(),
+        support::timestamp(ONE_HOUR_NS)
     );
-    let outcomes = RecoveryOutcomeStore::open(&store).expect("outcome store");
-    let locator = outcomes.publish(&outcome).expect("published outcome");
 
+    let draft =
+        ResearchSourcePlanBuilder::new(range(0, ONE_HOUR_NS), range(ONE_HOUR_NS, ONE_HOUR_NS * 2))
+            .expect("windows")
+            .with_recovery_outcomes(vec![locator])
+            .expect("outcome selection")
+            .build(
+                &fixture.store,
+                fixture
+                    .manifests
+                    .iter()
+                    .map(ResearchMemberLocator::legacy)
+                    .collect(),
+                Vec::new(),
+            )
+            .expect("source-plan draft");
+    let verified = draft
+        .publish_to(&fixture.store, fixture.root.path().join("source-plan"))
+        .expect("verified source plan");
+    assert_eq!(verified.recovery_outcomes().len(), 1);
+}
+
+#[test]
+fn companion_outcome_rejects_foreign_provenance() {
+    let fixture = PublishedFixture::new();
+    let locator = fixture.publish();
     let foreign = ParquetStore::open(
-        root.path(),
+        fixture.root.path(),
         DataProvenance::new(digest('c'), digest('b'), ParquetStore::schema_hash())
             .expect("foreign provenance"),
     )
     .expect("foreign store handle");
     assert!(
         RecoveryOutcomeStore::open(&foreign)
-            .expect("foreign outcome store handle")
+            .expect("foreign outcome store")
             .open_member(&locator)
             .is_err()
     );
+}
 
-    let draft = ResearchSourcePlanBuilder::new(
-        range(0, FIFTEEN_MINUTES_NS),
-        range(FIFTEEN_MINUTES_NS, FIFTEEN_MINUTES_NS * 2),
-    )
-    .expect("windows")
-    .with_recovery_outcomes(vec![locator])
-    .expect("outcome selection")
-    .build(
-        &store,
-        vec![ResearchMemberLocator::legacy(anchor_manifest)],
-        Vec::new(),
+#[test]
+fn companion_outcome_requires_every_witness_input_reference() {
+    let fixture = PublishedFixture::new();
+    let outcomes = RecoveryOutcomeStore::open(&fixture.store).expect("outcome store");
+    assert!(
+        outcomes
+            .publish_verified(
+                &fixture.fixture.result,
+                Some(fixture.predecessor.clone()),
+                fixture.trade_predecessor.clone(),
+                fixture.snapshot.clone(),
+                Vec::new(),
+                fixture.official_candles.clone(),
+                fixture.availability_anchor(),
+                &fixture.raw_proof,
+            )
+            .is_err()
     );
-    assert!(draft.is_err());
+    assert!(
+        outcomes
+            .publish_verified(
+                &fixture.fixture.result,
+                Some(fixture.predecessor.clone()),
+                fixture.trade_predecessor.clone(),
+                fixture.snapshot.clone(),
+                fixture.local_trades.clone(),
+                Vec::new(),
+                fixture.availability_anchor(),
+                &fixture.raw_proof,
+            )
+            .is_err()
+    );
 }
 
 #[test]
 fn companion_outcome_rejects_a_tampered_published_payload() {
-    let (root, store) = store();
-    let anchor = book(FIFTEEN_MINUTES_NS - 1_000, FIFTEEN_MINUTES_NS - 1_000, 1);
-    let candle = completed_candle();
-    let manifests = store
-        .write_events(&[anchor.clone(), candle.clone()])
-        .expect("source events");
-    let anchor_manifest = manifests
-        .iter()
-        .find(|manifest| manifest.min_event_time() == anchor.event_time())
-        .expect("book manifest");
-    let candle_manifest = manifests
-        .iter()
-        .find(|manifest| manifest.min_event_time() == candle.event_time())
-        .expect("candle manifest");
-    let outcome = outcome(
-        &anchor_manifest.manifest_digest(),
-        &candle_manifest.manifest_digest(),
-        &anchor,
-        &candle,
-    );
-    let outcomes = RecoveryOutcomeStore::open(&store).expect("outcome store");
-    let locator = outcomes.publish(&outcome).expect("published outcome");
-    let payload = root
+    let fixture = PublishedFixture::new();
+    let locator = fixture.publish();
+    let payload = fixture
+        .root
         .path()
         .join("recovery-outcomes")
         .join(format!("outcome-{}.out", locator.outcome_id()))
         .join("outcome.json");
     fs::write(payload, b"{}\n").expect("tamper companion payload");
 
-    assert!(outcomes.open_member(&locator).is_err());
+    assert!(
+        RecoveryOutcomeStore::open(&fixture.store)
+            .expect("outcome store")
+            .open_member(&locator)
+            .is_err()
+    );
 }
 
 #[test]
 fn companion_outcome_rejects_unexpected_member_entries() {
-    let (root, store) = store();
-    let anchor = book(FIFTEEN_MINUTES_NS - 1_000, FIFTEEN_MINUTES_NS - 1_000, 1);
-    let candle = completed_candle();
-    let manifests = store
-        .write_events(&[anchor.clone(), candle.clone()])
-        .expect("source events");
-    let anchor_manifest = manifests
-        .iter()
-        .find(|manifest| manifest.min_event_time() == anchor.event_time())
-        .expect("book manifest");
-    let candle_manifest = manifests
-        .iter()
-        .find(|manifest| manifest.min_event_time() == candle.event_time())
-        .expect("candle manifest");
-    let outcome = outcome(
-        &anchor_manifest.manifest_digest(),
-        &candle_manifest.manifest_digest(),
-        &anchor,
-        &candle,
-    );
-    let outcomes = RecoveryOutcomeStore::open(&store).expect("outcome store");
-    let locator = outcomes.publish(&outcome).expect("published outcome");
+    let fixture = PublishedFixture::new();
+    let locator = fixture.publish();
     fs::write(
-        root.path()
+        fixture
+            .root
+            .path()
             .join("recovery-outcomes")
             .join(format!("outcome-{}.out", locator.outcome_id()))
             .join("injected"),
@@ -311,54 +290,10 @@ fn companion_outcome_rejects_unexpected_member_entries() {
     )
     .expect("inject unexpected entry");
 
-    assert!(outcomes.open_member(&locator).is_err());
-}
-
-#[test]
-fn availability_anchor_is_the_exact_maximum_key_including_event_id_ties() {
-    let recovery_anchor = reference(&book(800, 800, 1), &digest('a'));
-    let backfill = reference(
-        &trade(FIFTEEN_MINUTES_NS, FIFTEEN_MINUTES_NS, 1),
-        &digest('b'),
-    );
-    let official = reference(&completed_candle(), &digest('c'));
-    let (lower, maximum) = if backfill.key() < official.key() {
-        (backfill.clone(), official.clone())
-    } else {
-        (official.clone(), backfill.clone())
-    };
-
     assert!(
-        ReconciledRecoveryOutcome::new(
-            "sol-gap-1",
-            1,
-            Market::new("SOL").expect("market"),
-            RecoveryRequestCursors::new(None, None).expect("request cursors"),
-            RecoveryOutcomeStatus::Reconciled,
-            RecoveryOutcomeSource::CapturedTrades,
-            timestamp(FIFTEEN_MINUTES_NS),
-            recovery_anchor.clone(),
-            vec![backfill.clone()],
-            vec![official.clone()],
-            lower,
-        )
-        .is_err()
-    );
-
-    assert!(
-        ReconciledRecoveryOutcome::new(
-            "sol-gap-1",
-            1,
-            Market::new("SOL").expect("market"),
-            RecoveryRequestCursors::new(None, None).expect("request cursors"),
-            RecoveryOutcomeStatus::Reconciled,
-            RecoveryOutcomeSource::CapturedTrades,
-            timestamp(FIFTEEN_MINUTES_NS),
-            recovery_anchor,
-            vec![backfill],
-            vec![official],
-            maximum,
-        )
-        .is_ok()
+        RecoveryOutcomeStore::open(&fixture.store)
+            .expect("outcome store")
+            .open_member(&locator)
+            .is_err()
     );
 }

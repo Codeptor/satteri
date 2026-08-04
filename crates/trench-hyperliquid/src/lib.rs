@@ -27,12 +27,15 @@ pub use normalize::{
 };
 #[cfg(debug_assertions)]
 #[doc(hidden)]
+pub use normalize::{CandleForTest, candle_for_test};
+#[cfg(debug_assertions)]
+#[doc(hidden)]
 pub use recovery::recovery_request_from_events_for_test;
 pub use recovery::{
     GapRecovery, GapRecoveryRequest, MAX_OUTSTANDING_RECOVERY_REQUESTS,
     MAX_PROCESSED_RECOVERY_REQUESTS, MAX_RECOVERY_LOCAL_TRADES, MAX_RECOVERY_OFFICIAL_CANDLES,
     RecoveryError, RecoveryEvidence, RecoveryResult, RecoverySource, RecoveryStatus,
-    RecoveryUnavailable,
+    RecoveryUnavailable, VerifiedRecoveryWitness,
 };
 pub use recovery_producer::{
     MAX_RETAINED_RECOVERY_TRADES_PER_MARKET, RecoveryEvidenceProducer, RecoveryProducerError,

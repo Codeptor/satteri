@@ -5,10 +5,8 @@
 //! market only at their verified raw availability anchor.
 
 use std::{
-    collections::BTreeSet,
-    fs::{self, File},
-    io::{self, Read, Write},
-    sync::Arc,
+    collections::{BTreeMap, BTreeSet},
+    io,
 };
 
 #[cfg(unix)]
@@ -17,11 +15,23 @@ use rustix::fs::{
 };
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
+use std::fs;
+#[cfg(unix)]
+use std::fs::File;
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+use std::sync::Arc;
 use thiserror::Error;
 use trench_core::{
     domain::{EventId, Market},
-    event::{MarketEvent, MarketEventKind, TimestampNs},
+    event::{CandleInterval, MarketEvent, MarketEventKind, TimestampNs},
+};
+use trench_hyperliquid::{
+    RecoveryResult as HyperliquidRecoveryResult, RecoverySource as HyperliquidRecoverySource,
+    RecoveryStatus as HyperliquidRecoveryStatus, VerifiedRecoveryWitness,
 };
 
 use crate::{
@@ -29,13 +39,16 @@ use crate::{
     research_runs::AvailabilityKey,
 };
 
-const OUTCOME_VERSION: u8 = 1;
+const OUTCOME_VERSION: u8 = 2;
+#[cfg(unix)]
 const OUTCOME_FILE: &str = "outcome.json";
+#[cfg(unix)]
 const MANIFEST_FILE: &str = "manifest.json";
 const MAX_OUTCOME_BYTES: u64 = 1_048_576;
 const MAX_IDENTIFIER_BYTES: usize = 256;
 const MAX_BACKFILL_REFS: usize = 8_192;
 const MAX_OFFICIAL_CANDLE_REFS: usize = 5_000;
+const WITNESS_VERSION: u8 = 1;
 /// Fixed aggregate raw-proof budget shared by every selected source plan.
 pub(crate) const MAX_TOTAL_RECOVERY_PROOF_REFERENCES: usize = 65_536;
 
@@ -143,23 +156,79 @@ pub struct ReconciledRecoveryOutcome {
     backfill_references: Vec<RecoverySourceReference>,
     official_candle_references: Vec<RecoverySourceReference>,
     availability_anchor: RecoverySourceReference,
+    verified_result: Option<VerifiedRecoveryResultWire>,
     result_digest: String,
 }
 
 impl ReconciledRecoveryOutcome {
-    /// Creates one immutable terminal recovery outcome.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    /// Binds a reconciled companion to a result emitted by Hyperliquid's recovery coordinator.
+    ///
+    /// The coordinator owns the prior candle-aggregator state, so raw references alone can
+    /// never establish reconciliation. This constructor is deliberately the only reconciled
+    /// construction path and accepts the opaque, already-verified result instead of a caller
+    /// supplied status or digest.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the opaque result and each independently selected source proof are explicit"
+    )]
+    pub(crate) fn from_verified_result(
+        result: &HyperliquidRecoveryResult,
+        predecessor: Option<RecoverySourceReference>,
+        trade_predecessor: RecoverySourceReference,
+        recovery_anchor: RecoverySourceReference,
+        backfill_references: Vec<RecoverySourceReference>,
+        official_candle_references: Vec<RecoverySourceReference>,
+        availability_anchor: RecoverySourceReference,
+        raw_proof: &BTreeMap<RecoverySourceReference, MarketEvent>,
+    ) -> Result<Self, RecoveryOutcomeError> {
+        let witness = result
+            .verified_witness()
+            .ok_or(RecoveryOutcomeError::InvalidOutcome)?;
+        if result.source() != HyperliquidRecoverySource::LocalTradesAndOfficialCandles
+            || !matches!(
+                result.status(),
+                HyperliquidRecoveryStatus::Reconciled { .. }
+            )
+            || result.request() != witness.request()
+            || result.completed_through() != witness.completed_through()
+        {
+            return Err(RecoveryOutcomeError::InvalidOutcome);
+        }
+        let verified_result = VerifiedRecoveryResultWire::from_witness(witness)?;
+        let request = result.request();
+        let value = Self {
+            request_id: format!("{}:{}", request.market().as_str(), request.generation()),
+            generation: request.generation(),
+            market: request.market().clone(),
+            request_cursors: RecoveryRequestCursors::new(predecessor, Some(trade_predecessor))?,
+            status: RecoveryOutcomeStatus::Reconciled,
+            source: RecoveryOutcomeSource::CapturedTrades,
+            completed_through: result.completed_through(),
+            recovery_anchor,
+            backfill_references,
+            official_candle_references,
+            availability_anchor,
+            result_digest: witness.commitment().to_owned(),
+            verified_result: Some(verified_result),
+        };
+        value.validate_structure()?;
+        value.validate_verified_result(result, witness, raw_proof)?;
+        Ok(value)
+    }
+
+    /// Creates an explicit unavailable outcome that can quarantine entries but never release them.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "unavailable outcomes deliberately bind their independent immutable request facts"
+    )]
+    pub(crate) fn unavailable(
         request_id: impl Into<String>,
         generation: u64,
         market: Market,
         request_cursors: RecoveryRequestCursors,
-        status: RecoveryOutcomeStatus,
         source: RecoveryOutcomeSource,
         completed_through: TimestampNs,
         recovery_anchor: RecoverySourceReference,
-        backfill_references: Vec<RecoverySourceReference>,
-        official_candle_references: Vec<RecoverySourceReference>,
         availability_anchor: RecoverySourceReference,
     ) -> Result<Self, RecoveryOutcomeError> {
         let mut value = Self {
@@ -167,17 +236,18 @@ impl ReconciledRecoveryOutcome {
             generation,
             market,
             request_cursors,
-            status,
+            status: RecoveryOutcomeStatus::Unavailable,
             source,
             completed_through,
             recovery_anchor,
-            backfill_references,
-            official_candle_references,
+            backfill_references: Vec::new(),
+            official_candle_references: Vec::new(),
             availability_anchor,
+            verified_result: None,
             result_digest: String::new(),
         };
         value.validate_structure()?;
-        value.result_digest = value.expected_result_digest()?;
+        value.result_digest = value.unavailable_result_digest()?;
         Ok(value)
     }
 
@@ -222,7 +292,7 @@ impl ReconciledRecoveryOutcome {
         &self.backfill_references
     }
 
-    /// Returns the immutable result commitment bound to the complete raw proof.
+    /// Returns the opaque upstream recovery-witness commitment.
     #[must_use]
     pub(crate) fn result_digest(&self) -> &str {
         &self.result_digest
@@ -242,8 +312,19 @@ impl ReconciledRecoveryOutcome {
 
     fn validate(&self) -> Result<(), RecoveryOutcomeError> {
         self.validate_structure()?;
-        if self.result_digest != self.expected_result_digest()? {
-            return Err(RecoveryOutcomeError::InvalidOutcome);
+        match (&self.status, &self.verified_result) {
+            (RecoveryOutcomeStatus::Reconciled, Some(result)) => {
+                if self.result_digest != result.upstream_commitment {
+                    return Err(RecoveryOutcomeError::InvalidOutcome);
+                }
+                self.validate_verified_result_shape(result)?;
+            }
+            (RecoveryOutcomeStatus::Unavailable, None) => {
+                if self.result_digest != self.unavailable_result_digest()? {
+                    return Err(RecoveryOutcomeError::InvalidOutcome);
+                }
+            }
+            _ => return Err(RecoveryOutcomeError::InvalidOutcome),
         }
         Ok(())
     }
@@ -265,7 +346,13 @@ impl ReconciledRecoveryOutcome {
         validate_sorted_references(&self.backfill_references)?;
         validate_sorted_references(&self.official_candle_references)?;
         match (self.status, self.source) {
-            (RecoveryOutcomeStatus::Reconciled, RecoveryOutcomeSource::CapturedTrades) => {}
+            (RecoveryOutcomeStatus::Reconciled, RecoveryOutcomeSource::CapturedTrades) => {
+                if self.request_cursors.trade_predecessor.is_none()
+                    || self.official_candle_references.is_empty()
+                {
+                    return Err(RecoveryOutcomeError::InvalidOutcome);
+                }
+            }
             (RecoveryOutcomeStatus::Unavailable, RecoveryOutcomeSource::ArchiveL2)
             | (RecoveryOutcomeStatus::Unavailable, RecoveryOutcomeSource::Unavailable) => {
                 if !self.backfill_references.is_empty()
@@ -297,8 +384,8 @@ impl ReconciledRecoveryOutcome {
         Ok(())
     }
 
-    pub(crate) fn expected_result_digest(&self) -> Result<String, RecoveryOutcomeError> {
-        payload_digest(&RecoveryOutcomeResultWire {
+    fn unavailable_result_digest(&self) -> Result<String, RecoveryOutcomeError> {
+        payload_digest(&UnavailableRecoveryResultWire {
             version: OUTCOME_VERSION,
             request_id: self.request_id.clone(),
             generation: self.generation,
@@ -362,10 +449,12 @@ impl ReconciledRecoveryOutcome {
                 .map(reference_wire)
                 .collect(),
             availability_anchor: reference_wire(&self.availability_anchor),
+            verified_result: self.verified_result.clone(),
             result_digest: self.result_digest.clone(),
         }
     }
 
+    #[cfg(unix)]
     fn from_wire(wire: RecoveryOutcomeWire) -> Result<Self, RecoveryOutcomeError> {
         if wire.version != OUTCOME_VERSION {
             return Err(RecoveryOutcomeError::InvalidOutcome);
@@ -396,6 +485,7 @@ impl ReconciledRecoveryOutcome {
                 .map(reference_from_wire)
                 .collect::<Result<Vec<_>, _>>()?,
             availability_anchor: reference_from_wire(wire.availability_anchor)?,
+            verified_result: wire.verified_result,
             result_digest: wire.result_digest,
         };
         value.validate()?;
@@ -439,15 +529,11 @@ impl ReconciledRecoveryOutcome {
             .chain(&self.official_candle_references)
     }
 
-    pub(crate) fn validate_raw_references(
+    fn validate_raw_references(
         &self,
-        observed: &std::collections::BTreeMap<RecoverySourceReference, MarketEvent>,
+        observed: &BTreeMap<RecoverySourceReference, MarketEvent>,
     ) -> Result<(), RecoveryOutcomeError> {
-        let source = |reference: &RecoverySourceReference| {
-            observed
-                .get(reference)
-                .ok_or(RecoveryOutcomeError::InvalidOutcome)
-        };
+        let source = |reference: &RecoverySourceReference| referenced_event(observed, reference);
         let anchor = source(&self.recovery_anchor)?;
         if anchor.market() != &self.market
             || !matches!(anchor.kind(), MarketEventKind::BookSnapshot(_))
@@ -471,11 +557,13 @@ impl ReconciledRecoveryOutcome {
                 return Err(RecoveryOutcomeError::InvalidOutcome);
             }
         }
+        let trade_predecessor = self.request_cursors.trade_predecessor.as_ref();
         for reference in &self.backfill_references {
             let event = source(reference)?;
             if event.market() != &self.market
                 || !matches!(event.kind(), MarketEventKind::Trade(_))
-                || event.event_time() > self.completed_through
+                || event.event_time() >= self.completed_through
+                || trade_predecessor.is_some_and(|predecessor| reference.key() <= predecessor.key())
             {
                 return Err(RecoveryOutcomeError::InvalidOutcome);
             }
@@ -489,21 +577,174 @@ impl ReconciledRecoveryOutcome {
                 return Err(RecoveryOutcomeError::InvalidOutcome);
             }
         }
-        if self.status == RecoveryOutcomeStatus::Reconciled
-            && self.official_candle_references.is_empty()
+        Ok(())
+    }
+
+    /// Validates every exact raw source fact against the persisted opaque witness.
+    pub(crate) fn verify_result_from_raw(
+        &self,
+        observed: &BTreeMap<RecoverySourceReference, MarketEvent>,
+    ) -> Result<(), RecoveryOutcomeError> {
+        self.validate_raw_references(observed)?;
+        if let Some(verified_result) = &self.verified_result {
+            self.validate_verified_result_raw(verified_result, observed)?;
+        }
+        Ok(())
+    }
+
+    fn validate_verified_result(
+        &self,
+        result: &HyperliquidRecoveryResult,
+        witness: &VerifiedRecoveryWitness,
+        observed: &BTreeMap<RecoverySourceReference, MarketEvent>,
+    ) -> Result<(), RecoveryOutcomeError> {
+        let verified_result = self
+            .verified_result
+            .as_ref()
+            .ok_or(RecoveryOutcomeError::InvalidOutcome)?;
+        if result.source() != HyperliquidRecoverySource::LocalTradesAndOfficialCandles
+            || !matches!(
+                result.status(),
+                HyperliquidRecoveryStatus::Reconciled { .. }
+            )
+            || result.request() != witness.request()
+            || result.completed_through() != witness.completed_through()
+            || *verified_result != VerifiedRecoveryResultWire::from_witness(witness)?
+            || self.result_digest != witness.commitment()
+        {
+            return Err(RecoveryOutcomeError::InvalidOutcome);
+        }
+        self.validate_raw_references(observed)?;
+        self.validate_verified_result_raw(verified_result, observed)
+    }
+
+    fn validate_verified_result_shape(
+        &self,
+        result: &VerifiedRecoveryResultWire,
+    ) -> Result<(), RecoveryOutcomeError> {
+        let expected_request_id = format!("{}:{}", result.market, result.generation);
+        if result.version != WITNESS_VERSION
+            || self.request_id != expected_request_id
+            || self.generation != result.generation
+            || self.market.as_str() != result.market
+            || self.completed_through.value() != result.completed_through_ns
+            || self.status != RecoveryOutcomeStatus::Reconciled
+            || self.source != RecoveryOutcomeSource::CapturedTrades
+            || self.request_cursors.trade_predecessor.is_none()
+            || result.local_trades.len() != self.backfill_references.len()
+            || result.official_candles.len() != self.official_candle_references.len()
+            || result.official_candles.is_empty()
+        {
+            return Err(RecoveryOutcomeError::InvalidOutcome);
+        }
+        validate_digest(&result.upstream_commitment)?;
+        validate_digest(&result.snapshot_event_id)?;
+        validate_digest(&result.trade_predecessor_event_id)?;
+        if !is_gap_reason(&result.reason)
+            || result.reconnect_attempt == 0
+            || !result
+                .local_trades
+                .iter()
+                .all(|trade| trade.market == result.market)
+            || !result
+                .official_candles
+                .iter()
+                .chain(&result.derived_candles)
+                .all(|candle| candle.market == result.market && is_interval(&candle.interval))
         {
             return Err(RecoveryOutcomeError::InvalidOutcome);
         }
         Ok(())
     }
 
-    /// Recomputes the result commitment after checking every exact raw proof reference.
-    pub(crate) fn verify_result_from_raw(
+    fn validate_verified_result_raw(
         &self,
-        observed: &std::collections::BTreeMap<RecoverySourceReference, MarketEvent>,
+        result: &VerifiedRecoveryResultWire,
+        observed: &BTreeMap<RecoverySourceReference, MarketEvent>,
     ) -> Result<(), RecoveryOutcomeError> {
-        self.validate_raw_references(observed)?;
-        if self.result_digest != self.expected_result_digest()? {
+        self.validate_verified_result_shape(result)?;
+        let source = |reference: &RecoverySourceReference| referenced_event(observed, reference);
+        let anchor = source(&self.recovery_anchor)?;
+        if anchor.event_id().as_str() != result.snapshot_event_id
+            || anchor.event_time().value() != result.snapshot_event_time_ns
+            || anchor.received_at().value() != result.snapshot_received_at_ns
+        {
+            return Err(RecoveryOutcomeError::InvalidOutcome);
+        }
+        match (
+            self.request_cursors.predecessor.as_ref(),
+            result.predecessor_event_time_ns,
+            result.predecessor_received_at_ns,
+        ) {
+            (None, None, None) => {}
+            (Some(reference), Some(event_time), Some(received_at))
+                if source(reference)?.event_time().value() == event_time
+                    && source(reference)?.received_at().value() == received_at => {}
+            _ => return Err(RecoveryOutcomeError::InvalidOutcome),
+        }
+        let trade_predecessor = self
+            .request_cursors
+            .trade_predecessor
+            .as_ref()
+            .ok_or(RecoveryOutcomeError::InvalidOutcome)?;
+        let trade_event = source(trade_predecessor)?;
+        if trade_event.event_id().as_str() != result.trade_predecessor_event_id
+            || trade_event.event_time().value() != result.trade_predecessor_event_time_ns
+            || trade_event.received_at().value() != result.trade_predecessor_received_at_ns
+        {
+            return Err(RecoveryOutcomeError::InvalidOutcome);
+        }
+        let observed_local_trades = self
+            .backfill_references
+            .iter()
+            .map(|reference| {
+                let trade = VerifiedTradeWire::from_event(source(reference)?)?;
+                Ok((trade.event_id.clone(), trade))
+            })
+            .collect::<Result<BTreeMap<_, _>, RecoveryOutcomeError>>()?;
+        let witness_local_trades = result
+            .local_trades
+            .iter()
+            .cloned()
+            .map(|trade| (trade.event_id.clone(), trade))
+            .collect::<BTreeMap<_, _>>();
+        if observed_local_trades.len() != self.backfill_references.len()
+            || witness_local_trades.len() != result.local_trades.len()
+            || observed_local_trades != witness_local_trades
+        {
+            return Err(RecoveryOutcomeError::InvalidOutcome);
+        }
+        let observed_official_candles = self
+            .official_candle_references
+            .iter()
+            .map(|reference| {
+                let candle = ReconciledCandleWire::from_completed_event(source(reference)?)?;
+                Ok(((candle.interval.clone(), candle.open_time_ns), candle))
+            })
+            .collect::<Result<BTreeMap<_, _>, RecoveryOutcomeError>>()?;
+        let witness_official_candles = result
+            .official_candles
+            .iter()
+            .cloned()
+            .map(|candle| ((candle.interval.clone(), candle.open_time_ns), candle))
+            .collect::<BTreeMap<_, _>>();
+        if observed_official_candles.len() != self.official_candle_references.len()
+            || witness_official_candles.len() != result.official_candles.len()
+            || observed_official_candles != witness_official_candles
+        {
+            return Err(RecoveryOutcomeError::InvalidOutcome);
+        }
+        let derived_candles = result
+            .derived_candles
+            .iter()
+            .cloned()
+            .map(|candle| ((candle.interval.clone(), candle.open_time_ns), candle))
+            .collect::<BTreeMap<_, _>>();
+        if derived_candles.len() != result.derived_candles.len()
+            || !derived_candles
+                .iter()
+                .all(|(key, candle)| witness_official_candles.get(key) == Some(candle))
+        {
             return Err(RecoveryOutcomeError::InvalidOutcome);
         }
         Ok(())
@@ -513,6 +754,7 @@ impl ReconciledRecoveryOutcome {
 /// Private immutable companion-member store rooted by a verified Parquet store.
 #[derive(Debug, Clone)]
 pub struct RecoveryOutcomeStore {
+    #[cfg(unix)]
     directory: Arc<File>,
     provenance: DataProvenance,
 }
@@ -521,13 +763,71 @@ impl RecoveryOutcomeStore {
     /// Opens the trusted companion-member directory owned by one Parquet store.
     pub fn open(store: &ParquetStore) -> Result<Self, RecoveryOutcomeError> {
         Ok(Self {
+            #[cfg(unix)]
             directory: Arc::new(store.recovery_outcomes_descriptor()?),
             provenance: store.provenance().clone(),
         })
     }
 
-    /// Atomically publishes one immutable companion outcome and returns its path-free locator.
-    pub fn publish(
+    /// Binds and atomically publishes a coordinator-minted reconciled recovery witness.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "publication keeps every external witness and raw-reference input explicit"
+    )]
+    pub fn publish_verified(
+        &self,
+        result: &HyperliquidRecoveryResult,
+        predecessor: Option<RecoverySourceReference>,
+        trade_predecessor: RecoverySourceReference,
+        recovery_anchor: RecoverySourceReference,
+        backfill_references: Vec<RecoverySourceReference>,
+        official_candle_references: Vec<RecoverySourceReference>,
+        availability_anchor: RecoverySourceReference,
+        raw_proof: &BTreeMap<RecoverySourceReference, MarketEvent>,
+    ) -> Result<RecoveryOutcomeLocator, RecoveryOutcomeError> {
+        let outcome = ReconciledRecoveryOutcome::from_verified_result(
+            result,
+            predecessor,
+            trade_predecessor,
+            recovery_anchor,
+            backfill_references,
+            official_candle_references,
+            availability_anchor,
+            raw_proof,
+        )?;
+        self.publish(&outcome)
+    }
+
+    /// Atomically publishes an explicit unavailable outcome that cannot release entries.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "unavailable publication keeps every immutable request fact explicit"
+    )]
+    pub fn publish_unavailable(
+        &self,
+        request_id: impl Into<String>,
+        generation: u64,
+        market: Market,
+        request_cursors: RecoveryRequestCursors,
+        source: RecoveryOutcomeSource,
+        completed_through: TimestampNs,
+        recovery_anchor: RecoverySourceReference,
+        availability_anchor: RecoverySourceReference,
+    ) -> Result<RecoveryOutcomeLocator, RecoveryOutcomeError> {
+        let outcome = ReconciledRecoveryOutcome::unavailable(
+            request_id,
+            generation,
+            market,
+            request_cursors,
+            source,
+            completed_through,
+            recovery_anchor,
+            availability_anchor,
+        )?;
+        self.publish(&outcome)
+    }
+
+    fn publish(
         &self,
         outcome: &ReconciledRecoveryOutcome,
     ) -> Result<RecoveryOutcomeLocator, RecoveryOutcomeError> {
@@ -602,11 +902,12 @@ struct RecoveryOutcomeWire {
     backfill_references: Vec<RecoverySourceReferenceWire>,
     official_candle_references: Vec<RecoverySourceReferenceWire>,
     availability_anchor: RecoverySourceReferenceWire,
+    verified_result: Option<VerifiedRecoveryResultWire>,
     result_digest: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct RecoveryOutcomeResultWire {
+struct UnavailableRecoveryResultWire {
     version: u8,
     request_id: String,
     generation: u64,
@@ -620,6 +921,180 @@ struct RecoveryOutcomeResultWire {
     backfill_references: Vec<RecoverySourceReferenceWire>,
     official_candle_references: Vec<RecoverySourceReferenceWire>,
     availability_anchor: RecoverySourceReferenceWire,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedRecoveryResultWire {
+    version: u8,
+    upstream_commitment: String,
+    generation: u64,
+    market: String,
+    reason: String,
+    reconnect_attempt: u32,
+    predecessor_event_time_ns: Option<i64>,
+    predecessor_received_at_ns: Option<i64>,
+    trade_predecessor_event_time_ns: i64,
+    trade_predecessor_received_at_ns: i64,
+    trade_predecessor_event_id: String,
+    snapshot_event_time_ns: i64,
+    snapshot_received_at_ns: i64,
+    snapshot_event_id: String,
+    completed_through_ns: i64,
+    local_trades: Vec<VerifiedTradeWire>,
+    official_candles: Vec<ReconciledCandleWire>,
+    derived_candles: Vec<ReconciledCandleWire>,
+}
+
+impl VerifiedRecoveryResultWire {
+    fn from_witness(witness: &VerifiedRecoveryWitness) -> Result<Self, RecoveryOutcomeError> {
+        let request = witness.request();
+        let (
+            Some(trade_predecessor_event_time),
+            Some(trade_predecessor_received_at),
+            Some(trade_predecessor_event_id),
+        ) = (
+            request.trade_predecessor_event_time(),
+            request.trade_predecessor_received_at(),
+            request.trade_predecessor_event_id(),
+        )
+        else {
+            return Err(RecoveryOutcomeError::InvalidOutcome);
+        };
+        Ok(Self {
+            version: WITNESS_VERSION,
+            upstream_commitment: witness.commitment().to_owned(),
+            generation: request.generation(),
+            market: request.market().as_str().to_owned(),
+            reason: gap_reason_name(request.reason()).to_owned(),
+            reconnect_attempt: request.reconnect_attempt(),
+            predecessor_event_time_ns: request.predecessor_event_time().map(TimestampNs::value),
+            predecessor_received_at_ns: request.predecessor_received_at().map(TimestampNs::value),
+            trade_predecessor_event_time_ns: trade_predecessor_event_time.value(),
+            trade_predecessor_received_at_ns: trade_predecessor_received_at.value(),
+            trade_predecessor_event_id: trade_predecessor_event_id.as_str().to_owned(),
+            snapshot_event_time_ns: request.snapshot_event_time().value(),
+            snapshot_received_at_ns: request.snapshot_received_at().value(),
+            snapshot_event_id: request.snapshot_event_id().as_str().to_owned(),
+            completed_through_ns: witness.completed_through().value(),
+            local_trades: witness
+                .local_trades()
+                .iter()
+                .map(VerifiedTradeWire::from_event)
+                .collect::<Result<Vec<_>, _>>()?,
+            official_candles: witness
+                .official_candles()
+                .iter()
+                .map(ReconciledCandleWire::from_official)
+                .collect::<Result<Vec<_>, _>>()?,
+            derived_candles: witness
+                .derived_candles()
+                .iter()
+                .map(ReconciledCandleWire::from_derived)
+                .collect(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedTradeWire {
+    event_id: String,
+    event_time_ns: i64,
+    received_at_ns: i64,
+    market: String,
+    trade_id: u64,
+    side: String,
+    price: String,
+    quantity: String,
+}
+
+impl VerifiedTradeWire {
+    fn from_event(event: &MarketEvent) -> Result<Self, RecoveryOutcomeError> {
+        let MarketEventKind::Trade(trade) = event.kind() else {
+            return Err(RecoveryOutcomeError::InvalidOutcome);
+        };
+        Ok(Self {
+            event_id: event.event_id().as_str().to_owned(),
+            event_time_ns: event.event_time().value(),
+            received_at_ns: event.received_at().value(),
+            market: event.market().as_str().to_owned(),
+            trade_id: trade.trade_id(),
+            side: match trade.side() {
+                trench_core::domain::Side::Buy => "buy".to_owned(),
+                trench_core::domain::Side::Sell => "sell".to_owned(),
+            },
+            price: trade.price().value().to_string(),
+            quantity: trade.quantity().value().to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReconciledCandleWire {
+    market: String,
+    interval: String,
+    open_time_ns: i64,
+    open: String,
+    high: String,
+    low: String,
+    close: String,
+    volume: String,
+    trade_count: u64,
+}
+
+impl ReconciledCandleWire {
+    fn from_official(candle: &trench_hyperliquid::Candle) -> Result<Self, RecoveryOutcomeError> {
+        let open_time_ns = candle
+            .open_time_ms()
+            .checked_mul(1_000_000)
+            .ok_or(RecoveryOutcomeError::InvalidOutcome)?;
+        Ok(Self {
+            market: candle.market().as_str().to_owned(),
+            interval: venue_interval_name(candle.interval()).to_owned(),
+            open_time_ns,
+            open: candle.open().value().to_string(),
+            high: candle.high().value().to_string(),
+            low: candle.low().value().to_string(),
+            close: candle.close().value().to_string(),
+            volume: candle.volume().value().to_string(),
+            trade_count: candle.trade_count(),
+        })
+    }
+
+    fn from_derived(candle: &trench_core::candle::Candle) -> Self {
+        let market = candle.market().as_str().to_owned();
+        let candle = candle.candle();
+        Self {
+            market,
+            interval: core_interval_name(candle.interval()).to_owned(),
+            open_time_ns: candle.open_time().value(),
+            open: candle.open().value().to_string(),
+            high: candle.high().value().to_string(),
+            low: candle.low().value().to_string(),
+            close: candle.close().value().to_string(),
+            volume: candle.volume().value().to_string(),
+            trade_count: candle.trade_count(),
+        }
+    }
+
+    fn from_completed_event(event: &MarketEvent) -> Result<Self, RecoveryOutcomeError> {
+        let MarketEventKind::CompletedCandle(candle) = event.kind() else {
+            return Err(RecoveryOutcomeError::InvalidOutcome);
+        };
+        Ok(Self {
+            market: event.market().as_str().to_owned(),
+            interval: core_interval_name(candle.interval()).to_owned(),
+            open_time_ns: candle.open_time().value(),
+            open: candle.open().value().to_string(),
+            high: candle.high().value().to_string(),
+            low: candle.low().value().to_string(),
+            close: candle.close().value().to_string(),
+            volume: candle.volume().value().to_string(),
+            trade_count: candle.trade_count(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -649,6 +1124,7 @@ fn reference_wire(reference: &RecoverySourceReference) -> RecoverySourceReferenc
     }
 }
 
+#[cfg(unix)]
 fn reference_from_wire(
     wire: RecoverySourceReferenceWire,
 ) -> Result<RecoverySourceReference, RecoveryOutcomeError> {
@@ -663,6 +1139,26 @@ fn reference_from_wire(
         )
         .map_err(|_| RecoveryOutcomeError::InvalidOutcome)?,
     )
+}
+
+fn referenced_event<'a>(
+    observed: &'a BTreeMap<RecoverySourceReference, MarketEvent>,
+    reference: &RecoverySourceReference,
+) -> Result<&'a MarketEvent, RecoveryOutcomeError> {
+    let event = observed
+        .get(reference)
+        .ok_or(RecoveryOutcomeError::InvalidOutcome)?;
+    if AvailabilityKey::new(
+        event.received_at(),
+        event.event_time(),
+        event.event_id().clone(),
+    )
+    .map_err(|_| RecoveryOutcomeError::InvalidOutcome)?
+        != reference.key().clone()
+    {
+        return Err(RecoveryOutcomeError::InvalidOutcome);
+    }
+    Ok(event)
 }
 
 fn validate_sorted_references(
@@ -696,6 +1192,7 @@ const fn source_name(source: RecoveryOutcomeSource) -> &'static str {
     }
 }
 
+#[cfg(unix)]
 fn parse_status(value: &str) -> Result<RecoveryOutcomeStatus, RecoveryOutcomeError> {
     match value {
         "reconciled" => Ok(RecoveryOutcomeStatus::Reconciled),
@@ -704,6 +1201,7 @@ fn parse_status(value: &str) -> Result<RecoveryOutcomeStatus, RecoveryOutcomeErr
     }
 }
 
+#[cfg(unix)]
 fn parse_source(value: &str) -> Result<RecoveryOutcomeSource, RecoveryOutcomeError> {
     match value {
         "captured_trades" => Ok(RecoveryOutcomeSource::CapturedTrades),
@@ -711,6 +1209,40 @@ fn parse_source(value: &str) -> Result<RecoveryOutcomeSource, RecoveryOutcomeErr
         "unavailable" => Ok(RecoveryOutcomeSource::Unavailable),
         _ => Err(RecoveryOutcomeError::InvalidOutcome),
     }
+}
+
+const fn venue_interval_name(interval: trench_hyperliquid::CandleInterval) -> &'static str {
+    match interval {
+        trench_hyperliquid::CandleInterval::FifteenMinutes => "15m",
+        trench_hyperliquid::CandleInterval::OneHour => "1h",
+    }
+}
+
+const fn core_interval_name(interval: CandleInterval) -> &'static str {
+    match interval {
+        CandleInterval::FifteenMinutes => "15m",
+        CandleInterval::OneHour => "1h",
+    }
+}
+
+const fn gap_reason_name(reason: trench_hyperliquid::GapReason) -> &'static str {
+    match reason {
+        trench_hyperliquid::GapReason::TransportClosed => "transport_closed",
+        trench_hyperliquid::GapReason::TransportError => "transport_error",
+        trench_hyperliquid::GapReason::ReadTimeout => "read_timeout",
+        trench_hyperliquid::GapReason::SnapshotRecoveryTimeout => "snapshot_recovery_timeout",
+    }
+}
+
+fn is_gap_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "transport_closed" | "transport_error" | "read_timeout" | "snapshot_recovery_timeout"
+    )
+}
+
+fn is_interval(interval: &str) -> bool {
+    matches!(interval, "15m" | "1h")
 }
 
 fn payload_digest(value: &impl Serialize) -> Result<String, RecoveryOutcomeError> {
@@ -816,6 +1348,7 @@ fn open_outcome_at(
     )
 }
 
+#[cfg(unix)]
 fn outcome_from_bytes(
     locator: &RecoveryOutcomeLocator,
     manifest_bytes: &[u8],
@@ -844,6 +1377,7 @@ fn outcome_from_bytes(
     Ok(outcome)
 }
 
+#[cfg(unix)]
 fn decode_outcome(bytes: &[u8]) -> Result<ReconciledRecoveryOutcome, RecoveryOutcomeError> {
     let wire = serde_json::from_slice::<RecoveryOutcomeWire>(bytes)?;
     if canonical_bytes(&wire)? != bytes {
@@ -852,6 +1386,7 @@ fn decode_outcome(bytes: &[u8]) -> Result<ReconciledRecoveryOutcome, RecoveryOut
     ReconciledRecoveryOutcome::from_wire(wire)
 }
 
+#[cfg(unix)]
 fn decode_manifest(bytes: &[u8]) -> Result<RecoveryOutcomeManifest, RecoveryOutcomeError> {
     let manifest = serde_json::from_slice::<RecoveryOutcomeManifest>(bytes)?;
     if canonical_bytes(&manifest)? != bytes
@@ -972,11 +1507,7 @@ fn directory_names(directory: &File) -> Result<Vec<std::ffi::OsString>, Recovery
     Ok(entries)
 }
 
-#[cfg(not(unix))]
-fn directory_names(_directory: &File) -> Result<Vec<std::ffi::OsString>, RecoveryOutcomeError> {
-    Err(RecoveryOutcomeError::UnsupportedPlatform)
-}
-
+#[cfg(unix)]
 fn require_exact_outcome_entries(directory: &File) -> Result<(), RecoveryOutcomeError> {
     let expected = [
         std::ffi::OsString::from(MANIFEST_FILE),

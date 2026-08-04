@@ -315,6 +315,54 @@ impl Candle {
     }
 }
 
+/// Builds a normalized candle fixture for tests outside this crate.
+///
+/// This hook is absent from release builds; production candles are normalized
+/// only from the bounded public information response.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub struct CandleForTest {
+    /// Fixture market.
+    pub market: Market,
+    /// Fixture interval.
+    pub interval: CandleInterval,
+    /// Fixture open epoch milliseconds.
+    pub open_time_ms: i64,
+    /// Fixture opening price.
+    pub open: Price,
+    /// Fixture high price.
+    pub high: Price,
+    /// Fixture low price.
+    pub low: Price,
+    /// Fixture closing price.
+    pub close: Price,
+    /// Fixture volume.
+    pub volume: Quantity,
+    /// Fixture trade count.
+    pub trade_count: u64,
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn candle_for_test(input: CandleForTest) -> Option<Candle> {
+    let close_time_ms = input
+        .open_time_ms
+        .checked_add(input.interval.duration_ms())?
+        .checked_sub(1)?;
+    Some(Candle {
+        open_time_ms: input.open_time_ms,
+        close_time_ms,
+        market: input.market,
+        interval: input.interval,
+        open: input.open,
+        close: input.close,
+        high: input.high,
+        low: input.low,
+        volume: input.volume,
+        trade_count: input.trade_count,
+    })
+}
+
 /// One normalized historical funding record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
