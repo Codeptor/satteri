@@ -382,15 +382,24 @@ fn gap_market(gap: &GapEvent) -> &trench_core::domain::Market {
 /// Routes one normalized source fact through a typed execution fence.
 ///
 /// Facts that do not carry executable semantics retain an explicit source-clock
-/// transition. Marks, funding, and books require a verified recovery boundary;
-/// an unavailable boundary leaves the fact in atomic Parquet only and never
-/// fabricates an engine or broker transition.
+/// transition. Funding and books require a verified recovery boundary. A fresh
+/// mark may still escalate an already-open position to a mandatory exit, but
+/// cannot fill it until a post-recovery book arrives.
 async fn admit_market_event(
     writer: &mut EngineWriter,
     authority: &mut AuthorityState,
     event: MarketEvent,
 ) -> Result<(), AppError> {
-    match authority.router.route_market_event(event)? {
+    let open_position_market = authority.engine_state.as_ref().and_then(|state| {
+        state
+            .broker()
+            .position()
+            .map(|position| position.market().clone())
+    });
+    match authority
+        .router
+        .route_market_event(event, open_position_market.as_ref())?
+    {
         MarketRoute::Engine(events) => {
             for event in events {
                 admit_typed_engine_event(writer, authority, event).await?;

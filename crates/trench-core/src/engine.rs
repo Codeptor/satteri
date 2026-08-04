@@ -1414,17 +1414,32 @@ impl Engine {
             });
             return Ok(EngineOutcome { state, batch });
         }
-        let readiness = market_readiness(&state, &market)?;
-        let mark = ExecutableMark::new(
-            market,
-            event_id,
-            price,
-            event_time,
-            received_at,
-            at,
-            state.broker.maximum_book_age(),
-            &readiness,
-        )?;
+        let mark = if state.broker.position().is_some() {
+            // A recovered book remains mandatory for every fill. A timely
+            // mark may nevertheless escalate a pre-existing position to a
+            // stop/liquidation exit while recovery is in progress.
+            ExecutableMark::exit_trigger(
+                market,
+                event_id,
+                price,
+                event_time,
+                received_at,
+                at,
+                state.broker.maximum_book_age(),
+            )?
+        } else {
+            let readiness = market_readiness(&state, &market)?;
+            ExecutableMark::new(
+                market,
+                event_id,
+                price,
+                event_time,
+                received_at,
+                at,
+                state.broker.maximum_book_age(),
+                &readiness,
+            )?
+        };
         if let Some(transition) = state.broker.observe_mark(&mark)? {
             batch.push(EngineRecord::BrokerApplied {
                 transition: transition.clone(),
@@ -1780,7 +1795,7 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use crate::book::OrderBook;
-    use crate::broker::{BrokerConfig, BrokerRunContext, PaperBroker};
+    use crate::broker::{BrokerConfig, BrokerRunContext, BrokerState, PaperBroker};
     use crate::domain::{
         Bps, EventId, LedgerId, Leverage, Market, Price, Quantity, RunId, Side, Sleeve, Usdc,
     };
@@ -2572,6 +2587,37 @@ mod tests {
             record["record"]["type"] == "ledger_applied"
                 && record["record"]["ledger_transition"]["kind"] == "position_liquidated"
         }));
+    }
+
+    #[test]
+    fn recovery_fenced_mark_escalates_an_actual_position_without_permitting_a_fill() {
+        let at = timestamp(900_000_000_000);
+        let mark_at = timestamp(i128::from(at.value()) + 2);
+        let market = Market::new("BTC").expect("market");
+        let mut fenced = opened_btc_state(at);
+        fenced.recovered_markets.clear();
+
+        let outcome = Engine::apply(
+            EngineEvent::MarketMark {
+                event_id: EventId::new("event-recovery-fenced-stop-mark").expect("event ID"),
+                at: mark_at,
+                market,
+                price: Price::new(dec!(98)).expect("mark"),
+                event_time: mark_at,
+                received_at: mark_at,
+            },
+            fenced,
+            &EngineContext::passive(EventAdmission::New),
+        )
+        .expect("stop mark must protect pre-existing paper exposure");
+
+        assert_eq!(outcome.state().broker().state(), BrokerState::MandatoryExit);
+        assert!(outcome.state().ledger().position().is_some());
+        assert!(outcome.batch().records().iter().any(|record| matches!(
+            record.record(),
+            EngineRecord::BrokerApplied { transition }
+                if transition.state() == BrokerState::MandatoryExit
+        )));
     }
 
     #[test]

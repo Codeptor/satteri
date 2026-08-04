@@ -243,7 +243,12 @@ fn funding_outcome(
     .expect("fixture funding must apply")
 }
 
-fn opened_btc_state(at: TimestampNs) -> EngineState {
+/// Builds an actual BTC paper position for adapter integration tests.
+///
+/// The position is opened only through the real sealed-entry and executable-
+/// book engine paths; production code cannot construct it directly.
+#[must_use]
+pub fn opened_btc_state(at: TimestampNs) -> EngineState {
     let strategy = AcceptAll;
     let context = context(at);
     let queued = apply_entry(

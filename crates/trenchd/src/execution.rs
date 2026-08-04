@@ -344,11 +344,14 @@ impl TypedMarketRouter {
     pub(crate) fn route_market_event(
         &mut self,
         source: MarketEvent,
+        open_position_market: Option<&Market>,
     ) -> Result<MarketRoute, RoutingError> {
         match source.kind() {
             MarketEventKind::BookSnapshot(_) => self.route_book(source),
             MarketEventKind::AssetContext(context) => {
-                if let Some(reason) = self.execution_blocker(source.market()) {
+                if let Some(reason) = self.execution_blocker(source.market())
+                    && open_position_market != Some(source.market())
+                {
                     return Ok(MarketRoute::Blocked {
                         market: source.market().clone(),
                         reason,
@@ -556,7 +559,7 @@ mod tests {
     };
     use trench_core::ledger::LedgerState;
 
-    use super::{RecoveryCompletion, TypedMarketRouter};
+    use super::{MarketRoute, RecoveryCompletion, TypedEngineEvent, TypedMarketRouter};
 
     fn timestamp(value: i64) -> TimestampNs {
         TimestampNs::new(i128::from(value)).expect("fixture timestamp")
@@ -575,10 +578,14 @@ mod tests {
     }
 
     fn snapshot(at: i64, sequence: u64) -> MarketEvent {
+        snapshot_for(market(), at, sequence)
+    }
+
+    fn snapshot_for(market: Market, at: i64, sequence: u64) -> MarketEvent {
         MarketEvent::book_snapshot(
             timestamp(at),
             timestamp(at),
-            market(),
+            market,
             BookSnapshot::new(
                 sequence,
                 vec![BookLevel::new(price(99), quantity(10))],
@@ -616,7 +623,7 @@ mod tests {
         router.open_gap_for_test(market());
         assert!(
             router
-                .route_market_event(book.clone())
+                .route_market_event(book.clone(), None)
                 .expect("typed source route")
                 .events()
                 .is_none()
@@ -648,7 +655,7 @@ mod tests {
         router.open_gap_for_test(market());
         let book = snapshot(20, 1);
         let _ = router
-            .route_market_event(book.clone())
+            .route_market_event(book.clone(), None)
             .expect("deferred book");
         let _ = router
             .complete_recovery(RecoveryCompletion::fixture(
@@ -682,7 +689,7 @@ mod tests {
 
         assert!(matches!(
             router
-                .route_market_event(context)
+                .route_market_event(context, None)
                 .expect("context route")
                 .events()
                 .expect("typed engine route"),
@@ -690,12 +697,146 @@ mod tests {
         ));
         assert!(matches!(
             router
-                .route_market_event(funding)
+                .route_market_event(funding, None)
                 .expect("funding route")
                 .events()
                 .expect("typed engine route"),
             [super::TypedEngineEvent::FundingObserved { .. }]
         ));
+    }
+
+    #[test]
+    fn recovery_fenced_mark_requires_a_matching_open_position() {
+        let mut router =
+            TypedMarketRouter::new(DurationNs::new(1_000_000_000).expect("fixture maximum age"));
+        let protected_market = market();
+        let different_market = Market::new("BTC").expect("different fixture market");
+        router.open_gap_for_test(protected_market.clone());
+        let source = MarketEvent::asset_context(
+            timestamp(20),
+            timestamp(20),
+            protected_market.clone(),
+            AssetContext::new(
+                price(98),
+                price(98),
+                Some(price(98)),
+                quantity(1),
+                Usdc::new(Decimal::ONE).expect("fixture notional"),
+                FundingRate::new(Decimal::ZERO),
+            ),
+        )
+        .expect("fixture mark");
+
+        assert!(matches!(
+            router
+                .route_market_event(source.clone(), Some(&different_market))
+                .expect("unexposed mark route"),
+            MarketRoute::Blocked {
+                reason: super::ExecutionBlocker::RecoveryUnverified,
+                ..
+            }
+        ));
+        assert!(matches!(
+            router
+                .route_market_event(source, Some(&protected_market))
+                .expect("protective mark route")
+                .events(),
+            Some([TypedEngineEvent::MarketMark { .. }])
+        ));
+    }
+
+    #[test]
+    fn gap_stop_mark_waits_for_verified_recovery_before_its_fresh_book_fills() {
+        let opened_at = timestamp(900_000_000_000);
+        let market = Market::new("BTC").expect("fixture market");
+        let mut state = trench_core::engine::test_support::opened_btc_state(opened_at);
+        let mut router =
+            TypedMarketRouter::new(DurationNs::new(1_000_000_000).expect("fixture maximum age"));
+
+        router.open_gap_for_test(market.clone());
+        let stop_at = timestamp(900_000_000_010);
+        let stop_mark = MarketEvent::asset_context(
+            stop_at,
+            stop_at,
+            market.clone(),
+            AssetContext::new(
+                price(98),
+                price(98),
+                Some(price(98)),
+                quantity(1),
+                Usdc::new(Decimal::ONE).expect("fixture notional"),
+                FundingRate::new(Decimal::ZERO),
+            ),
+        )
+        .expect("fixture stop mark");
+        let stop_route = router
+            .route_market_event(stop_mark, Some(&market))
+            .expect("open position routes its protective mark");
+        let MarketRoute::Engine(events) = stop_route else {
+            panic!("recovery-fenced position mark must remain protective");
+        };
+        assert!(matches!(
+            events.as_slice(),
+            [TypedEngineEvent::MarketMark { .. }]
+        ));
+        for event in events {
+            state = Engine::apply(
+                event.into_engine_event(),
+                state,
+                &EngineContext::passive(trench_core::engine::EventAdmission::New),
+            )
+            .expect("protective mark must apply")
+            .into_parts()
+            .0;
+        }
+        assert_eq!(
+            state.broker().state(),
+            trench_core::broker::BrokerState::MandatoryExit
+        );
+        assert!(state.ledger().position().is_some());
+
+        let book = snapshot_for(market.clone(), 900_000_000_012, 2);
+        assert!(
+            router
+                .route_market_event(book.clone(), Some(&market))
+                .expect("fresh book must be deferred")
+                .events()
+                .is_none()
+        );
+        assert_eq!(
+            state.broker().state(),
+            trench_core::broker::BrokerState::MandatoryExit
+        );
+
+        let recovery_events = router
+            .complete_recovery(RecoveryCompletion::fixture(
+                market,
+                timestamp(900_000_000_011),
+                book.event_id().clone(),
+            ))
+            .expect("verified recovery completion");
+        assert!(matches!(
+            recovery_events.as_slice(),
+            [
+                TypedEngineEvent::MarketRecovered { .. },
+                TypedEngineEvent::ExecutableBook { .. }
+            ]
+        ));
+        for event in recovery_events {
+            state = Engine::apply(
+                event.into_engine_event(),
+                state,
+                &EngineContext::passive(trench_core::engine::EventAdmission::New),
+            )
+            .expect("recovery route must apply")
+            .into_parts()
+            .0;
+        }
+        assert_eq!(
+            state.broker().state(),
+            trench_core::broker::BrokerState::Flat
+        );
+        assert!(state.ledger().position().is_none());
     }
 
     #[test]

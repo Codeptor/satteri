@@ -285,6 +285,60 @@ impl ExecutableMark {
         if event_time <= readiness.recovered_at || received_at <= readiness.recovered_at {
             return Err(BrokerError::BookPredatesRecovery);
         }
+        Self::fresh(
+            market,
+            event_id,
+            price,
+            event_time,
+            received_at,
+            as_of_time,
+            maximum_age,
+        )
+    }
+
+    /// Seals a timely mark that may only escalate an already-open position's
+    /// exit priority while its market is recovery-fenced.
+    ///
+    /// This deliberately omits a recovery proof. The engine may use it only
+    /// when actual paper exposure already exists; it cannot admit entries,
+    /// fills, funding, or an explicit discretionary exit.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the immutable mark source is complete"
+    )]
+    pub(crate) fn exit_trigger(
+        market: Market,
+        event_id: EventId,
+        price: Price,
+        event_time: TimestampNs,
+        received_at: TimestampNs,
+        as_of_time: TimestampNs,
+        maximum_age: DurationNs,
+    ) -> Result<Self, BrokerError> {
+        Self::fresh(
+            market,
+            event_id,
+            price,
+            event_time,
+            received_at,
+            as_of_time,
+            maximum_age,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the immutable mark source is complete"
+    )]
+    fn fresh(
+        market: Market,
+        event_id: EventId,
+        price: Price,
+        event_time: TimestampNs,
+        received_at: TimestampNs,
+        as_of_time: TimestampNs,
+        maximum_age: DurationNs,
+    ) -> Result<Self, BrokerError> {
         if event_time > received_at || received_at > as_of_time {
             return Err(BrokerError::BookFromFuture);
         }
