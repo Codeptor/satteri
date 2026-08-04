@@ -417,7 +417,12 @@ impl TypedMarketRouter {
         let book =
             OrderBook::apply_snapshot(self.books.get(&market), &source, self.maximum_book_age)?;
         if let Some(reason) = self.execution_blocker(&market) {
-            self.deferred_books.insert(market.clone(), (source, book));
+            // A recovery request is anchored to the first fresh L2 snapshot
+            // emitted after its gap. Later books cannot replace that evidence:
+            // a mandatory exit must use the first verified executable price.
+            self.deferred_books
+                .entry(market.clone())
+                .or_insert((source, book));
             return Ok(MarketRoute::Blocked { market, reason });
         }
         self.books.insert(market, book.clone());
@@ -434,7 +439,7 @@ impl TypedMarketRouter {
         if self.gap_generations.get(&market) != Some(&completion.generation) {
             return Err(RoutingError::RecoveryGenerationMismatch { market });
         }
-        let Some((source, book)) = self.deferred_books.remove(&market) else {
+        let Some((source, _)) = self.deferred_books.get(&market) else {
             return Err(RoutingError::MissingRecoverySnapshot { market });
         };
         if source.event_id() != &completion.snapshot_event_id {
@@ -444,6 +449,12 @@ impl TypedMarketRouter {
                 actual: source.event_id().clone(),
             });
         }
+        let (source, book) =
+            self.deferred_books
+                .remove(&market)
+                .ok_or(RoutingError::MissingRecoverySnapshot {
+                    market: market.clone(),
+                })?;
         let event_id = recovery_event_id(&completion);
         let RecoveryCompletion {
             market,
@@ -646,6 +657,66 @@ mod tests {
             events[1],
             super::TypedEngineEvent::ExecutableBook { .. }
         ));
+    }
+
+    #[test]
+    fn recovery_uses_its_first_fresh_snapshot_after_later_books_arrive() {
+        let mut router =
+            TypedMarketRouter::new(DurationNs::new(1_000_000_000).expect("fixture maximum age"));
+        let anchor = snapshot(20, 1);
+        let later = snapshot(21, 2);
+
+        router.open_gap_for_test(market());
+        let _ = router
+            .route_market_event(anchor.clone(), None)
+            .expect("anchor snapshot must fence");
+        let _ = router
+            .route_market_event(later, None)
+            .expect("later snapshot must stay fenced");
+
+        let events = router
+            .complete_recovery(RecoveryCompletion::fixture(
+                market(),
+                timestamp(10),
+                anchor.event_id().clone(),
+            ))
+            .expect("anchored recovery completion")
+            .into_iter()
+            .collect::<Vec<_>>();
+        let TypedEngineEvent::ExecutableBook { source, .. } = &events[1] else {
+            panic!("recovery must release its executable anchor book");
+        };
+        assert_eq!(source.event_id(), anchor.event_id());
+    }
+
+    #[test]
+    fn snapshot_mismatch_keeps_the_anchor_available_for_a_retry() {
+        let mut router =
+            TypedMarketRouter::new(DurationNs::new(1_000_000_000).expect("fixture maximum age"));
+        let anchor = snapshot(20, 1);
+        let wrong = snapshot(21, 2);
+
+        router.open_gap_for_test(market());
+        let _ = router
+            .route_market_event(anchor.clone(), None)
+            .expect("anchor snapshot must fence");
+        assert!(matches!(
+            router.complete_recovery(RecoveryCompletion::fixture(
+                market(),
+                timestamp(10),
+                wrong.event_id().clone(),
+            )),
+            Err(super::RoutingError::RecoverySnapshotMismatch { .. })
+        ));
+        assert!(
+            router
+                .complete_recovery(RecoveryCompletion::fixture(
+                    market(),
+                    timestamp(10),
+                    anchor.event_id().clone(),
+                ))
+                .is_ok()
+        );
     }
 
     #[test]
