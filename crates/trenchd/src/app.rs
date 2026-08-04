@@ -5,14 +5,15 @@ use std::future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use trench_core::broker::{BrokerConfig, BrokerRunContext, PaperBroker};
 use trench_core::candle::CandleAggregator;
 use trench_core::config::PaperConfig;
-use trench_core::domain::{LedgerId, Market, RunId, Usdc};
-use trench_core::engine::{Engine, EngineContext, EngineState};
+use trench_core::domain::{EventId, LedgerId, Market, RunId, Usdc};
+use trench_core::engine::{Engine, EngineContext, EngineError, EnginePersistenceKind, EngineState};
 use trench_core::event::{DurationNs, MarketEvent, MarketEventKind, TimestampNs};
 use trench_core::ledger::LedgerState;
 use trench_hyperliquid::{
@@ -22,6 +23,7 @@ use trench_hyperliquid::{
 };
 use trench_storage::parquet::{DataProvenance, ParquetError, ParquetStore};
 use trench_storage::replay::{DeterministicReplay, ReplayError, ReplayPlan};
+use trench_storage::sqlite::{EngineJournalHistory, JournalEvent};
 
 use crate::admin::{
     AdminError, AdminServer, AuthorityRequest, DaemonMode, DaemonStatus, authority_channel,
@@ -74,15 +76,56 @@ struct RecoveredSource {
     events: Vec<MarketEvent>,
 }
 
+/// Fully reconstructed authority state plus only the source facts that were
+/// durably retained in Parquet but never atomically admitted to SQLite before
+/// the prior daemon stopped.
+#[derive(Debug)]
+struct RestoredAuthority {
+    authority: AuthorityState,
+    fresh_events: Vec<MarketEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryRequestJournal {
+    schema_version: u8,
+    event_id: String,
+    market: String,
+    event_time_ns: i64,
+    kind: String,
+    generation: u64,
+    snapshot_event_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryCompletionJournal {
+    schema_version: u8,
+    event_id: String,
+    market: String,
+    event_time_ns: i64,
+    kind: String,
+    snapshot_event_id: String,
+}
+
 struct AuthorityState {
     engine_state: Option<EngineState>,
     router: TypedMarketRouter,
+    historical_sources: BTreeMap<EventId, MarketEvent>,
     readiness: Readiness,
     live: LiveSubscription,
     reconciled: bool,
     recovery_markets: BTreeSet<Market>,
     recovery_pending: VecDeque<RecoveryInput>,
     recovery_worker_available: bool,
+}
+
+impl std::fmt::Debug for AuthorityState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorityState")
+            .finish_non_exhaustive()
+    }
 }
 
 /// One authority-approved handoff to the read-only evidence producer.
@@ -117,6 +160,16 @@ enum CaptureOutput {
     Captured(ContextCaptureBatch),
     /// No source facts are available because the batch failed atomically.
     Rejected(ContextCaptureError),
+}
+
+/// Whether a complete capture can cross the durable authority boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureSourcePreflight {
+    /// Every capture fact is new and the full batch can be persisted atomically.
+    AllNew,
+    /// Every capture fact is already verified immutable history, so this retry
+    /// must leave all daemon state unchanged.
+    HistoricalNoOp,
 }
 
 /// Explicit UTC receipt-time source used only by the read-only I/O adapter.
@@ -280,25 +333,15 @@ pub async fn run(
     let provenance = provenance(config_bytes)?;
     let started_at_ns = current_time_ns()?;
     let run_id = run_id(started_at_ns, provenance.config_digest());
-    let mut writer = EngineWriter::open(&sqlite_path, run_id, started_at_ns).await?;
-
     let recovery = recover_source_stream(&parquet_path, provenance.clone())?;
-    let initial_at_ns = recovery
-        .as_ref()
-        .and_then(|recovery| recovery.events.first())
-        .map_or(started_at_ns, |event| {
-            event.event_time().value().min(started_at_ns)
-        });
-    let mut authority = AuthorityState {
-        engine_state: Some(initial_engine_state(writer.run_id(), initial_at_ns)?),
-        router: TypedMarketRouter::new(maximum_book_age()?),
-        readiness: Readiness::default(),
-        live: LiveSubscription::new(),
-        reconciled: false,
-        recovery_markets: BTreeSet::new(),
-        recovery_pending: VecDeque::new(),
-        recovery_worker_available: true,
-    };
+    let history = EngineWriter::inspect_history(&sqlite_path).await?;
+    let RestoredAuthority {
+        mut authority,
+        fresh_events,
+    } = reconstruct_authority(recovery.as_ref(), &history, &run_id, started_at_ns)?;
+    let mut writer =
+        EngineWriter::open_after_reconstruction(&sqlite_path, run_id, started_at_ns, &history)
+            .await?;
     authority.readiness.set_storage_writable(true);
     authority
         .readiness
@@ -328,9 +371,7 @@ pub async fn run(
     ));
     let (source_sender, mut source_receiver) = mpsc::channel(SOURCE_CHANNEL_CAPACITY);
     let replay_task = tokio::spawn(replay_producer(
-        recovery
-            .as_ref()
-            .map_or_else(Vec::new, |recovery| recovery.events.clone()),
+        fresh_events,
         source_sender,
         cancellation.clone(),
     ));
@@ -440,14 +481,15 @@ pub async fn run(
             output = receive_live(&mut authority.live.stream) => {
                 match output {
                     Some(WsOutput::MarketEvent(event)) => {
-                        parquet_store.write_events(std::slice::from_ref(&event))?;
-                        admit_market_event(
+                        let admitted = persist_live_market_event(
+                            &parquet_store,
                             &mut writer,
                             &mut authority,
                             event.clone(),
                             Some(&recovery_sender),
-                        ).await?;
-                        if matches!(event.kind(), MarketEventKind::BookSnapshot(_))
+                        )
+                        .await?;
+                        if admitted && matches!(event.kind(), MarketEventKind::BookSnapshot(_))
                             && authority.live.observe_l2(event.market())
                         {
                             authority.readiness.set_stream_connected(true);
@@ -618,6 +660,321 @@ fn recover_source_stream(
     }))
 }
 
+/// Reconstructs authority-local executable state before a new SQLite run is
+/// created. The journal supplies comparison witnesses only: every resulting
+/// transition is recalculated through the same typed router and pure engine
+/// from immutable normalized Parquet source facts.
+fn reconstruct_authority(
+    recovery: Option<&RecoveredSource>,
+    history: &EngineJournalHistory,
+    new_run_id: &str,
+    started_at_ns: i64,
+) -> Result<RestoredAuthority, AppError> {
+    let source_events = recovery.map_or(&[][..], |recovered| recovered.events.as_slice());
+    if history.is_empty() {
+        let initial_at_ns = source_events.first().map_or(started_at_ns, |event| {
+            event.event_time().value().min(started_at_ns)
+        });
+        return Ok(RestoredAuthority {
+            authority: new_authority(new_run_id, initial_at_ns)?,
+            fresh_events: source_events.to_vec(),
+        });
+    }
+    let Some(first_journal_event) = history.events().first() else {
+        return Err(AppError::HistoryParity {
+            reason: "nonempty journal had no first transition",
+        });
+    };
+    let Some(first_source_event) = source_events.first() else {
+        return Err(AppError::MissingHistoricalSourceEvidence);
+    };
+    let source_replay_initial_at_ns = first_source_event
+        .event_time()
+        .value()
+        .min(first_journal_event.run_started_at_ns());
+    let source_by_id = source_events
+        .iter()
+        .map(|event| (event.event_id().as_str(), event))
+        .collect::<BTreeMap<_, _>>();
+    let initial_candidates = [
+        first_journal_event.run_started_at_ns(),
+        source_replay_initial_at_ns,
+    ];
+    let mut last_candidate_error = None;
+    let mut previous_candidate = None;
+    for initial_at_ns in initial_candidates {
+        if previous_candidate == Some(initial_at_ns) {
+            continue;
+        }
+        previous_candidate = Some(initial_at_ns);
+        let mut authority = new_authority(first_journal_event.run_id(), initial_at_ns)?;
+        match reconstruct_historical_journal(&mut authority, history, &source_by_id) {
+            Ok(historical_sources) => {
+                if authority.router.has_pending_recovery() {
+                    return Err(AppError::IncompleteRecoveryEvidence);
+                }
+                let causal_cursor = authority
+                    .engine_state
+                    .as_ref()
+                    .ok_or(AppError::MissingEngineState)?
+                    .broker()
+                    .causal_boundary();
+                let fresh_events = source_events
+                    .iter()
+                    .filter(|event| !historical_sources.contains_key(event.event_id()))
+                    .map(|event| {
+                        if event.received_at() <= causal_cursor {
+                            Err(AppError::UncoveredSourceBeforeCursor)
+                        } else {
+                            Ok(event.clone())
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                authority.historical_sources = historical_sources;
+                return Ok(RestoredAuthority {
+                    authority,
+                    fresh_events,
+                });
+            }
+            Err(error @ AppError::HistoryParity { .. }) | Err(error @ AppError::Engine(_)) => {
+                last_candidate_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_candidate_error.unwrap_or(AppError::HistoryParity {
+        reason: "no valid initial engine boundary could reproduce durable history",
+    }))
+}
+
+fn reconstruct_historical_journal(
+    authority: &mut AuthorityState,
+    history: &EngineJournalHistory,
+    source_by_id: &BTreeMap<&str, &MarketEvent>,
+) -> Result<BTreeMap<EventId, MarketEvent>, AppError> {
+    let mut historical_sources = BTreeMap::new();
+    for journal_event in history.events() {
+        if let Some(source) = source_by_id.get(journal_event.event_id()) {
+            if historical_sources
+                .insert(source.event_id().clone(), (*source).clone())
+                .is_some()
+            {
+                return Err(AppError::HistoryParity {
+                    reason: "source fact appeared more than once in SQLite history",
+                });
+            }
+            reconstruct_market_event(authority, (*source).clone(), journal_event)?;
+        } else {
+            reconstruct_recovery_event(authority, journal_event)?;
+        }
+    }
+    Ok(historical_sources)
+}
+
+fn new_authority(run_id: &str, initial_at_ns: i64) -> Result<AuthorityState, AppError> {
+    Ok(AuthorityState {
+        engine_state: Some(initial_engine_state(run_id, initial_at_ns)?),
+        router: TypedMarketRouter::new(maximum_book_age()?),
+        historical_sources: BTreeMap::new(),
+        readiness: Readiness::default(),
+        live: LiveSubscription::new(),
+        reconciled: false,
+        recovery_markets: BTreeSet::new(),
+        recovery_pending: VecDeque::new(),
+        recovery_worker_available: true,
+    })
+}
+
+fn reconstruct_market_event(
+    authority: &mut AuthorityState,
+    source: MarketEvent,
+    journal_event: &JournalEvent,
+) -> Result<(), AppError> {
+    let retained_source = source.clone();
+    if source_is_late(authority, &retained_source)? {
+        return reconstruct_typed_event(
+            authority,
+            TypedEngineEvent::SourceRetained {
+                source: retained_source,
+            },
+            journal_event,
+        );
+    }
+    let open_position_market = authority.engine_state.as_ref().and_then(|state| {
+        state
+            .broker()
+            .position()
+            .map(|position| position.market().clone())
+    });
+    match authority
+        .router
+        .route_market_event(source, open_position_market.as_ref())?
+    {
+        MarketRoute::Engine(events) => events
+            .into_iter()
+            .try_for_each(|event| reconstruct_typed_event(authority, event, journal_event)),
+        MarketRoute::Blocked { .. } => reconstruct_typed_event(
+            authority,
+            TypedEngineEvent::AdvanceTime {
+                source: retained_source,
+            },
+            journal_event,
+        ),
+    }
+}
+
+fn reconstruct_recovery_event(
+    authority: &mut AuthorityState,
+    journal_event: &JournalEvent,
+) -> Result<(), AppError> {
+    match journal_event.kind() {
+        "recovery_request" => {
+            let evidence =
+                serde_json::from_str::<RecoveryRequestJournal>(journal_event.payload_json())
+                    .map_err(|_| AppError::InvalidRecoveryEvidence)?;
+            if evidence.schema_version != 1
+                || evidence.kind != "recovery_request"
+                || evidence.event_id != journal_event.event_id()
+                || evidence.event_time_ns != journal_event.event_time_ns()
+            {
+                return Err(AppError::InvalidRecoveryEvidence);
+            }
+            let market =
+                Market::new(evidence.market).map_err(|_| AppError::InvalidRecoveryEvidence)?;
+            let event_id =
+                EventId::new(evidence.event_id).map_err(|_| AppError::InvalidRecoveryEvidence)?;
+            let snapshot_event_id = EventId::new(evidence.snapshot_event_id)
+                .map_err(|_| AppError::InvalidRecoveryEvidence)?;
+            let at = TimestampNs::new(i128::from(evidence.event_time_ns))
+                .map_err(|_| AppError::InvalidRecoveryEvidence)?;
+            authority.router.restore_recovery_request(
+                market.clone(),
+                evidence.generation,
+                snapshot_event_id.clone(),
+            )?;
+            reconstruct_typed_event(
+                authority,
+                TypedEngineEvent::RecoveryRequested {
+                    event_id,
+                    at,
+                    market,
+                    generation: evidence.generation,
+                    snapshot_event_id,
+                },
+                journal_event,
+            )
+        }
+        "market_recovered" => {
+            let evidence =
+                serde_json::from_str::<RecoveryCompletionJournal>(journal_event.payload_json())
+                    .map_err(|_| AppError::InvalidRecoveryEvidence)?;
+            if evidence.schema_version != 1
+                || evidence.kind != "market_recovered"
+                || evidence.event_id != journal_event.event_id()
+                || evidence.event_time_ns != journal_event.event_time_ns()
+            {
+                return Err(AppError::InvalidRecoveryEvidence);
+            }
+            let market =
+                Market::new(evidence.market).map_err(|_| AppError::InvalidRecoveryEvidence)?;
+            let event_id =
+                EventId::new(evidence.event_id).map_err(|_| AppError::InvalidRecoveryEvidence)?;
+            let snapshot_event_id = EventId::new(evidence.snapshot_event_id)
+                .map_err(|_| AppError::InvalidRecoveryEvidence)?;
+            let at = TimestampNs::new(i128::from(evidence.event_time_ns))
+                .map_err(|_| AppError::InvalidRecoveryEvidence)?;
+            authority.router.restore_recovery_completion(
+                &event_id,
+                at,
+                market.clone(),
+                snapshot_event_id.clone(),
+            )?;
+            reconstruct_typed_event(
+                authority,
+                TypedEngineEvent::MarketRecovered {
+                    event_id,
+                    at,
+                    market,
+                    snapshot_event_id,
+                },
+                journal_event,
+            )
+        }
+        _ => Err(AppError::MissingHistoricalSourceEvidence),
+    }
+}
+
+fn reconstruct_typed_event(
+    authority: &mut AuthorityState,
+    event: TypedEngineEvent,
+    journal_event: &JournalEvent,
+) -> Result<(), AppError> {
+    let payload_json = event.source_payload_json()?;
+    if journal_event.event_id() != event.event_id().as_str()
+        || journal_event.event_time_ns() != event.at().value()
+        || journal_event.kind() != event.source_kind()
+        || journal_event.payload_json() != payload_json
+    {
+        return Err(AppError::HistoryParity {
+            reason: "typed source evidence differs from immutable SQLite journal",
+        });
+    }
+    let prior = authority
+        .engine_state
+        .take()
+        .ok_or(AppError::MissingEngineState)?;
+    let readiness_event = event.clone();
+    let outcome = Engine::apply(
+        event.into_engine_event(),
+        prior,
+        &EngineContext::passive(trench_core::engine::EventAdmission::New),
+    )?;
+    verify_historical_outcome(&outcome, journal_event)?;
+    authority.engine_state = Some(outcome.into_parts().0);
+    update_readiness_from_typed_event(&mut authority.readiness, &readiness_event);
+    Ok(())
+}
+
+fn verify_historical_outcome(
+    outcome: &trench_core::engine::EngineOutcome,
+    journal_event: &JournalEvent,
+) -> Result<(), AppError> {
+    let projection = outcome.persistence_batch();
+    let checkpoint = projection.checkpoint();
+    if projection.event_id() != journal_event.event_id()
+        || projection.at().value() != journal_event.checkpoint_at_ns()
+        || checkpoint.checkpoint_id() != journal_event.checkpoint_id()
+        || checkpoint.state_digest() != journal_event.state_digest()
+        || projection.records().len() != journal_event.records().len()
+        || projection
+            .records()
+            .iter()
+            .zip(journal_event.records())
+            .any(|(actual, expected)| {
+                persistence_kind_name(actual.kind()) != expected.kind()
+                    || actual.payload_json() != expected.payload_json()
+            })
+    {
+        return Err(AppError::HistoryParity {
+            reason: "recomputed core transition differs from immutable SQLite evidence",
+        });
+    }
+    Ok(())
+}
+
+const fn persistence_kind_name(kind: EnginePersistenceKind) -> &'static str {
+    match kind {
+        EnginePersistenceKind::Snapshot => "snapshot",
+        EnginePersistenceKind::Signal => "signal",
+        EnginePersistenceKind::Intent => "intent",
+        EnginePersistenceKind::Risk => "risk",
+        EnginePersistenceKind::Order => "order",
+        EnginePersistenceKind::Fill => "fill",
+        EnginePersistenceKind::Ledger => "ledger",
+        EnginePersistenceKind::Breaker => "breaker",
+    }
+}
+
 async fn replay_producer(
     events: Vec<MarketEvent>,
     sender: mpsc::Sender<MarketEvent>,
@@ -688,6 +1045,17 @@ async fn admit_capture_output(
 ) -> Result<StreamScopeAction, AppError> {
     match output {
         CaptureOutput::Captured(batch) => {
+            if preflight_capture_sources(authority, batch.events())?
+                == CaptureSourcePreflight::HistoricalNoOp
+            {
+                tracing::debug!(
+                    events = batch.events().len(),
+                    captured_at_ns = batch.captured_at().value(),
+                    source_digest = %batch.source_digest(),
+                    "dropping complete historical context-capture retry before durable mutation"
+                );
+                return Ok(StreamScopeAction::None);
+            }
             parquet_store.write_capture_batch(batch.events())?;
             for event in batch.events().iter().cloned() {
                 admit_market_event(writer, authority, event, recovery_sender).await?;
@@ -1139,6 +1507,9 @@ async fn admit_market_event(
     event: MarketEvent,
     recovery_sender: Option<&mpsc::Sender<RecoveryInput>>,
 ) -> Result<(), AppError> {
+    if is_verified_historical_source_retry(authority, &event)? {
+        return Ok(());
+    }
     let committed_source = event.clone();
     if source_is_late(authority, &committed_source)? {
         admit_typed_engine_event(
@@ -1194,6 +1565,71 @@ async fn admit_market_event(
         retain_recovery_source(sender, authority, committed_source);
     }
     Ok(())
+}
+
+/// Filters a source retry against immutable evidence verified during restart.
+///
+/// This must run before a public source fact reaches either durable store. An
+/// exact retry is already durable; a reused identity with changed evidence is
+/// an integrity failure and never becomes a new source fact.
+fn is_verified_historical_source_retry(
+    authority: &AuthorityState,
+    event: &MarketEvent,
+) -> Result<bool, AppError> {
+    let Some(historical) = authority.historical_sources.get(event.event_id()) else {
+        return Ok(false);
+    };
+    if historical == event {
+        tracing::debug!(
+            event_id = event.event_id().as_str(),
+            "dropping exact source retry already verified during restart reconstruction"
+        );
+        return Ok(true);
+    }
+    Err(AppError::HistoricalSourceConflict {
+        event_id: event.event_id().as_str().to_owned(),
+    })
+}
+
+/// Preflights a complete context capture without mutating authority state.
+///
+/// A capture is indivisible: accepting a subset would bind its dynamic scope
+/// to facts that were never admitted in the same durable capture boundary.
+fn preflight_capture_sources(
+    authority: &AuthorityState,
+    events: &[MarketEvent],
+) -> Result<CaptureSourcePreflight, AppError> {
+    let historical_count = events.iter().try_fold(0_usize, |count, event| {
+        Ok::<_, AppError>(
+            count + usize::from(is_verified_historical_source_retry(authority, event)?),
+        )
+    })?;
+    if historical_count == 0 {
+        return Ok(CaptureSourcePreflight::AllNew);
+    }
+    if historical_count == events.len() {
+        return Ok(CaptureSourcePreflight::HistoricalNoOp);
+    }
+    Err(AppError::MixedHistoricalCapture)
+}
+
+/// Persists and routes one live source fact after the restart-evidence fence.
+///
+/// `false` means a verified historical retry was dropped without mutating
+/// Parquet, SQLite, the engine, or recovery input state.
+async fn persist_live_market_event(
+    parquet_store: &ParquetStore,
+    writer: &mut EngineWriter,
+    authority: &mut AuthorityState,
+    event: MarketEvent,
+    recovery_sender: Option<&mpsc::Sender<RecoveryInput>>,
+) -> Result<bool, AppError> {
+    if is_verified_historical_source_retry(authority, &event)? {
+        return Ok(false);
+    }
+    parquet_store.write_events(std::slice::from_ref(&event))?;
+    admit_market_event(writer, authority, event, recovery_sender).await?;
+    Ok(true)
 }
 
 fn source_is_late(authority: &AuthorityState, source: &MarketEvent) -> Result<bool, AppError> {
@@ -1377,6 +1813,37 @@ pub enum AppError {
     /// Engine state was consumed by a failed authority transition.
     #[error("authority engine state is unavailable after a failed transition")]
     MissingEngineState,
+    /// Reapplying verified historical evidence produced a different typed
+    /// transition, core record sequence, or successor-state commitment.
+    #[error("deterministic restart history parity failed: {reason}")]
+    HistoryParity { reason: &'static str },
+    /// A SQLite history transition claimed a raw source fact absent from the
+    /// immutable committed Parquet stream.
+    #[error("historical engine journal referenced source evidence missing from committed Parquet")]
+    MissingHistoricalSourceEvidence,
+    /// A Parquet fact not present in SQLite was at or before the reconstructed
+    /// causal cursor, so it cannot safely be admitted as a fresh source input.
+    #[error("uncommitted Parquet source evidence preceded the reconstructed causal cursor")]
+    UncoveredSourceBeforeCursor,
+    /// An incoming source event reused a verified historical identity with
+    /// changed immutable source or receipt evidence.
+    #[error("incoming source evidence conflicted with reconstructed history for event {event_id}")]
+    HistoricalSourceConflict {
+        /// Reused normalized source identity.
+        event_id: String,
+    },
+    /// A complete context capture combined exact historical retries with new
+    /// facts, so no atomic source/scope transition can be proved.
+    #[error("context capture mixed historical retries with new source facts")]
+    MixedHistoricalCapture,
+    /// Persisted recovery control evidence was malformed, edited, or did not
+    /// bind to its anchored raw L2 source fact.
+    #[error("persisted recovery evidence was invalid")]
+    InvalidRecoveryEvidence,
+    /// Prior durable history ended behind an unresolved recovery fence. The
+    /// ephemeral worker result cannot be recreated safely after restart.
+    #[error("historical recovery was incomplete; startup remains fail-closed")]
+    IncompleteRecoveryEvidence,
     /// The minimal no-entry engine state could not be initialized safely.
     #[error("paper engine initial state could not be constructed")]
     InitialEngineState,
@@ -1386,6 +1853,9 @@ pub enum AppError {
     /// SQLite admission/write ownership could not initialize or drain.
     #[error(transparent)]
     Writer(#[from] WriterError),
+    /// The pure engine rejected a reconstructed historical typed transition.
+    #[error(transparent)]
+    Engine(#[from] EngineError),
     /// Atomic market-data persistence/recovery rejected a local path or state.
     #[error(transparent)]
     Storage(#[from] ParquetError),
@@ -1408,13 +1878,14 @@ pub enum AppError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, VecDeque};
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
     use rust_decimal::Decimal;
     use serde_json::{Value, json};
+    use sqlx::{Connection, SqliteConnection};
     use tokio::sync::mpsc;
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
@@ -1428,10 +1899,11 @@ mod tests {
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     use super::{
-        AuthorityState, CaptureOutput, LiveSubscription, RecoveryInput, RecoveryOutput,
+        AppError, AuthorityState, CaptureOutput, LiveSubscription, RecoveryInput, RecoveryOutput,
         StreamScopeAction, SystemReceiptClock, admit_capture_output, admit_market_event,
-        admit_recovery_output, capture_worker, configured_path, current_time_ns,
-        initial_engine_state, maximum_book_age, recover_source_stream, recovery_worker,
+        admit_recovery_output, admit_typed_engine_event, capture_worker, configured_path,
+        current_time_ns, initial_engine_state, maximum_book_age, persist_live_market_event,
+        reconstruct_authority, recover_source_stream, recovery_worker,
     };
     use crate::capture_scheduler::CaptureScheduler;
     use crate::readiness::Readiness;
@@ -1511,6 +1983,7 @@ mod tests {
             router: crate::execution::TypedMarketRouter::new(
                 maximum_book_age().expect("fixture maximum book age"),
             ),
+            historical_sources: BTreeMap::new(),
             readiness: Readiness::default(),
             live: LiveSubscription::new(),
             reconciled: false,
@@ -1795,6 +2268,7 @@ mod tests {
             router: crate::execution::TypedMarketRouter::new(
                 maximum_book_age().expect("fixture maximum book age"),
             ),
+            historical_sources: BTreeMap::new(),
             readiness: Readiness::default(),
             live: LiveSubscription::new(),
             reconciled: false,
@@ -1905,6 +2379,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_historical_capture_is_a_no_op_before_every_mutation() {
+        let (capture, request, _server) = mounted_context_capture(None).await;
+        let batch = capture
+            .capture(&request, &SystemReceiptClock)
+            .await
+            .expect("complete public context batch");
+        let directory = tempfile::tempdir().expect("fixture root");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("private fixture root");
+        let store = ParquetStore::open(directory.path(), provenance()).expect("fixture store");
+        let mut writer = EngineWriter::open(
+            directory.path().join("trench.sqlite"),
+            "run-capture-historical-noop",
+            current_time_ns().expect("UTC clock"),
+        )
+        .await
+        .expect("fixture writer");
+        let mut authority = authority("run-capture-historical-noop");
+        authority.historical_sources = batch
+            .events()
+            .iter()
+            .map(|event| (event.event_id().clone(), event.clone()))
+            .collect();
+        let _ = authority.live.replace_persisted_scope(vec![btc()]);
+        let scope_before = authority.live.scope.clone();
+        let epoch_before = authority.live.epoch;
+        let readiness_before = authority.readiness.snapshot();
+        let mut scheduler = CaptureScheduler::new(vec![btc()]);
+        let _ = scheduler
+            .dispatch(current_timestamp())
+            .expect("capture schedule")
+            .expect("in-flight capture");
+        let config = PaperConfig::from_toml(PAPER_CONFIG).expect("fixture config");
+
+        let action = admit_capture_output(
+            &store,
+            &mut writer,
+            &mut authority,
+            CaptureOutput::Captured(batch),
+            &mut scheduler,
+            &config,
+            None,
+        )
+        .await
+        .expect("complete historical capture is a safe no-op");
+
+        assert_eq!(action, StreamScopeAction::None);
+        assert!(
+            scheduler.in_flight(),
+            "the retry must not complete the schedule"
+        );
+        assert!(store.partitions().expect("source partitions").is_empty());
+        assert_eq!(
+            writer
+                .journal_counts()
+                .await
+                .expect("journal counts")
+                .events,
+            0
+        );
+        assert_eq!(authority.live.scope, scope_before);
+        assert_eq!(authority.live.epoch, epoch_before);
+        assert_eq!(authority.readiness.snapshot(), readiness_before);
+    }
+
+    #[tokio::test]
+    async fn mixed_historical_capture_fails_closed_before_every_mutation() {
+        let (capture, request, _server) = mounted_context_capture(None).await;
+        let batch = capture
+            .capture(&request, &SystemReceiptClock)
+            .await
+            .expect("complete public context batch");
+        let historical = batch
+            .events()
+            .first()
+            .expect("complete capture has source facts")
+            .clone();
+        assert!(
+            batch.events().len() > 1,
+            "fixture must include both historical and new source facts"
+        );
+        let directory = tempfile::tempdir().expect("fixture root");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("private fixture root");
+        let store = ParquetStore::open(directory.path(), provenance()).expect("fixture store");
+        let mut writer = EngineWriter::open(
+            directory.path().join("trench.sqlite"),
+            "run-capture-mixed-history",
+            current_time_ns().expect("UTC clock"),
+        )
+        .await
+        .expect("fixture writer");
+        let mut authority = authority("run-capture-mixed-history");
+        authority
+            .historical_sources
+            .insert(historical.event_id().clone(), historical);
+        let _ = authority.live.replace_persisted_scope(vec![btc()]);
+        let scope_before = authority.live.scope.clone();
+        let epoch_before = authority.live.epoch;
+        let readiness_before = authority.readiness.snapshot();
+        let mut scheduler = CaptureScheduler::new(vec![btc()]);
+        let _ = scheduler
+            .dispatch(current_timestamp())
+            .expect("capture schedule")
+            .expect("in-flight capture");
+        let config = PaperConfig::from_toml(PAPER_CONFIG).expect("fixture config");
+
+        let error = admit_capture_output(
+            &store,
+            &mut writer,
+            &mut authority,
+            CaptureOutput::Captured(batch),
+            &mut scheduler,
+            &config,
+            None,
+        )
+        .await
+        .expect_err("a mixed historical capture cannot cross an atomic boundary");
+
+        assert!(matches!(error, AppError::MixedHistoricalCapture));
+        assert!(
+            scheduler.in_flight(),
+            "the failed batch must not complete the schedule"
+        );
+        assert!(store.partitions().expect("source partitions").is_empty());
+        assert_eq!(
+            writer
+                .journal_counts()
+                .await
+                .expect("journal counts")
+                .events,
+            0
+        );
+        assert_eq!(authority.live.scope, scope_before);
+        assert_eq!(authority.live.epoch, epoch_before);
+        assert_eq!(authority.readiness.snapshot(), readiness_before);
+    }
+
+    #[tokio::test]
     async fn complete_context_capture_persists_before_authority_admission() {
         let (capture, request, _server) = mounted_context_capture(None).await;
         let batch = capture
@@ -1964,6 +2577,278 @@ mod tests {
                 .events,
             0,
             "the induced authority failure occurs after source persistence"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_live_boundary_drops_exact_historical_retries_before_durable_mutation() {
+        let root = tempfile::tempdir().expect("fixture root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("private fixture root");
+        let provenance = provenance();
+        let store = ParquetStore::open(root.path(), provenance.clone()).expect("fixture store");
+        let database = root.path().join("trench.sqlite");
+        let committed = predecessor();
+        store
+            .write_events(std::slice::from_ref(&committed))
+            .expect("committed source evidence");
+
+        let mut initial_writer = EngineWriter::open(&database, "run-initial", BASE_NS)
+            .await
+            .expect("fresh initial writer");
+        let mut initial_authority = authority("run-initial");
+        admit_market_event(
+            &mut initial_writer,
+            &mut initial_authority,
+            committed.clone(),
+            None,
+        )
+        .await
+        .expect("initial atomic admission");
+        assert_eq!(
+            initial_writer
+                .journal_counts()
+                .await
+                .expect("initial counts")
+                .events,
+            1
+        );
+        drop(initial_writer);
+
+        let fresh = late_trade(BASE_NS + 1, BASE_NS + 1);
+        store
+            .write_events(std::slice::from_ref(&fresh))
+            .expect("new source retained before restart");
+        let history = EngineWriter::inspect_history(&database)
+            .await
+            .expect("complete immutable history");
+        let recovered = recover_source_stream(root.path(), provenance)
+            .expect("verified source replay")
+            .expect("source evidence");
+        let mut restored =
+            reconstruct_authority(Some(&recovered), &history, "run-restarted", BASE_NS + 100)
+                .expect("history must reconstruct before opening a writer");
+        assert_eq!(restored.fresh_events, vec![fresh.clone()]);
+        assert_eq!(
+            restored
+                .authority
+                .engine_state
+                .as_ref()
+                .expect("reconstructed state")
+                .broker()
+                .causal_boundary(),
+            initial_authority
+                .engine_state
+                .as_ref()
+                .expect("initial state")
+                .broker()
+                .causal_boundary(),
+            "reconstruction must exactly preserve the executed causal state"
+        );
+        assert_eq!(
+            EngineWriter::inspect_history(&database)
+                .await
+                .expect("read-only restart verification"),
+            history,
+            "reconstruction itself must not duplicate a SQLite source or checkpoint"
+        );
+
+        let mut restarted_writer = EngineWriter::open_after_reconstruction(
+            &database,
+            "run-restarted",
+            BASE_NS + 100,
+            &history,
+        )
+        .await
+        .expect("writer opens only after successful reconstruction");
+        let reconstructed_boundary = restored
+            .authority
+            .engine_state
+            .as_ref()
+            .expect("reconstructed state")
+            .broker()
+            .causal_boundary();
+        let source_events_before = store
+            .partitions()
+            .expect("source partitions before live retry")
+            .into_iter()
+            .flat_map(|manifest| store.read_partition(&manifest).expect("source partition"))
+            .collect::<Vec<_>>();
+        let admitted = persist_live_market_event(
+            &store,
+            &mut restarted_writer,
+            &mut restored.authority,
+            committed.clone(),
+            None,
+        )
+        .await
+        .expect("exact historic live retry is dropped before Parquet or SQLite admission");
+        assert!(
+            !admitted,
+            "the live intake boundary must report an exact historical retry as dropped"
+        );
+        let source_events_after_retry = store
+            .partitions()
+            .expect("source partitions after live retry")
+            .into_iter()
+            .flat_map(|manifest| store.read_partition(&manifest).expect("source partition"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            source_events_after_retry, source_events_before,
+            "an exact historical live retry must not mutate Parquet"
+        );
+        assert_eq!(
+            restarted_writer
+                .journal_counts()
+                .await
+                .expect("restarted counts after retry")
+                .events,
+            0,
+            "a historic retry must not duplicate source or checkpoint persistence"
+        );
+        assert_eq!(
+            restored
+                .authority
+                .engine_state
+                .as_ref()
+                .expect("state after retry")
+                .broker()
+                .causal_boundary(),
+            reconstructed_boundary,
+            "dropping a historic retry must not alter source-clock or late-source state"
+        );
+        let conflicting_receipt = MarketEvent::trade(
+            timestamp(BASE_NS),
+            timestamp(BASE_NS + 1),
+            btc(),
+            Trade::new(1, Side::Buy, price(100), quantity(1)).expect("fixture trade"),
+        )
+        .expect("same source identity with altered receipt evidence");
+        assert_eq!(conflicting_receipt.event_id(), committed.event_id());
+        assert_ne!(conflicting_receipt, committed);
+        let conflict = persist_live_market_event(
+            &store,
+            &mut restarted_writer,
+            &mut restored.authority,
+            conflicting_receipt,
+            None,
+        )
+        .await
+        .expect_err("changed receipt evidence must fail closed rather than be dropped");
+        assert!(matches!(
+            conflict,
+            AppError::HistoricalSourceConflict { .. }
+        ));
+        assert_eq!(
+            restarted_writer
+                .journal_counts()
+                .await
+                .expect("restarted counts after conflict")
+                .events,
+            0
+        );
+        let source_events_after_conflict = store
+            .partitions()
+            .expect("source partitions after rejected conflict")
+            .into_iter()
+            .flat_map(|manifest| store.read_partition(&manifest).expect("source partition"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            source_events_after_conflict, source_events_before,
+            "conflicting historical evidence must not mutate Parquet"
+        );
+        admit_market_event(&mut restarted_writer, &mut restored.authority, fresh, None)
+            .await
+            .expect("only the fresh source fact is appended");
+        assert_eq!(
+            restarted_writer
+                .journal_counts()
+                .await
+                .expect("restarted run counts")
+                .events,
+            1,
+            "the restarted run contains only newly admitted source evidence"
+        );
+        drop(restarted_writer);
+        let complete_history = EngineWriter::inspect_history(&database)
+            .await
+            .expect("complete history after fresh append");
+        assert_eq!(complete_history.events().len(), 2);
+        assert_eq!(
+            complete_history.events()[0].event_id(),
+            committed.event_id().as_str()
+        );
+        assert_ne!(
+            complete_history.events()[1].event_id(),
+            committed.event_id().as_str(),
+            "the new run must append the one previously uncommitted source fact"
+        );
+        assert_eq!(complete_history.events()[1].run_id(), "run-restarted");
+    }
+
+    #[tokio::test]
+    async fn restart_reuses_the_original_live_open_boundary_when_late_history_sorts_first() {
+        let root = tempfile::tempdir().expect("fixture root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("private fixture root");
+        let provenance = provenance();
+        let store = ParquetStore::open(root.path(), provenance.clone()).expect("fixture store");
+        let database = root.path().join("trench.sqlite");
+        let first = MarketEvent::trade(
+            timestamp(BASE_NS + 100),
+            timestamp(BASE_NS + 100),
+            btc(),
+            Trade::new(1, Side::Buy, price(100), quantity(1)).expect("fixture trade"),
+        )
+        .expect("fixture source");
+        let late = late_trade(BASE_NS + 50, BASE_NS + 101);
+        let mut writer = EngineWriter::open(&database, "run-live-boundary", BASE_NS)
+            .await
+            .expect("fresh writer");
+        let mut initial_authority = authority("run-live-boundary");
+        for source in [first, late] {
+            store
+                .write_events(std::slice::from_ref(&source))
+                .expect("committed source evidence");
+            admit_market_event(&mut writer, &mut initial_authority, source, None)
+                .await
+                .expect("initial source admission");
+        }
+        let expected_boundary = initial_authority
+            .engine_state
+            .as_ref()
+            .expect("initial state")
+            .broker()
+            .causal_boundary();
+        drop(writer);
+
+        let history = EngineWriter::inspect_history(&database)
+            .await
+            .expect("history");
+        let recovered = recover_source_stream(root.path(), provenance)
+            .expect("verified raw source replay")
+            .expect("raw source evidence");
+        assert!(
+            recovered.events[0].event_time() < recovered.events[1].event_time(),
+            "the deterministic Parquet order deliberately differs from original live admission"
+        );
+        let restored = reconstruct_authority(
+            Some(&recovered),
+            &history,
+            "run-restarted",
+            BASE_NS + 200,
+        )
+        .expect("the original live opening boundary must be tried before replay-derived fallback");
+        assert!(restored.fresh_events.is_empty());
+        assert_eq!(
+            restored
+                .authority
+                .engine_state
+                .as_ref()
+                .expect("restored state")
+                .broker()
+                .causal_boundary(),
+            expected_boundary
         );
     }
 
@@ -2096,6 +2981,105 @@ mod tests {
             i64::try_from(event_count).expect("bounded capture event count"),
             "every persisted normalized fact must use the sole authority writer"
         );
+    }
+
+    #[tokio::test]
+    async fn restart_rejects_missing_or_tampered_source_evidence() {
+        let root = tempfile::tempdir().expect("fixture root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("private fixture root");
+        let provenance = provenance();
+        let database = root.path().join("trench.sqlite");
+        let source = predecessor();
+        let mut writer = EngineWriter::open(&database, "run-corrupt", BASE_NS)
+            .await
+            .expect("fresh writer");
+        let mut initial_authority = authority("run-corrupt");
+        admit_market_event(&mut writer, &mut initial_authority, source, None)
+            .await
+            .expect("durable source transition");
+        drop(writer);
+
+        let missing = reconstruct_authority(
+            None,
+            &EngineWriter::inspect_history(&database)
+                .await
+                .expect("history"),
+            "run-next",
+            BASE_NS + 1,
+        )
+        .expect_err("SQLite history without committed Parquet source must fail closed");
+        assert!(matches!(missing, AppError::MissingHistoricalSourceEvidence));
+
+        let store = ParquetStore::open(root.path(), provenance.clone()).expect("fixture store");
+        let source = predecessor();
+        store
+            .write_events(std::slice::from_ref(&source))
+            .expect("restore source evidence");
+        let mut connection =
+            SqliteConnection::connect(&format!("sqlite://{}", database.to_string_lossy()))
+                .await
+                .expect("fixture database connection");
+        sqlx::query("UPDATE events SET payload_json = '{}' WHERE event_id = ?1")
+            .bind(source.event_id().as_str())
+            .execute(&mut connection)
+            .await
+            .expect("fixture corruption");
+        connection.close().await.expect("fixture connection closes");
+
+        let tampered_history = EngineWriter::inspect_history(&database)
+            .await
+            .expect("history remains structurally complete");
+        let recovered = recover_source_stream(root.path(), provenance)
+            .expect("verified raw source evidence")
+            .expect("raw source evidence");
+        let tampered =
+            reconstruct_authority(Some(&recovered), &tampered_history, "run-next", BASE_NS + 1)
+                .expect_err("edited SQLite source evidence must fail parity");
+        assert!(matches!(tampered, AppError::HistoryParity { .. }));
+    }
+
+    #[tokio::test]
+    async fn restart_rejects_incomplete_recovery_evidence() {
+        let root = tempfile::tempdir().expect("fixture root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("private fixture root");
+        let provenance = provenance();
+        let store = ParquetStore::open(root.path(), provenance.clone()).expect("fixture store");
+        let database = root.path().join("trench.sqlite");
+        let predecessor = predecessor();
+        let anchor = snapshot(BASE_NS + 1, 1);
+        let request = recovery_request_from_events_for_test(1, Some(&predecessor), &anchor);
+        let mut writer = EngineWriter::open(&database, "run-incomplete-recovery", BASE_NS)
+            .await
+            .expect("fresh writer");
+        let mut initial_authority = authority("run-incomplete-recovery");
+        for source in [predecessor.clone(), anchor.clone()] {
+            store
+                .write_events(std::slice::from_ref(&source))
+                .expect("committed source evidence");
+            admit_market_event(&mut writer, &mut initial_authority, source, None)
+                .await
+                .expect("source admission");
+        }
+        admit_typed_engine_event(
+            &mut writer,
+            &mut initial_authority,
+            crate::execution::TypedEngineEvent::recovery_requested(&request),
+        )
+        .await
+        .expect("durable recovery request evidence");
+        drop(writer);
+
+        let history = EngineWriter::inspect_history(&database)
+            .await
+            .expect("complete journal rows");
+        let recovered = recover_source_stream(root.path(), provenance)
+            .expect("verified raw source replay")
+            .expect("raw source evidence");
+        let error = reconstruct_authority(Some(&recovered), &history, "run-next", BASE_NS + 10)
+            .expect_err("a pending recovery worker result cannot be recreated after restart");
+        assert!(matches!(error, AppError::IncompleteRecoveryEvidence));
     }
 
     #[tokio::test]

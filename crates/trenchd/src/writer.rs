@@ -4,7 +4,8 @@ use thiserror::Error;
 use trench_core::domain::LedgerId;
 use trench_core::engine::{EngineError, EngineOutcome, EventAdmission};
 use trench_storage::sqlite::{
-    EngineJournalCounts, EventInput, LedgerId as StoreLedgerId, RunInput, SqliteStore, StoreError,
+    EngineJournalCounts, EngineJournalHistory, EventInput, LedgerId as StoreLedgerId, RunInput,
+    SqliteStore, StoreError,
 };
 
 /// Owned normalized source evidence submitted to the authority loop.
@@ -57,6 +58,7 @@ impl EngineWriter {
     /// Opens the WAL store and records the daemon-owned run before admission.
     ///
     /// No network task receives the underlying store or a database handle.
+    #[cfg(test)]
     pub async fn open(
         path: impl AsRef<std::path::Path>,
         run_id: impl Into<String>,
@@ -66,6 +68,44 @@ impl EngineWriter {
         let mut store = SqliteStore::open(path).await?;
         if store.has_engine_history().await? {
             return Err(WriterError::PriorHistory);
+        }
+        store
+            .create_run(RunInput {
+                run_id: &run_id,
+                started_at_ns,
+            })
+            .await?;
+        Ok(Self { store, run_id })
+    }
+
+    /// Inspects the immutable SQLite journal before any daemon run is created.
+    ///
+    /// Startup must reconstruct the executable state from independently
+    /// committed Parquet source/recovery evidence and compare it to this
+    /// history before calling [`Self::open_after_reconstruction`].
+    pub async fn inspect_history(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<EngineJournalHistory, WriterError> {
+        let mut store = SqliteStore::open(path).await?;
+        store.engine_journal_history().await.map_err(Into::into)
+    }
+
+    /// Opens a new daemon-owned run only after the supplied journal witness
+    /// was deterministically reconstructed by the authority path.
+    ///
+    /// The database is read again before mutation so a concurrent or changed
+    /// history invalidates the restoration rather than allowing a stale proof
+    /// to append fresh source facts.
+    pub async fn open_after_reconstruction(
+        path: impl AsRef<std::path::Path>,
+        run_id: impl Into<String>,
+        started_at_ns: i64,
+        reconstructed: &EngineJournalHistory,
+    ) -> Result<Self, WriterError> {
+        let run_id = run_id.into();
+        let mut store = SqliteStore::open(path).await?;
+        if store.engine_journal_history().await? != *reconstructed {
+            return Err(WriterError::HistoryChanged);
         }
         store
             .create_run(RunInput {
@@ -137,8 +177,13 @@ fn store_ledger(ledger: LedgerId) -> StoreLedgerId {
 #[derive(Debug, Error)]
 pub enum WriterError {
     /// Existing journal checkpoints require a complete replay-state restorer.
+    #[cfg(test)]
     #[error("prior engine history requires deterministic state reconstruction")]
     PriorHistory,
+    /// Immutable SQLite evidence changed after authority reconstruction and
+    /// before the new writer run could be created.
+    #[error("historical engine journal changed during deterministic reconstruction")]
+    HistoryChanged,
     /// The submitted event was not scoped to this durable run.
     #[error("source event belongs to a different daemon run")]
     RunMismatch,

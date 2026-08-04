@@ -1,5 +1,6 @@
 //! Single-writer SQLite journal for durable paper-trading transitions.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
@@ -54,6 +55,10 @@ pub enum StoreError {
     /// The supplied event identity conflicts with immutable source evidence.
     #[error("existing source event does not match this engine batch")]
     EventConflict,
+    /// Historical source evidence was not accompanied by one complete
+    /// rules-only engine batch and checkpoint.
+    #[error("historical engine journal is incomplete")]
+    IncompleteEngineHistory,
 }
 
 impl From<sqlx::Error> for StoreError {
@@ -288,6 +293,133 @@ pub struct EngineJournalCounts {
     pub duplicate_attempts: i64,
 }
 
+/// One immutable persisted engine record in causal sequence order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JournalRecord {
+    kind: String,
+    payload_json: String,
+}
+
+impl JournalRecord {
+    /// Returns the stable storage category emitted by the core engine.
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// Returns the canonical secret-free persistence payload.
+    #[must_use]
+    pub fn payload_json(&self) -> &str {
+        &self.payload_json
+    }
+}
+
+/// One complete, append-only rules-only engine transition recovered from SQLite.
+///
+/// The fields are evidence for deterministic reconstruction only. In
+/// particular, the journal intentionally does not expose checkpoint JSON here:
+/// callers must re-apply typed source facts and compare the resulting digest,
+/// never deserialize a checkpoint into executable state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JournalEvent {
+    run_id: String,
+    run_started_at_ns: i64,
+    event_id: String,
+    event_time_ns: i64,
+    kind: String,
+    payload_json: String,
+    checkpoint_id: String,
+    checkpoint_at_ns: i64,
+    state_digest: String,
+    records: Vec<JournalRecord>,
+}
+
+impl JournalEvent {
+    /// Returns the run that originally committed this causal transition.
+    #[must_use]
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    /// Returns the original daemon-run UTC start time.
+    #[must_use]
+    pub const fn run_started_at_ns(&self) -> i64 {
+        self.run_started_at_ns
+    }
+
+    /// Returns the immutable source or recovery identity.
+    #[must_use]
+    pub fn event_id(&self) -> &str {
+        &self.event_id
+    }
+
+    /// Returns the source transition time retained by SQLite.
+    #[must_use]
+    pub const fn event_time_ns(&self) -> i64 {
+        self.event_time_ns
+    }
+
+    /// Returns the stable typed source category.
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// Returns the canonical typed source/recovery evidence.
+    #[must_use]
+    pub fn payload_json(&self) -> &str {
+        &self.payload_json
+    }
+
+    /// Returns the core-generated successor-checkpoint identity.
+    #[must_use]
+    pub fn checkpoint_id(&self) -> &str {
+        &self.checkpoint_id
+    }
+
+    /// Returns the explicit successor causal boundary.
+    #[must_use]
+    pub const fn checkpoint_at_ns(&self) -> i64 {
+        self.checkpoint_at_ns
+    }
+
+    /// Returns the core-generated canonical successor-state digest.
+    #[must_use]
+    pub fn state_digest(&self) -> &str {
+        &self.state_digest
+    }
+
+    /// Returns all records in their atomically committed sequence.
+    #[must_use]
+    pub fn records(&self) -> &[JournalRecord] {
+        &self.records
+    }
+}
+
+/// Complete rules-only history in SQLite append order.
+///
+/// This value is deliberately only a verification witness. It cannot create an
+/// executable engine state; runtime must reconstruct state from normalized
+/// Parquet source facts and compare every resulting transition to this record.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EngineJournalHistory {
+    events: Vec<JournalEvent>,
+}
+
+impl EngineJournalHistory {
+    /// Returns whether this SQLite journal has no engine transition history.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    /// Returns complete causal transitions in immutable append order.
+    #[must_use]
+    pub fn events(&self) -> &[JournalEvent] {
+        &self.events
+    }
+}
+
 /// Required connection durability settings observed from SQLite.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PragmaSettings {
@@ -381,6 +513,120 @@ impl SqliteStore {
             .fetch_one(&mut self.connection)
             .await?;
         Ok(count > 0)
+    }
+
+    /// Reads every complete rules-only transition in immutable SQLite append
+    /// order for a deterministic restart verifier.
+    ///
+    /// This method never reads checkpoint state JSON. The returned checkpoint
+    /// identity, boundary, digest, and ordered records are comparison witnesses
+    /// only; callers must rebuild state by reapplying independently retained
+    /// normalized source facts. Any source row without its complete rules-only
+    /// admission, records, and checkpoint is rejected rather than partially
+    /// restored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::IncompleteEngineHistory`] if the journal cannot
+    /// prove one complete rules-only transition for every source event.
+    pub async fn engine_journal_history(&mut self) -> Result<EngineJournalHistory, StoreError> {
+        let event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+            .fetch_one(&mut self.connection)
+            .await?;
+        if event_count == 0 {
+            return Ok(EngineJournalHistory::default());
+        }
+
+        let rows = sqlx::query_as::<
+            _,
+            (
+                String,
+                i64,
+                String,
+                i64,
+                String,
+                String,
+                String,
+                i64,
+                String,
+            ),
+        >(
+            "SELECT e.run_id, r.started_at_ns, e.event_id, e.event_time_ns, e.event_kind, \
+                    e.payload_json, c.checkpoint_id, c.as_of_time_ns, c.state_digest \
+             FROM events AS e \
+             JOIN runs AS r ON r.run_id = e.run_id \
+             JOIN engine_event_admissions AS a \
+               ON a.run_id = e.run_id \
+              AND a.event_id = e.event_id \
+              AND a.ledger_id = 'rules_only' \
+             JOIN engine_checkpoints AS c \
+               ON c.run_id = e.run_id \
+              AND c.event_id = e.event_id \
+              AND c.ledger_id = 'rules_only' \
+             ORDER BY e.rowid",
+        )
+        .fetch_all(&mut self.connection)
+        .await?;
+        if i64::try_from(rows.len()).ok() != Some(event_count) {
+            return Err(StoreError::IncompleteEngineHistory);
+        }
+
+        let record_rows = sqlx::query_as::<_, (String, String, String, String)>(
+            "SELECT b.run_id, b.event_id, b.record_kind, b.payload_json \
+             FROM engine_batch_records AS b \
+             JOIN events AS e ON e.run_id = b.run_id AND e.event_id = b.event_id \
+             WHERE b.ledger_id = 'rules_only' \
+             ORDER BY e.rowid, b.sequence",
+        )
+        .fetch_all(&mut self.connection)
+        .await?;
+        let mut records = BTreeMap::<(String, String), Vec<JournalRecord>>::new();
+        for (run_id, event_id, kind, payload_json) in record_rows {
+            records
+                .entry((run_id, event_id))
+                .or_default()
+                .push(JournalRecord { kind, payload_json });
+        }
+
+        let events = rows
+            .into_iter()
+            .map(
+                |(
+                    run_id,
+                    run_started_at_ns,
+                    event_id,
+                    event_time_ns,
+                    kind,
+                    payload_json,
+                    checkpoint_id,
+                    checkpoint_at_ns,
+                    state_digest,
+                )| {
+                    let records = records
+                        .remove(&(run_id.clone(), event_id.clone()))
+                        .ok_or(StoreError::IncompleteEngineHistory)?;
+                    if records.is_empty() {
+                        return Err(StoreError::IncompleteEngineHistory);
+                    }
+                    Ok(JournalEvent {
+                        run_id,
+                        run_started_at_ns,
+                        event_id,
+                        event_time_ns,
+                        kind,
+                        payload_json,
+                        checkpoint_id,
+                        checkpoint_at_ns,
+                        state_digest,
+                        records,
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+        if !records.is_empty() {
+            return Err(StoreError::IncompleteEngineHistory);
+        }
+        Ok(EngineJournalHistory { events })
     }
 
     /// Reads ledger-scoped source-event admission before pure engine evaluation.

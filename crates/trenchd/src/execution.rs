@@ -413,6 +413,68 @@ impl TypedMarketRouter {
         self.deferred_books.remove(market);
     }
 
+    /// Rebuilds a persisted recovery-request fence from its immutable typed
+    /// journal evidence. The anchored source book must already have been
+    /// replayed from committed Parquet evidence, so SQLite alone can never
+    /// manufacture an executable recovery path.
+    pub(crate) fn restore_recovery_request(
+        &mut self,
+        market: Market,
+        generation: u64,
+        snapshot_event_id: EventId,
+    ) -> Result<(), RoutingError> {
+        if generation == 0 {
+            return Err(RoutingError::InvalidRecoveryGeneration { market });
+        }
+        let Some((source, _)) = self.deferred_books.get(&market) else {
+            return Err(RoutingError::MissingRecoverySnapshot { market });
+        };
+        if source.event_id() != &snapshot_event_id {
+            return Err(RoutingError::RecoverySnapshotMismatch {
+                market,
+                expected: snapshot_event_id,
+                actual: source.event_id().clone(),
+            });
+        }
+        self.gap_generations.insert(market.clone(), generation);
+        self.recovered_at.remove(&market);
+        self.unavailable.remove(&market);
+        Ok(())
+    }
+
+    /// Rebuilds one opaque reconciled recovery completion after its request
+    /// and anchored Parquet snapshot have both been verified. The event
+    /// identity is recomputed from the request generation; an edited SQLite
+    /// payload cannot silently weaken the recovery fence.
+    pub(crate) fn restore_recovery_completion(
+        &mut self,
+        event_id: &EventId,
+        at: TimestampNs,
+        market: Market,
+        snapshot_event_id: EventId,
+    ) -> Result<(), RoutingError> {
+        let generation = *self.gap_generations.get(&market).ok_or_else(|| {
+            RoutingError::RecoveryGenerationMismatch {
+                market: market.clone(),
+            }
+        })?;
+        let completion = RecoveryCompletion {
+            market,
+            generation,
+            boundary_at: at,
+            snapshot_event_id,
+        };
+        let expected = recovery_event_id(&completion);
+        if event_id != &expected {
+            return Err(RoutingError::RecoveryEventIdentityMismatch {
+                expected,
+                actual: event_id.clone(),
+            });
+        }
+        let _ = self.complete_recovery(completion)?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn open_gap_for_test(&mut self, market: Market) {
         self.gap_generations.insert(market.clone(), 1);
@@ -426,6 +488,14 @@ impl TypedMarketRouter {
     #[must_use]
     pub(crate) fn recovery_boundary(&self, market: &Market) -> Option<TimestampNs> {
         self.recovered_at.get(market).copied()
+    }
+
+    /// Returns whether durable history ended while any market was still behind
+    /// an unresolved recovery fence. A restart must reject such a history: no
+    /// unpersisted network recovery result may be reconstructed from memory.
+    #[must_use]
+    pub(crate) fn has_pending_recovery(&self) -> bool {
+        !self.gap_generations.is_empty()
     }
 
     /// Routes exactly one normalized source fact without inventing execution semantics.
@@ -617,6 +687,13 @@ pub(crate) enum RoutingError {
         /// Affected market.
         market: Market,
     },
+    /// Persisted recovery evidence named generation zero, which no live gap
+    /// producer can emit.
+    #[error("market {market:?} recovery generation is invalid")]
+    InvalidRecoveryGeneration {
+        /// Affected market.
+        market: Market,
+    },
     /// Recovery completed before the requested fresh L2 snapshot was retained.
     #[error("market {market:?} recovery has no retained fresh L2 snapshot")]
     MissingRecoverySnapshot {
@@ -631,6 +708,15 @@ pub(crate) enum RoutingError {
         /// Expected request snapshot identity.
         expected: EventId,
         /// Retained source snapshot identity.
+        actual: EventId,
+    },
+    /// Persisted recovery completion identity did not match the request-bound
+    /// canonical recovery identity.
+    #[error("recovery completion event identity did not match its request-bound evidence")]
+    RecoveryEventIdentityMismatch {
+        /// Canonical identity reconstructed from the verified request.
+        expected: EventId,
+        /// Edited or mismatched durable event identity.
         actual: EventId,
     },
     /// Compact source evidence could not be serialized.
