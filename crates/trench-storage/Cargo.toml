@@ -21,6 +21,7 @@ sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 trench-core = { path = "../trench-core" }
+trench-hyperliquid = { path = "../trench-hyperliquid" }
 
 [dev-dependencies]
 rust_decimal.workspace = true

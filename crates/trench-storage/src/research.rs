@@ -30,6 +30,7 @@ use trench_core::validation::{
     EngineReplayOutcome, MissingReplayInput, ResearchProvenance, RuleGrid, RuleReplay,
     RuleReplayRequest, RulesArtifact, ValidationError,
 };
+use trench_hyperliquid::{RecoveryResult, RecoverySource, RecoveryStatus};
 
 use crate::parquet::events_digest;
 use crate::replay::DeterministicReplay;
@@ -88,9 +89,9 @@ impl ResearchSourceEvidence {
     }
 }
 
-/// A persisted recovery completion derived from evidence in the same immutable
-/// replay stream. It has no public raw constructor: a source event cannot by
-/// itself unlock execution.
+/// A persisted recovery completion derived only from an opaque reconciled
+/// recovery result and evidence in the same immutable replay stream. A raw
+/// source event can never unlock execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryBoundary {
     event_id: EventId,
@@ -98,55 +99,56 @@ pub struct RecoveryBoundary {
     market: Market,
     generation: u64,
     evidence: ResearchSourceEvidence,
-    anchor_event_id: EventId,
+    snapshot_event_id: EventId,
 }
 
 impl RecoveryBoundary {
-    /// Derives one recovery completion from verified raw source evidence.
-    ///
-    /// `generation` distinguishes repeated recoveries for the same market.
-    /// `anchor_event_id` must be a same-market member of `evidence_ids`; the
-    /// completion time is derived from the latest evidence receipt rather than
-    /// accepted from a caller.
-    pub fn from_verified_replay(
+    /// Derives one execution boundary from a reconciled, queue-verified
+    /// recovery result. `RecoveryResult` has no public constructor, so a
+    /// caller cannot turn a selected snapshot into a recovery unlock.
+    pub fn from_reconciled_recovery(
         replay: &DeterministicReplay,
-        market: Market,
-        generation: u64,
-        anchor_event_id: EventId,
-        evidence_ids: Vec<EventId>,
+        result: &RecoveryResult,
     ) -> Result<Self, ValidationError> {
-        if generation == 0 {
+        if !matches!(result.status(), RecoveryStatus::Reconciled { .. })
+            || result.source() != RecoverySource::LocalTradesAndOfficialCandles
+        {
             return Err(ValidationError::InvalidEngineOutcome);
         }
+        let request = result.request();
+        if request.generation() == 0 {
+            return Err(ValidationError::InvalidEngineOutcome);
+        }
+        let mut evidence_ids = result
+            .backfill_events()
+            .iter()
+            .map(|event| event.event_id().clone())
+            .collect::<Vec<_>>();
+        evidence_ids.push(request.snapshot_event_id().clone());
         let evidence = ResearchSourceEvidence::from_replay(replay, evidence_ids)?;
-        let events = evidence.verify(replay, None)?;
-        let anchor = events
+        let events = evidence.verify(replay, Some(result.completed_through()))?;
+        let snapshot = events
             .iter()
-            .find(|event| event.event_id() == &anchor_event_id)
+            .find(|event| event.event_id() == request.snapshot_event_id())
             .ok_or(ValidationError::InvalidEngineOutcome)?;
-        if anchor.market() != &market {
+        if snapshot.market() != request.market()
+            || !matches!(snapshot.kind(), MarketEventKind::BookSnapshot(_))
+        {
             return Err(ValidationError::InvalidEngineOutcome);
         }
-        let at = events
-            .iter()
-            .map(MarketEvent::received_at)
-            .max()
-            .ok_or(ValidationError::InvalidEngineOutcome)?;
         let event_id = recovery_event_id(
-            replay.digest(),
-            &market,
-            generation,
-            at,
-            evidence.digest.as_str(),
-            &anchor_event_id,
+            request.market(),
+            request.generation(),
+            result.completed_through(),
+            request.snapshot_event_id(),
         )?;
         Ok(Self {
             event_id,
-            at,
-            market,
-            generation,
+            at: result.completed_through(),
+            market: request.market().clone(),
+            generation: request.generation(),
             evidence,
-            anchor_event_id,
+            snapshot_event_id: request.snapshot_event_id().clone(),
         })
     }
 
@@ -552,7 +554,9 @@ impl EngineRuleReplay {
                 MarketEventKind::Funding(funding) => {
                     let was_open = state.ledger().position().is_some();
                     let prior = take_state(&self.execution, &mut state, at)?;
-                    let outcome = if recovered.contains_key(event.market()) {
+                    let outcome = if recovered.contains_key(event.market())
+                        && let Some(mark_price) = funding.mark_price()
+                    {
                         Engine::apply(
                             EngineEvent::FundingObserved {
                                 event_id: event.event_id().clone(),
@@ -561,7 +565,7 @@ impl EngineRuleReplay {
                                 venue_at: event.event_time(),
                                 received_at: event.received_at(),
                                 rate: funding.rate(),
-                                mark_price: funding.mark_price(),
+                                mark_price,
                             },
                             prior,
                             &EngineContext::passive(EventAdmission::New),
@@ -937,21 +941,17 @@ fn source_events(
 }
 
 fn recovery_event_id(
-    replay_digest: &str,
     market: &Market,
     generation: u64,
     at: TimestampNs,
-    evidence_digest: &str,
-    anchor_event_id: &EventId,
+    snapshot_event_id: &EventId,
 ) -> Result<EventId, ValidationError> {
-    let mut hasher = Hasher::new_derive_key("trench.research.recovery-boundary.v1");
+    let mut hasher = Hasher::new_derive_key("trench.daemon-recovery-boundary.v1");
     for component in [
-        replay_digest,
         market.as_str(),
         &generation.to_string(),
         &at.value().to_string(),
-        evidence_digest,
-        anchor_event_id.as_str(),
+        snapshot_event_id.as_str(),
     ] {
         hasher.update(&(component.len() as u64).to_be_bytes());
         hasher.update(component.as_bytes());
@@ -1130,36 +1130,32 @@ fn validate_recovery_boundaries(
     let mut generations = BTreeSet::new();
     let mut boundary_ids = BTreeSet::new();
     for boundary in boundaries {
-        let evidence = boundary.evidence.verify(replay, None);
-        let anchor = evidence.as_ref().ok().and_then(|events| {
+        let evidence = boundary.evidence.verify(replay, Some(boundary.at()));
+        let snapshot = evidence.as_ref().ok().and_then(|events| {
             events
                 .iter()
-                .find(|event| event.event_id() == &boundary.anchor_event_id)
+                .find(|event| event.event_id() == &boundary.snapshot_event_id)
         });
-        let completed_at = evidence
-            .as_ref()
-            .ok()
-            .and_then(|events| events.iter().map(MarketEvent::received_at).max());
         let expected_id = recovery_event_id(
-            replay.digest(),
             boundary.market(),
             boundary.generation,
             boundary.at(),
-            &boundary.evidence.digest,
-            &boundary.anchor_event_id,
+            &boundary.snapshot_event_id,
         );
         if boundary.generation == 0
             || raw_ids.contains(boundary.event_id())
             || !boundary_ids.insert(boundary.event_id())
             || !generations.insert((boundary.market(), boundary.generation))
-            || anchor.is_none_or(|event| event.market() != boundary.market())
+            || snapshot.is_none_or(|event| {
+                event.market() != boundary.market()
+                    || !matches!(event.kind(), MarketEventKind::BookSnapshot(_))
+            })
             || evidence.is_err()
             || evidence.is_ok_and(|events| {
                 events
                     .iter()
                     .any(|event| event.market() != boundary.market())
             })
-            || completed_at != Some(boundary.at())
             || expected_id.as_ref().ok() != Some(boundary.event_id())
             || prior.is_some_and(|prior| {
                 (
@@ -1506,6 +1502,25 @@ mod tests {
         .expect("normalized crossed book is retained until execution")
     }
 
+    fn recovery_boundary_fixture(
+        replay: &DeterministicReplay,
+        snapshot_event: &MarketEvent,
+    ) -> RecoveryBoundary {
+        let evidence =
+            ResearchSourceEvidence::from_replay(replay, vec![snapshot_event.event_id().clone()])
+                .expect("fixture source evidence");
+        let at = snapshot_event.received_at();
+        RecoveryBoundary {
+            event_id: recovery_event_id(&market(), 1, at, snapshot_event.event_id())
+                .expect("fixture recovery ID"),
+            at,
+            market: market(),
+            generation: 1,
+            evidence,
+            snapshot_event_id: snapshot_event.event_id().clone(),
+        }
+    }
+
     #[test]
     fn missing_typed_decision_facts_are_canonical_ineligibility_not_a_zero_outcome() {
         let (_directory, replay) = replay(&[completed_candle_event()]);
@@ -1536,19 +1551,28 @@ mod tests {
     }
 
     #[test]
-    fn recovery_boundaries_require_verified_same_stream_anchor_evidence() {
+    fn recovery_boundaries_reject_a_raw_source_identity_collision() {
         let book = book_event(2);
         let (_directory, replay) = replay(std::slice::from_ref(&book));
-        let error = RecoveryBoundary::from_verified_replay(
-            &replay,
-            market(),
-            1,
-            EventId::new("research-missing-anchor").expect("anchor ID"),
-            vec![book.event_id().clone()],
+        let provenance = research_provenance(&replay);
+        let mut forged = recovery_boundary_fixture(&replay, &book);
+        forged.event_id = book.event_id().clone();
+        let error = EngineRuleReplay::new(
+            replay,
+            provenance.clone(),
+            artifacts(&provenance),
+            ResearchFacts::new(),
+            vec![forged],
+            execution(),
         )
-        .expect_err("a recovery must be anchored by its verified replay evidence");
+        .expect_err("a raw source identity cannot be reused as a recovery boundary");
 
-        assert_eq!(error, ValidationError::InvalidEngineOutcome);
+        assert_eq!(
+            error,
+            ValidationError::MisalignedReplayInputs {
+                inputs: vec![MissingReplayInput::RecoveryBoundary],
+            }
+        );
     }
 
     #[test]
@@ -1638,14 +1662,7 @@ mod tests {
         let second_book = book_event(3);
         let (_directory, replay) = replay(&[first_book.clone(), second_book]);
         let provenance = research_provenance(&replay);
-        let boundary = RecoveryBoundary::from_verified_replay(
-            &replay,
-            market(),
-            1,
-            first_book.event_id().clone(),
-            vec![first_book.event_id().clone()],
-        )
-        .expect("verified recovery boundary");
+        let boundary = recovery_boundary_fixture(&replay, &first_book);
         let mut adapter = EngineRuleReplay::new(
             replay,
             provenance.clone(),
