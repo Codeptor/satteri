@@ -570,14 +570,12 @@ mod tests {
         assert_eq!(second.request(), &eth);
     }
 
-    #[test]
-    fn retained_trade_capacity_fails_before_a_source_fact_is_dropped() {
+    #[tokio::test]
+    async fn retained_trade_capacity_fails_before_a_source_fact_is_dropped() {
         let first = trade("BTC", BASE_NS + 1, 1);
         let second = trade("BTC", BASE_NS + 2, 2);
-        let mut producer = RecoveryEvidenceProducer::new(
-            InfoClient::new_loopback_for_test("http://127.0.0.1:19090/info")
-                .expect("test client must be valid"),
-        );
+        let server = MockServer::start().await;
+        let mut producer = RecoveryEvidenceProducer::new(client(&server).await);
         producer.retained_trades.insert(
             market("BTC"),
             vec![first; MAX_RETAINED_RECOVERY_TRADES_PER_MARKET],
