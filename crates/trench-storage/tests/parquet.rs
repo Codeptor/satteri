@@ -11,7 +11,8 @@ use trench_core::event::{
     Trade,
 };
 use trench_storage::parquet::{
-    DataProvenance, ParquetError, ParquetStore, PartitionFailure, PartitionManifest,
+    CaptureBatchFailure, DataProvenance, ParquetError, ParquetStore, PartitionFailure,
+    PartitionManifest,
 };
 
 fn provenance() -> DataProvenance {
@@ -116,6 +117,19 @@ fn complete_partitions(root: &TempDir) -> Vec<std::path::PathBuf> {
     paths
 }
 
+fn staged_capture_batches(root: &TempDir) -> Vec<std::path::PathBuf> {
+    let batches = root.path().join("capture-batches");
+    fs::read_dir(batches)
+        .expect("capture batch directory should be readable")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(".batch.tmp"))
+        })
+        .collect()
+}
+
 fn secure(root: &TempDir) {
     #[cfg(unix)]
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
@@ -175,6 +189,185 @@ fn event_kind_partitioning_keeps_distinct_normalized_facts_separate() {
 
     assert_eq!(manifests.len(), 2);
     assert!(manifests.iter().all(|manifest| manifest.row_count() == 1));
+}
+
+#[test]
+fn capture_batch_publishes_all_partition_kinds_at_one_commit_boundary() {
+    let root = TempDir::new().expect("temporary root should be created");
+    secure(&root);
+    let store = ParquetStore::open(root.path(), provenance()).expect("store should open");
+
+    let manifests = store
+        .write_capture_batch(&[trade(1_000, 1), bbo(1_000, 7)])
+        .expect("capture should publish");
+
+    assert_eq!(manifests.len(), 2);
+    assert_eq!(
+        store
+            .partitions()
+            .expect("committed capture should be replayable"),
+        manifests
+    );
+    for partition in &manifests {
+        assert_eq!(
+            store
+                .read_partition(partition)
+                .expect("committed capture partition should reopen")
+                .len(),
+            1
+        );
+    }
+}
+
+#[test]
+fn capture_batch_retry_is_idempotent_only_for_the_exact_committed_capture() {
+    let root = TempDir::new().expect("temporary root should be created");
+    secure(&root);
+    let store = ParquetStore::open(root.path(), provenance()).expect("store should open");
+    let events = [trade(1_000, 1), bbo(1_000, 7)];
+
+    let committed = store
+        .write_capture_batch(&events)
+        .expect("first capture should publish");
+    let retried = store
+        .write_capture_batch(&events)
+        .expect("exact capture retry should validate and remain idempotent");
+
+    assert_eq!(retried, committed);
+    assert_eq!(complete_partitions(&root).len(), committed.len());
+    assert!(staged_capture_batches(&root).is_empty());
+    assert_eq!(
+        store
+            .partitions()
+            .expect("exact retry must leave a replayable store"),
+        committed
+    );
+}
+
+#[test]
+fn capture_batch_rejects_mixed_legacy_overlap_before_staging() {
+    let root = TempDir::new().expect("temporary root should be created");
+    secure(&root);
+    let store = ParquetStore::open(root.path(), provenance()).expect("store should open");
+    let existing = trade(1_000, 1);
+    store
+        .write_events(std::slice::from_ref(&existing))
+        .expect("legacy partition should commit");
+
+    let error = store
+        .write_capture_batch(&[existing, bbo(1_000, 7)])
+        .expect_err("mixed legacy/capture overlap must fail before staging");
+
+    assert!(matches!(error, ParquetError::DuplicateEvent { .. }));
+    assert_eq!(complete_partitions(&root).len(), 1);
+    assert!(staged_capture_batches(&root).is_empty());
+}
+
+#[test]
+fn capture_batch_rejects_mixed_prior_capture_overlap_before_staging() {
+    let root = TempDir::new().expect("temporary root should be created");
+    secure(&root);
+    let store = ParquetStore::open(root.path(), provenance()).expect("store should open");
+    let existing = trade(1_000, 1);
+    let committed = store
+        .write_capture_batch(&[existing.clone(), bbo(1_000, 7)])
+        .expect("first capture should publish");
+
+    let error = store
+        .write_capture_batch(&[existing, historical_funding(1_000)])
+        .expect_err("mixed capture overlap must fail before staging");
+
+    assert!(matches!(error, ParquetError::DuplicateEvent { .. }));
+    assert_eq!(complete_partitions(&root).len(), committed.len());
+    assert!(staged_capture_batches(&root).is_empty());
+    assert_eq!(
+        store
+            .partitions()
+            .expect("rejected overlap must preserve the old capture"),
+        committed
+    );
+}
+
+#[test]
+fn legacy_write_rejects_an_existing_capture_partition_before_staging() {
+    let root = TempDir::new().expect("temporary root should be created");
+    secure(&root);
+    let store = ParquetStore::open(root.path(), provenance()).expect("store should open");
+    let event = trade(1_000, 1);
+    let [committed]: [PartitionManifest; 1] = store
+        .write_capture_batch(std::slice::from_ref(&event))
+        .expect("capture should publish")
+        .try_into()
+        .expect("fixture capture should have one partition");
+
+    let error = store
+        .write_events(std::slice::from_ref(&event))
+        .expect_err("legacy write must not republish a captured partition");
+
+    assert!(matches!(error, ParquetError::DuplicateEvent { .. }));
+    assert_eq!(complete_partitions(&root).len(), 1);
+    assert!(temp_siblings(&root).is_empty());
+    assert_eq!(
+        store
+            .read_partition(&committed)
+            .expect("rejected legacy write must preserve the capture"),
+        [event]
+    );
+}
+
+#[test]
+fn later_capture_partition_fsync_failure_exposes_no_facts_and_is_cleaned_on_restart() {
+    let root = TempDir::new().expect("temporary root should be created");
+    secure(&root);
+    let store = ParquetStore::open(root.path(), provenance()).expect("store should open");
+
+    let error = store
+        .write_capture_batch_with_failure(
+            &[trade(1_000, 1), bbo(1_000, 7)],
+            CaptureBatchFailure::BeforePartitionFileSync { partition_index: 1 },
+        )
+        .expect_err("later staged partition fsync should fail");
+
+    assert!(error.is_injected_failure());
+    assert_eq!(
+        store
+            .partitions()
+            .expect("uncommitted capture must stay invisible"),
+        []
+    );
+    assert_eq!(staged_capture_batches(&root).len(), 1);
+    drop(store);
+
+    let reopened = ParquetStore::open(root.path(), provenance()).expect("restart should recover");
+    assert_eq!(
+        reopened
+            .partitions()
+            .expect("failed staging must remain absent after restart"),
+        []
+    );
+    assert_eq!(staged_capture_batches(&root).len(), 0);
+}
+
+#[test]
+fn later_capture_manifest_fsync_failure_exposes_no_facts() {
+    let root = TempDir::new().expect("temporary root should be created");
+    secure(&root);
+    let store = ParquetStore::open(root.path(), provenance()).expect("store should open");
+
+    let error = store
+        .write_capture_batch_with_failure(
+            &[trade(1_000, 1), bbo(1_000, 7)],
+            CaptureBatchFailure::BeforePartitionManifestSync { partition_index: 1 },
+        )
+        .expect_err("later staged partition manifest fsync should fail");
+
+    assert!(error.is_injected_failure());
+    assert_eq!(
+        store
+            .partitions()
+            .expect("uncommitted capture must stay invisible"),
+        []
+    );
 }
 
 #[test]

@@ -1,10 +1,12 @@
 //! Atomic, self-validating Parquet partitions for normalized public market data.
 //!
 //! A complete partition is a directory containing one Parquet file and one
-//! manifest. The directory is written as a temporary sibling and renamed only
-//! after both files are durable and the Parquet rows reopen successfully. A
-//! recovery scan ignores temporary siblings, so a process loss can never make
-//! a half-written partition replayable.
+//! manifest. Ordinary partitions are written as a temporary sibling and
+//! renamed only after both files are durable and the Parquet rows reopen
+//! successfully. Complete public captures use one outer staged directory with
+//! a commit marker; its single rename makes every member visible together.
+//! Recovery ignores all temporary siblings, so a process loss can never make a
+//! half-written partition or capture replayable.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -30,16 +32,21 @@ use trench_core::event::{
 };
 
 const PARTITIONS_DIRECTORY: &str = "partitions";
+const CAPTURE_BATCHES_DIRECTORY: &str = "capture-batches";
 const IMPORTS_DIRECTORY: &str = "imports";
 const EVENT_FILE: &str = "events.parquet";
 const MANIFEST_FILE: &str = "manifest.json";
+const CAPTURE_BATCH_MANIFEST_FILE: &str = "capture-batch.json";
 const PARTITION_SCHEMA_VERSION: u8 = 1;
+const CAPTURE_BATCH_SCHEMA_VERSION: u8 = 1;
 const MAX_EVENTS_PER_BATCH: usize = 100_000;
 const MAX_DISCOVERED_PARTITIONS: usize = 4_096;
+const MAX_PARTITIONS_PER_CAPTURE_BATCH: usize = 1_024;
 const MAX_BOOK_LEVELS_PER_EVENT: usize = 2_000;
 const MAX_EVENT_WIRE_BYTES: usize = 64 * 1_024;
 const MAX_PARTITION_WIRE_BYTES: usize = 8 * 1_024 * 1_024;
 const MAX_MANIFEST_BYTES: u64 = 1_048_576;
+const MAX_CAPTURE_BATCH_MANIFEST_BYTES: u64 = 1_048_576;
 const MAX_PARQUET_BYTES: u64 = 64 * 1_024 * 1_024;
 const MAX_PARQUET_METADATA_BYTES: u32 = 1_048_576;
 const MAX_PARQUET_UNCOMPRESSED_BYTES: i64 = 32 * 1_024 * 1_024;
@@ -214,11 +221,149 @@ impl PartitionManifest {
     }
 }
 
+/// The immutable commit marker for one all-or-nothing public capture batch.
+///
+/// The marker is published only with the fully validated batch directory. A
+/// replay reader accepts every listed partition or none of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureBatchManifest {
+    version: u8,
+    batch_id: String,
+    provenance: DataProvenance,
+    partitions: Vec<PartitionManifest>,
+}
+
+impl CaptureBatchManifest {
+    /// Returns the content-addressed identifier for this complete capture.
+    #[must_use]
+    pub fn batch_id(&self) -> &str {
+        &self.batch_id
+    }
+
+    /// Returns every partition committed atomically with this capture.
+    #[must_use]
+    pub fn partitions(&self) -> &[PartitionManifest] {
+        &self.partitions
+    }
+
+    /// Returns the frozen provenance shared by every committed partition.
+    #[must_use]
+    pub const fn provenance(&self) -> &DataProvenance {
+        &self.provenance
+    }
+
+    fn from_partitions(
+        mut partitions: Vec<PartitionManifest>,
+        provenance: DataProvenance,
+    ) -> Result<Self, ParquetError> {
+        partitions.sort_by(|left, right| left.partition_id.cmp(&right.partition_id));
+        let mut hasher = blake3::Hasher::new_derive_key("trench.parquet.capture-batch-id.v1");
+        hasher.update(&[CAPTURE_BATCH_SCHEMA_VERSION]);
+        for value in [
+            provenance.config_digest(),
+            provenance.code_digest(),
+            provenance.schema_hash(),
+        ] {
+            hasher.update(&(value.len() as u64).to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+        for partition in &partitions {
+            hasher.update(&(partition.partition_id.len() as u64).to_be_bytes());
+            hasher.update(partition.partition_id.as_bytes());
+        }
+        let manifest = Self {
+            version: CAPTURE_BATCH_SCHEMA_VERSION,
+            batch_id: format!("b3:{}", hasher.finalize().to_hex()),
+            provenance,
+            partitions,
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    fn validate(&self) -> Result<(), ParquetError> {
+        if self.version != CAPTURE_BATCH_SCHEMA_VERSION {
+            return Err(ParquetError::UnsupportedCaptureBatchManifestVersion {
+                actual: self.version,
+            });
+        }
+        validate_digest("capture batch id", &self.batch_id)?;
+        self.provenance.validate()?;
+        if self.partitions.is_empty() || self.partitions.len() > MAX_PARTITIONS_PER_CAPTURE_BATCH {
+            return Err(ParquetError::InvalidCaptureBatch {
+                reason: "capture batch partition count is outside the bounded range",
+            });
+        }
+        let mut partition_ids = BTreeSet::new();
+        let mut previous_id = None;
+        for partition in &self.partitions {
+            partition.validate()?;
+            if partition.provenance != self.provenance {
+                return Err(ParquetError::InvalidCaptureBatch {
+                    reason: "capture batch partition provenance differs from its commit marker",
+                });
+            }
+            if !partition_ids.insert(partition.partition_id.clone()) {
+                return Err(ParquetError::InvalidCaptureBatch {
+                    reason: "capture batch repeats a partition identifier",
+                });
+            }
+            if previous_id
+                .as_ref()
+                .is_some_and(|previous| previous >= &partition.partition_id)
+            {
+                return Err(ParquetError::InvalidCaptureBatch {
+                    reason: "capture batch partitions are not in canonical order",
+                });
+            }
+            previous_id = Some(partition.partition_id.clone());
+        }
+        let expected = Self::from_partition_ids(&self.partitions, self.provenance.clone());
+        if expected != self.batch_id {
+            return Err(ParquetError::InvalidCaptureBatch {
+                reason: "capture batch identifier does not match its committed partitions",
+            });
+        }
+        Ok(())
+    }
+
+    fn from_partition_ids(partitions: &[PartitionManifest], provenance: DataProvenance) -> String {
+        let mut hasher = blake3::Hasher::new_derive_key("trench.parquet.capture-batch-id.v1");
+        hasher.update(&[CAPTURE_BATCH_SCHEMA_VERSION]);
+        for value in [
+            provenance.config_digest(),
+            provenance.code_digest(),
+            provenance.schema_hash(),
+        ] {
+            hasher.update(&(value.len() as u64).to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+        for partition in partitions {
+            hasher.update(&(partition.partition_id.len() as u64).to_be_bytes());
+            hasher.update(partition.partition_id.as_bytes());
+        }
+        format!("b3:{}", hasher.finalize().to_hex())
+    }
+}
+
 /// Deterministic failure injection used only by recovery tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PartitionFailure {
     /// Stop after the temporary sibling has been fully validated and fsynced.
     BeforeRename,
+}
+
+/// Deterministic capture-publication failure injection used only by tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureBatchFailure {
+    /// Stop before fsyncing the staged Parquet file at this zero-based partition index.
+    BeforePartitionFileSync { partition_index: usize },
+    /// Stop before fsyncing the staged partition manifest at this zero-based partition index.
+    BeforePartitionManifestSync { partition_index: usize },
+    /// Stop before fsyncing the atomically renamed capture commit marker.
+    BeforeCommitMarkerSync,
+    /// Stop after every staged partition and the commit marker validate, before publication.
+    BeforePublish,
 }
 
 /// A root-owned, append-only normalized-event Parquet store.
@@ -244,6 +389,9 @@ impl ParquetStore {
         let root = validate_private_root(root)?;
         let partitions = root.join(PARTITIONS_DIRECTORY);
         ensure_private_directory(&partitions)?;
+        let capture_batches = root.join(CAPTURE_BATCHES_DIRECTORY);
+        ensure_private_directory(&capture_batches)?;
+        cleanup_staged_capture_batches(&capture_batches)?;
         Ok(Self { root, provenance })
     }
 
@@ -299,35 +447,144 @@ impl ParquetStore {
         self.write_events_inner(events, Some(failure))
     }
 
+    /// Stages and atomically publishes all partitions from one complete public
+    /// capture. Readers see every partition in the capture or none of them.
+    pub fn write_capture_batch(
+        &self,
+        events: &[MarketEvent],
+    ) -> Result<Vec<PartitionManifest>, ParquetError> {
+        self.write_capture_batch_inner(events, None)
+    }
+
+    /// Test-only variant of [`Self::write_capture_batch`] with deterministic
+    /// fault injection before any staged capture can become replayable.
+    pub fn write_capture_batch_with_failure(
+        &self,
+        events: &[MarketEvent],
+        failure: CaptureBatchFailure,
+    ) -> Result<Vec<PartitionManifest>, ParquetError> {
+        self.write_capture_batch_inner(events, Some(failure))
+    }
+
+    fn write_capture_batch_inner(
+        &self,
+        events: &[MarketEvent],
+        failure: Option<CaptureBatchFailure>,
+    ) -> Result<Vec<PartitionManifest>, ParquetError> {
+        let partitions = prepare_event_partitions(events)?;
+        if partitions.is_empty() {
+            return Ok(Vec::new());
+        }
+        if partitions.len() > MAX_PARTITIONS_PER_CAPTURE_BATCH {
+            return Err(ParquetError::CaptureBatchTooLarge {
+                count: partitions.len(),
+                limit: MAX_PARTITIONS_PER_CAPTURE_BATCH,
+            });
+        }
+
+        let prepared = partitions
+            .iter()
+            .map(|(key, events)| {
+                let events = normalize_partition_events(events)?;
+                let manifest =
+                    PartitionManifest::from_events(key, &events, self.provenance.clone())?;
+                Ok(PreparedPartition {
+                    key: key.clone(),
+                    events,
+                    manifest,
+                })
+            })
+            .collect::<Result<Vec<_>, ParquetError>>()?;
+        let batch = CaptureBatchManifest::from_partitions(
+            prepared
+                .iter()
+                .map(|partition| partition.manifest.clone())
+                .collect(),
+            self.provenance.clone(),
+        )?;
+        let batches = self.capture_batches_directory()?;
+        let final_directory = batches.join(capture_batch_directory_name(batch.batch_id(), false));
+        let temporary_directory =
+            batches.join(capture_batch_directory_name(batch.batch_id(), true));
+
+        if final_directory.exists() {
+            return self
+                .validate_existing_capture_batch(&final_directory, &batch)
+                .map(|batch| batch.partitions);
+        }
+        // Capture retries are all-or-nothing. A partition-level retry is not
+        // enough here: republishing one old member alongside new members would
+        // create two physical copies of the old facts under different capture
+        // commit markers. The exact batch return above is the only permitted
+        // duplicate-fact retry path.
+        self.fence_existing_events(&partitions, false)?;
+        if temporary_directory.exists() {
+            return Err(ParquetError::TemporarySiblingExists {
+                path: temporary_directory,
+            });
+        }
+
+        fs::create_dir(&temporary_directory).map_err(|source| ParquetError::Filesystem {
+            operation: "creating temporary capture batch directory",
+            source,
+        })?;
+        set_private_permissions(&temporary_directory)?;
+        sync_directory(&temporary_directory)?;
+        sync_directory(&batches)?;
+
+        for (partition_index, partition) in prepared.iter().enumerate() {
+            let parent = capture_batch_partition_parent(&temporary_directory, &partition.key)?;
+            write_capture_partition(
+                &parent,
+                partition,
+                failure,
+                partition_index,
+                &self.provenance,
+            )?;
+        }
+
+        let commit_marker = temporary_directory.join(CAPTURE_BATCH_MANIFEST_FILE);
+        write_capture_batch_manifest(&commit_marker, &batch, failure)?;
+        sync_directory(&temporary_directory)?;
+        let validated = read_capture_batch_directory(
+            &temporary_directory,
+            &self.provenance,
+            batch.batch_id(),
+            MAX_PARTITIONS_PER_CAPTURE_BATCH,
+        )?;
+        if validated != batch {
+            return Err(ParquetError::InvalidCaptureBatch {
+                reason: "temporary capture batch changed during validation",
+            });
+        }
+        if failure == Some(CaptureBatchFailure::BeforePublish) {
+            return Err(ParquetError::InjectedFailure);
+        }
+
+        fs::rename(&temporary_directory, &final_directory).map_err(|source| {
+            ParquetError::Filesystem {
+                operation: "atomically publishing capture batch directory",
+                source,
+            }
+        })?;
+        sync_directory(&batches)?;
+        Ok(batch.partitions)
+    }
+
     fn write_events_inner(
         &self,
         events: &[MarketEvent],
         failure: Option<PartitionFailure>,
     ) -> Result<Vec<PartitionManifest>, ParquetError> {
-        if events.is_empty() {
+        let partitions = prepare_event_partitions(events)?;
+        if partitions.is_empty() {
             return Ok(Vec::new());
-        }
-        if events.len() > MAX_EVENTS_PER_BATCH {
-            return Err(ParquetError::BatchTooLarge {
-                count: events.len(),
-                limit: MAX_EVENTS_PER_BATCH,
-            });
-        }
-
-        validate_write_events(events)?;
-        let events = deduplicate_events(events)?;
-        let mut partitions = BTreeMap::<PartitionKey, Vec<MarketEvent>>::new();
-        for event in events {
-            partitions
-                .entry(PartitionKey::from_event(&event))
-                .or_default()
-                .push(event);
         }
 
         // A store is one frozen run. Read and fence the complete existing root
         // before creating a single new directory: a retry may reproduce one
         // whole partition, but no partial/superset batch may reuse its events.
-        self.fence_existing_events(&partitions)?;
+        self.fence_existing_events(&partitions, true)?;
 
         partitions
             .into_iter()
@@ -338,12 +595,9 @@ impl ParquetStore {
     fn fence_existing_events(
         &self,
         candidates: &BTreeMap<PartitionKey, Vec<MarketEvent>>,
+        allow_exact_legacy_partition_retries: bool,
     ) -> Result<(), ParquetError> {
         let manifests = self.partitions()?;
-        let existing_partition_ids = manifests
-            .iter()
-            .map(|manifest| manifest.partition_id.clone())
-            .collect::<BTreeSet<_>>();
         let mut existing_events = BTreeMap::<EventId, MarketEvent>::new();
         for manifest in &manifests {
             for event in self.read_partition(manifest)? {
@@ -359,7 +613,8 @@ impl ParquetStore {
             let normalized = normalize_partition_events(events)?;
             let candidate =
                 PartitionManifest::from_events(key, &normalized, self.provenance.clone())?;
-            let exact_retry = existing_partition_ids.contains(&candidate.partition_id);
+            let exact_retry = allow_exact_legacy_partition_retries
+                && self.exact_legacy_partition_retry(&candidate)?;
             for event in normalized {
                 let Some(existing) = existing_events.get(event.event_id()) else {
                     continue;
@@ -458,7 +713,7 @@ impl ParquetStore {
         let mut manifests = Vec::new();
         let mut rows = 0_u64;
         let mut encoded_bytes = 0_u64;
-        for candidate in scan_complete_partition_directories(&self.root)? {
+        for candidate in scan_complete_partition_directories(&self.root, &self.provenance)? {
             let manifest = read_partition_directory(
                 &candidate.directory,
                 &self.provenance,
@@ -508,15 +763,22 @@ impl ParquetStore {
         if manifest.provenance != self.provenance {
             return Err(ParquetError::ProvenanceMismatch);
         }
-        let path = self
-            .existing_partition_parent(&manifest.key()?)?
-            .join(format!("part-{}.part", manifest.partition_id));
-        let actual = read_partition_directory(
-            &path,
-            &self.provenance,
-            &manifest.key()?,
-            &manifest.partition_id,
-        )?;
+        let key = manifest.key()?;
+        let candidates = scan_complete_partition_directories(&self.root, &self.provenance)?;
+        let mut matches = candidates.into_iter().filter(|candidate| {
+            candidate.key == key && candidate.partition_id == manifest.partition_id
+        });
+        let candidate = matches.next().ok_or(ParquetError::MissingPartition {
+            partition_id: manifest.partition_id.clone(),
+        })?;
+        if matches.next().is_some() {
+            return Err(ParquetError::DuplicatePartition {
+                partition_id: manifest.partition_id.clone(),
+            });
+        }
+        let path = candidate.directory;
+        let actual =
+            read_partition_directory(&path, &self.provenance, &key, &manifest.partition_id)?;
         if &actual != manifest {
             return Err(ParquetError::ManifestMismatch {
                 partition_id: manifest.partition_id.clone(),
@@ -539,6 +801,31 @@ impl ParquetStore {
         Ok(imports)
     }
 
+    fn capture_batches_directory(&self) -> Result<PathBuf, ParquetError> {
+        let capture_batches = self.root.join(CAPTURE_BATCHES_DIRECTORY);
+        ensure_private_directory(&capture_batches)?;
+        Ok(capture_batches)
+    }
+
+    fn validate_existing_capture_batch(
+        &self,
+        directory: &Path,
+        expected: &CaptureBatchManifest,
+    ) -> Result<CaptureBatchManifest, ParquetError> {
+        let actual = read_capture_batch_directory(
+            directory,
+            &self.provenance,
+            expected.batch_id(),
+            MAX_PARTITIONS_PER_CAPTURE_BATCH,
+        )?;
+        if &actual != expected {
+            return Err(ParquetError::InvalidCaptureBatch {
+                reason: "existing capture batch does not match the requested commit",
+            });
+        }
+        Ok(actual)
+    }
+
     fn partition_parent(&self, key: &PartitionKey) -> Result<PathBuf, ParquetError> {
         let partitions = self.root.join(PARTITIONS_DIRECTORY);
         ensure_private_directory(&partitions)?;
@@ -551,16 +838,28 @@ impl ParquetStore {
         Ok(market)
     }
 
-    fn existing_partition_parent(&self, key: &PartitionKey) -> Result<PathBuf, ParquetError> {
-        let partitions = self.root.join(PARTITIONS_DIRECTORY);
-        ensure_existing_private_directory(&partitions)?;
-        let date = partitions.join(format!("date={}", key.date));
-        ensure_existing_private_directory(&date)?;
-        let kind = date.join(format!("kind={}", key.event_kind));
-        ensure_existing_private_directory(&kind)?;
-        let market = kind.join(format!("market={}", encode_component(&key.market)));
-        ensure_existing_private_directory(&market)?;
-        Ok(market)
+    fn exact_legacy_partition_retry(
+        &self,
+        expected: &PartitionManifest,
+    ) -> Result<bool, ParquetError> {
+        let key = expected.key()?;
+        let directory = self
+            .root
+            .join(PARTITIONS_DIRECTORY)
+            .join(format!("date={}", key.date))
+            .join(format!("kind={}", key.event_kind))
+            .join(format!("market={}", encode_component(&key.market)))
+            .join(format!("part-{}.part", expected.partition_id));
+        match fs::symlink_metadata(&directory) {
+            Ok(_) => self
+                .validate_existing_partition(&directory, expected)
+                .map(|_| true),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(ParquetError::Filesystem {
+                operation: "inspecting legacy partition retry",
+                source,
+            }),
+        }
     }
 
     fn validate_existing_partition(
@@ -598,6 +897,9 @@ pub enum ParquetError {
     /// A batch would exceed the bounded write contract.
     #[error("event batch has {count} rows, exceeding {limit}")]
     BatchTooLarge { count: usize, limit: usize },
+    /// A capture would create more immutable partitions than one atomic marker can bind.
+    #[error("capture batch has {count} partitions, exceeding {limit}")]
+    CaptureBatchTooLarge { count: usize, limit: usize },
     /// The same normalized event identity was supplied with different facts.
     #[error("conflicting normalized event identity {event_id}")]
     ConflictingEvent { event_id: String },
@@ -607,9 +909,15 @@ pub enum ParquetError {
     /// A complete partition manifest has an unsupported format version.
     #[error("unsupported partition manifest version {actual}")]
     UnsupportedManifestVersion { actual: u8 },
+    /// A capture batch commit marker has an unsupported format version.
+    #[error("unsupported capture batch manifest version {actual}")]
+    UnsupportedCaptureBatchManifestVersion { actual: u8 },
     /// A manifest or Parquet row was malformed or violated a frozen invariant.
     #[error("invalid parquet partition: {reason}")]
     InvalidPartition { reason: &'static str },
+    /// A capture batch marker or its staged membership violated an invariant.
+    #[error("invalid capture batch: {reason}")]
+    InvalidCaptureBatch { reason: &'static str },
     /// A bounded decoded partition input exceeded the frozen resource ceiling.
     #[error("partition resource limit exceeded for {field}")]
     ResourceLimit { field: &'static str },
@@ -619,6 +927,9 @@ pub enum ParquetError {
     /// A final partition did not match the expected content-addressed manifest.
     #[error("partition manifest mismatch for {partition_id}")]
     ManifestMismatch { partition_id: String },
+    /// A committed capture marker referenced a partition that is not present.
+    #[error("committed partition {partition_id} is missing")]
+    MissingPartition { partition_id: String },
     /// Two physical paths named one content-addressed completed partition.
     #[error("duplicate physical partition {partition_id}")]
     DuplicatePartition { partition_id: String },
@@ -814,6 +1125,36 @@ fn deduplicate_events(events: &[MarketEvent]) -> Result<Vec<MarketEvent>, Parque
     Ok(unique.into_values().collect())
 }
 
+fn prepare_event_partitions(
+    events: &[MarketEvent],
+) -> Result<BTreeMap<PartitionKey, Vec<MarketEvent>>, ParquetError> {
+    if events.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    if events.len() > MAX_EVENTS_PER_BATCH {
+        return Err(ParquetError::BatchTooLarge {
+            count: events.len(),
+            limit: MAX_EVENTS_PER_BATCH,
+        });
+    }
+    validate_write_events(events)?;
+    let events = deduplicate_events(events)?;
+    let mut partitions = BTreeMap::<PartitionKey, Vec<MarketEvent>>::new();
+    for event in events {
+        partitions
+            .entry(PartitionKey::from_event(&event))
+            .or_default()
+            .push(event);
+    }
+    Ok(partitions)
+}
+
+struct PreparedPartition {
+    key: PartitionKey,
+    events: Vec<MarketEvent>,
+    manifest: PartitionManifest,
+}
+
 fn write_parquet(path: &Path, events: &[MarketEvent]) -> Result<File, ParquetError> {
     let rows = events
         .iter()
@@ -878,6 +1219,143 @@ fn write_manifest(path: &Path, manifest: &PartitionManifest) -> Result<File, Par
         })?;
     set_private_file_permissions(&file)?;
     Ok(file)
+}
+
+fn write_capture_partition(
+    parent: &Path,
+    partition: &PreparedPartition,
+    failure: Option<CaptureBatchFailure>,
+    partition_index: usize,
+    provenance: &DataProvenance,
+) -> Result<(), ParquetError> {
+    let directory = parent.join(format!("part-{}.part", partition.manifest.partition_id));
+    fs::create_dir(&directory).map_err(|source| ParquetError::Filesystem {
+        operation: "creating staged capture partition directory",
+        source,
+    })?;
+    set_private_permissions(&directory)?;
+    sync_directory(&directory)?;
+    sync_directory(parent)?;
+
+    let event_file = write_parquet(&directory.join(EVENT_FILE), &partition.events)?;
+    if failure == Some(CaptureBatchFailure::BeforePartitionFileSync { partition_index }) {
+        return Err(ParquetError::InjectedFailure);
+    }
+    event_file
+        .sync_all()
+        .map_err(|source| ParquetError::Filesystem {
+            operation: "fsyncing staged capture parquet file",
+            source,
+        })?;
+
+    let manifest_file = write_manifest(&directory.join(MANIFEST_FILE), &partition.manifest)?;
+    if failure == Some(CaptureBatchFailure::BeforePartitionManifestSync { partition_index }) {
+        return Err(ParquetError::InjectedFailure);
+    }
+    manifest_file
+        .sync_all()
+        .map_err(|source| ParquetError::Filesystem {
+            operation: "fsyncing staged capture partition manifest",
+            source,
+        })?;
+    sync_directory(&directory)?;
+    sync_directory(parent)?;
+
+    let validated = read_partition_directory(
+        &directory,
+        provenance,
+        &partition.key,
+        &partition.manifest.partition_id,
+    )?;
+    if validated != partition.manifest {
+        return Err(ParquetError::InvalidCaptureBatch {
+            reason: "staged capture partition changed during validation",
+        });
+    }
+    Ok(())
+}
+
+fn write_capture_batch_manifest(
+    path: &Path,
+    manifest: &CaptureBatchManifest,
+    failure: Option<CaptureBatchFailure>,
+) -> Result<(), ParquetError> {
+    let temporary = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec(manifest)?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|source| ParquetError::Filesystem {
+            operation: "creating temporary capture batch commit marker",
+            source,
+        })?;
+    file.write_all(&bytes)
+        .and_then(|()| file.flush())
+        .map_err(|source| ParquetError::Filesystem {
+            operation: "writing temporary capture batch commit marker",
+            source,
+        })?;
+    set_private_file_permissions(&file)?;
+    if failure == Some(CaptureBatchFailure::BeforeCommitMarkerSync) {
+        return Err(ParquetError::InjectedFailure);
+    }
+    file.sync_all().map_err(|source| ParquetError::Filesystem {
+        operation: "fsyncing temporary capture batch commit marker",
+        source,
+    })?;
+    fs::rename(&temporary, path).map_err(|source| ParquetError::Filesystem {
+        operation: "atomically publishing staged capture batch commit marker",
+        source,
+    })?;
+    sync_parent_directory(path)?;
+    Ok(())
+}
+
+fn read_capture_batch_directory(
+    directory: &Path,
+    expected_provenance: &DataProvenance,
+    physical_batch_id: &str,
+    maximum_members: usize,
+) -> Result<CaptureBatchManifest, ParquetError> {
+    ensure_existing_private_directory(directory)?;
+    let manifest = read_capture_batch_manifest(&directory.join(CAPTURE_BATCH_MANIFEST_FILE))?;
+    if manifest.partitions.len() > maximum_members {
+        return Err(ParquetError::ResourceLimit {
+            field: "discovered partition count",
+        });
+    }
+    manifest.validate()?;
+    if manifest.batch_id != physical_batch_id {
+        return Err(ParquetError::InvalidCaptureBatch {
+            reason: "capture batch identifier does not match its directory",
+        });
+    }
+    if &manifest.provenance != expected_provenance {
+        return Err(ParquetError::ProvenanceMismatch);
+    }
+    for partition in &manifest.partitions {
+        let parent = existing_capture_batch_partition_parent(directory, &partition.key()?)?;
+        let partition_directory = parent.join(format!("part-{}.part", partition.partition_id));
+        let actual = read_partition_directory(
+            &partition_directory,
+            expected_provenance,
+            &partition.key()?,
+            &partition.partition_id,
+        )?;
+        if actual != *partition {
+            return Err(ParquetError::ManifestMismatch {
+                partition_id: partition.partition_id.clone(),
+            });
+        }
+    }
+    Ok(manifest)
+}
+
+fn read_capture_batch_manifest(path: &Path) -> Result<CaptureBatchManifest, ParquetError> {
+    ensure_regular_file(path)?;
+    let bytes = read_bounded_file(path, MAX_CAPTURE_BATCH_MANIFEST_BYTES)?;
+    serde_json::from_slice(&bytes).map_err(ParquetError::Json)
 }
 
 fn read_partition_directory(
@@ -1183,6 +1661,7 @@ struct CompletePartitionDirectory {
 
 fn scan_complete_partition_directories(
     root: &Path,
+    expected_provenance: &DataProvenance,
 ) -> Result<Vec<CompletePartitionDirectory>, ParquetError> {
     let partitions = root.join(PARTITIONS_DIRECTORY);
     ensure_existing_private_directory(&partitions)?;
@@ -1219,13 +1698,9 @@ fn scan_complete_partition_directories(
                         })?
                         .to_owned();
                     validate_digest("partition directory identifier", &partition_id)?;
+                    ensure_discovered_partition_capacity(completed.len(), 1)?;
                     let path = entry.path();
                     ensure_existing_private_directory(&path)?;
-                    if completed.len() == MAX_DISCOVERED_PARTITIONS {
-                        return Err(ParquetError::ResourceLimit {
-                            field: "discovered partition count",
-                        });
-                    }
                     completed.push(CompletePartitionDirectory {
                         directory: path,
                         key: key.clone(),
@@ -1235,8 +1710,131 @@ fn scan_complete_partition_directories(
             }
         }
     }
+    scan_committed_capture_batches(root, expected_provenance, &mut completed)?;
     completed.sort_by(|left, right| left.directory.cmp(&right.directory));
     Ok(completed)
+}
+
+fn scan_committed_capture_batches(
+    root: &Path,
+    expected_provenance: &DataProvenance,
+    completed: &mut Vec<CompletePartitionDirectory>,
+) -> Result<(), ParquetError> {
+    let batches = root.join(CAPTURE_BATCHES_DIRECTORY);
+    match fs::symlink_metadata(&batches) {
+        Ok(_) => ensure_existing_private_directory(&batches)?,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(ParquetError::Filesystem {
+                operation: "inspecting capture batch directory",
+                source,
+            });
+        }
+    }
+
+    for entry in fs::read_dir(&batches).map_err(|source| ParquetError::Filesystem {
+        operation: "scanning capture batch directories",
+        source,
+    })? {
+        let entry = entry.map_err(|source| ParquetError::Filesystem {
+            operation: "reading capture batch directory",
+            source,
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(ParquetError::InvalidCaptureBatch {
+                reason: "capture batch directory name is not valid UTF-8",
+            });
+        };
+        if name.ends_with(".tmp") {
+            continue;
+        }
+        let Some(batch_id) = name
+            .strip_prefix("batch-")
+            .and_then(|name| name.strip_suffix(".batch"))
+        else {
+            continue;
+        };
+        validate_digest("capture batch directory identifier", batch_id)?;
+        ensure_discovered_partition_capacity(completed.len(), 1)?;
+        let directory = entry.path();
+        ensure_existing_private_directory(&directory)?;
+        let manifest = read_capture_batch_directory(
+            &directory,
+            expected_provenance,
+            batch_id,
+            remaining_discovered_partition_capacity(completed.len())?,
+        )?;
+        for partition in manifest.partitions() {
+            ensure_discovered_partition_capacity(completed.len(), 1)?;
+            let key = partition.key()?;
+            let parent = existing_capture_batch_partition_parent(&directory, &key)?;
+            completed.push(CompletePartitionDirectory {
+                directory: parent.join(format!("part-{}.part", partition.partition_id)),
+                key,
+                partition_id: partition.partition_id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn remaining_discovered_partition_capacity(discovered: usize) -> Result<usize, ParquetError> {
+    MAX_DISCOVERED_PARTITIONS
+        .checked_sub(discovered)
+        .ok_or(ParquetError::ResourceLimit {
+            field: "discovered partition count",
+        })
+}
+
+fn ensure_discovered_partition_capacity(
+    discovered: usize,
+    additional: usize,
+) -> Result<(), ParquetError> {
+    if additional > remaining_discovered_partition_capacity(discovered)? {
+        return Err(ParquetError::ResourceLimit {
+            field: "discovered partition count",
+        });
+    }
+    Ok(())
+}
+
+fn capture_batch_directory_name(batch_id: &str, temporary: bool) -> String {
+    if temporary {
+        format!("batch-{batch_id}.batch.tmp")
+    } else {
+        format!("batch-{batch_id}.batch")
+    }
+}
+
+fn capture_batch_partition_parent(
+    capture_batch: &Path,
+    key: &PartitionKey,
+) -> Result<PathBuf, ParquetError> {
+    let partitions = capture_batch.join(PARTITIONS_DIRECTORY);
+    ensure_private_directory(&partitions)?;
+    let date = partitions.join(format!("date={}", key.date));
+    ensure_private_directory(&date)?;
+    let kind = date.join(format!("kind={}", key.event_kind));
+    ensure_private_directory(&kind)?;
+    let market = kind.join(format!("market={}", encode_component(&key.market)));
+    ensure_private_directory(&market)?;
+    Ok(market)
+}
+
+fn existing_capture_batch_partition_parent(
+    capture_batch: &Path,
+    key: &PartitionKey,
+) -> Result<PathBuf, ParquetError> {
+    let partitions = capture_batch.join(PARTITIONS_DIRECTORY);
+    ensure_existing_private_directory(&partitions)?;
+    let date = partitions.join(format!("date={}", key.date));
+    ensure_existing_private_directory(&date)?;
+    let kind = date.join(format!("kind={}", key.event_kind));
+    ensure_existing_private_directory(&kind)?;
+    let market = kind.join(format!("market={}", encode_component(&key.market)));
+    ensure_existing_private_directory(&market)?;
+    Ok(market)
 }
 
 fn partition_key_from_paths(
@@ -1286,6 +1884,44 @@ fn read_managed_directories(parent: &Path, prefix: &str) -> Result<Vec<PathBuf>,
     }
     children.sort();
     Ok(children)
+}
+
+fn cleanup_staged_capture_batches(batches: &Path) -> Result<(), ParquetError> {
+    ensure_existing_private_directory(batches)?;
+    let mut removed = false;
+    for entry in fs::read_dir(batches).map_err(|source| ParquetError::Filesystem {
+        operation: "scanning interrupted capture batches",
+        source,
+    })? {
+        let entry = entry.map_err(|source| ParquetError::Filesystem {
+            operation: "reading interrupted capture batch",
+            source,
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(ParquetError::InvalidCaptureBatch {
+                reason: "temporary capture batch name is not valid UTF-8",
+            });
+        };
+        let Some(batch_id) = name
+            .strip_prefix("batch-")
+            .and_then(|name| name.strip_suffix(".batch.tmp"))
+        else {
+            continue;
+        };
+        validate_digest("temporary capture batch identifier", batch_id)?;
+        let path = entry.path();
+        ensure_existing_private_directory(&path)?;
+        fs::remove_dir_all(&path).map_err(|source| ParquetError::Filesystem {
+            operation: "cleaning interrupted capture batch",
+            source,
+        })?;
+        removed = true;
+    }
+    if removed {
+        sync_directory(batches)?;
+    }
+    Ok(())
 }
 
 fn validate_private_root(path: &Path) -> Result<PathBuf, ParquetError> {
@@ -1939,11 +2575,31 @@ fn required_levels(payload: &Value, field: &'static str) -> Result<Vec<BookLevel
 
 #[cfg(test)]
 mod tests {
-    use super::{DataProvenance, ParquetStore};
+    use super::{
+        DataProvenance, MAX_DISCOVERED_PARTITIONS, ParquetError, ParquetStore,
+        ensure_discovered_partition_capacity,
+    };
 
     #[test]
     fn fixed_arrow_schema_hash_is_a_valid_blake3_commitment() {
         let hash = ParquetStore::schema_hash();
         assert!(DataProvenance::new(hash.clone(), hash.clone(), hash).is_ok());
+    }
+
+    #[test]
+    fn discovered_partition_capacity_rejects_overflow_before_another_read() {
+        assert!(ensure_discovered_partition_capacity(MAX_DISCOVERED_PARTITIONS - 1, 1).is_ok());
+        assert!(matches!(
+            ensure_discovered_partition_capacity(MAX_DISCOVERED_PARTITIONS, 1),
+            Err(ParquetError::ResourceLimit {
+                field: "discovered partition count"
+            })
+        ));
+        assert!(matches!(
+            ensure_discovered_partition_capacity(MAX_DISCOVERED_PARTITIONS - 1, 2),
+            Err(ParquetError::ResourceLimit {
+                field: "discovered partition count"
+            })
+        ));
     }
 }

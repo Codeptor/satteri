@@ -97,6 +97,23 @@ fn replay_merges_partitions_by_event_time_kind_and_event_identity() {
 }
 
 #[test]
+fn replay_reads_capture_partitions_only_after_their_batch_commit() {
+    let root = TempDir::new().expect("temporary root should be created");
+    secure(&root);
+    let store = ParquetStore::open(root.path(), provenance()).expect("store should open");
+    let bbo = bbo(1_000);
+    let trade = trade(1_000, 1);
+
+    store
+        .write_capture_batch(&[trade.clone(), bbo.clone()])
+        .expect("capture should publish");
+
+    let replay = DeterministicReplay::open(root.path(), provenance())
+        .expect("replay should consume the complete capture batch");
+    assert_eq!(replay.events(), &[bbo, trade]);
+}
+
+#[test]
 fn replay_rejects_partitions_from_a_different_frozen_config() {
     let root = TempDir::new().expect("temporary root should be created");
     secure(&root);
