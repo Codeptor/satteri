@@ -356,6 +356,8 @@ pub async fn run(
         .set_ntp_synchronized(local_ntp_synchronized());
     authority.readiness.set_rules_configuration_valid(false);
     authority.readiness.set_rules_sleeve_warm(false);
+    authority.readiness.set_universe_witness_valid(false);
+    authority.readiness.set_risk_witness_valid(false);
     if let Some(error) = rules_startup.error() {
         tracing::warn!(
             reason = %error,
@@ -1566,13 +1568,21 @@ fn observe_feature_source(authority: &mut AuthorityState, event: &MarketEvent) {
     match event.kind() {
         MarketEventKind::Trade(_) => {
             if let Err(error) = authority.candle_aggregator.ingest(event) {
-                authority.feature_faulted = true;
-                tracing::warn!(
-                    market = event.market().as_str(),
-                    event_id = event.event_id().as_str(),
-                    error = %error,
-                    "candle input rejected; rules entries remain fail-closed"
-                );
+                if !matches!(error, trench_core::candle::CandleError::LateTrade { .. }) {
+                    authority.feature_faulted = true;
+                    tracing::warn!(
+                        market = event.market().as_str(),
+                        event_id = event.event_id().as_str(),
+                        error = %error,
+                        "candle input rejected; rules entries remain fail-closed"
+                    );
+                } else {
+                    tracing::debug!(
+                        market = event.market().as_str(),
+                        event_id = event.event_id().as_str(),
+                        "late trade retained as source without revising finalized candles"
+                    );
+                }
                 return;
             }
             match authority
@@ -1580,6 +1590,19 @@ fn observe_feature_source(authority: &mut AuthorityState, event: &MarketEvent) {
                 .complete_through(event.event_time())
             {
                 Ok(candles) => completed = candles,
+                Err(trench_core::candle::CandleError::LateTrade { .. })
+                | Err(trench_core::candle::CandleError::BackwardWatermark { .. }) => {
+                    // Historical capture candles and the public stream can
+                    // legitimately overlap in exchange time. Once a candle
+                    // interval has been finalized, a late trade cannot revise
+                    // the immutable feature candle; retain the source event
+                    // and keep the bounded candle state at its watermark.
+                    tracing::debug!(
+                        market = event.market().as_str(),
+                        event_id = event.event_id().as_str(),
+                        "late trade/candle watermark ignored after immutable finalization"
+                    );
+                }
                 Err(error) => {
                     authority.feature_faulted = true;
                     tracing::warn!(
