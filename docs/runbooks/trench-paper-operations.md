@@ -17,6 +17,21 @@ sudo /opt/trenchbot/current/deploy/scripts/smoke-test.sh \
   --config /etc/trenchbot/paper.toml --json
 ```
 
+The checked-in daemon's authoritative readiness transport is the private Unix
+status socket. Loopback health/metrics and writer-owned backup/retention
+commands are optional smoke gates until those daemon features are installed.
+Require them explicitly only for a release that advertises them:
+
+```sh
+sudo /opt/trenchbot/current/deploy/scripts/smoke-test.sh \
+  --config /etc/trenchbot/paper.toml --socket /run/trenchbot/admin.sock \
+  --require-health --require-maintenance --json
+```
+
+The backup/retention units are scaffolding in this phase; their timers must
+not be treated as evidence of a completed backup policy while the installed
+binary does not expose the corresponding writer-owned admin commands.
+
 `health/live` means the process event loop responds. `health/ready` is an
 entry-readiness signal: a `503` is an explicit blocker, not evidence that a
 mandatory exit may be abandoned. Inspect readiness reason codes and the

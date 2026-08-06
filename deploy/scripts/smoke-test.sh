@@ -8,6 +8,8 @@ set -euo pipefail
 config=/etc/trenchbot/paper.toml
 socket=/run/trenchbot/admin.sock
 json_only=0
+require_health=0
+require_maintenance=0
 while (($# > 0)); do
     case "$1" in
         --config)
@@ -20,9 +22,11 @@ while (($# > 0)); do
             socket=$2
             shift
             ;;
+        --require-health) require_health=1 ;;
+        --require-maintenance) require_maintenance=1 ;;
         --json) json_only=1 ;;
         --help)
-            printf 'usage: %s [--config ABSOLUTE_PATH] [--socket ABSOLUTE_PATH] [--json]\n' "$0"
+            printf 'usage: %s [--config ABSOLUTE_PATH] [--socket ABSOLUTE_PATH] [--require-health] [--require-maintenance] [--json]\n' "$0"
             exit 0
             ;;
         *)
@@ -71,6 +75,30 @@ else
     record config 0 'config must be an existing absolute file'
 fi
 
+rules_mode=''
+if [[ -f "$config" ]]; then
+    rules_mode=$(awk '
+        /^[[:space:]]*\[/ {
+            section=$0
+            next
+        }
+        section == "[rules]" && /^[[:space:]]*mode[[:space:]]*=/ {
+            value=$0
+            sub(/^[^=]*=[[:space:]]*/, "", value)
+            sub(/[[:space:]]+#.*$/, "", value)
+            gsub(/[[:space:]]+$/, "", value)
+            gsub(/^"|"$/, "", value)
+            print value
+            exit
+        }
+    ' "$config" 2>/dev/null || true)
+fi
+if [[ "$rules_mode" == collect_only ]]; then
+    record rules_mode 1 collect_only
+else
+    record rules_mode 0 "${rules_mode:-missing} (requires collect_only)"
+fi
+
 if [[ "$socket" == /* && "$socket" == *.sock ]]; then
     record admin_socket 1 "$socket"
 else
@@ -106,7 +134,13 @@ fi
 
 live_status=none
 ready_status=none
-if command -v curl >/dev/null 2>&1; then
+health_probe=0
+if command -v ss >/dev/null 2>&1; then
+    if ss --listening --numeric --tcp 2>/dev/null | awk '$0 ~ /:9464([[:space:]]|$)/ {found=1} END {exit !found}'; then
+        health_probe=1
+    fi
+fi
+if ((require_health == 1 || health_probe == 1)) && command -v curl >/dev/null 2>&1; then
     if live_status=$(curl --silent --show-error --output /dev/null --connect-timeout 2 --max-time 5 \
         --write-out '%{http_code}' http://127.0.0.1:9464/health/live 2>/dev/null); then
         :
@@ -122,8 +156,13 @@ if command -v curl >/dev/null 2>&1; then
 fi
 [[ "$live_status" == 200 ]] && live_ok=1 || live_ok=0
 [[ "$ready_status" == 200 || "$ready_status" == 503 ]] && ready_ok=1 || ready_ok=0
-record health_live "$live_ok" "HTTP $live_status"
-record health_ready "$ready_ok" "HTTP $ready_status (503 is an explicit entry blocker)"
+if ((require_health == 1 || health_probe == 1)); then
+    record health_live "$live_ok" "HTTP $live_status"
+    record health_ready "$ready_ok" "HTTP $ready_status (503 is an explicit entry blocker)"
+else
+    record health_live 1 'optional endpoint not configured; Unix status remains authoritative'
+    record health_ready 1 'optional endpoint not configured; Unix status remains authoritative'
+fi
 
 listener_ok=0
 listener=''
@@ -133,8 +172,12 @@ if command -v ss >/dev/null 2>&1; then
         listener_ok=1
     fi
 fi
-record loopback_listener "$listener_ok" \
-    "$([[ "$listener_ok" == 1 ]] && printf 127.0.0.1:9464 || printf 'missing or non-loopback listener')"
+if ((require_health == 1 || health_probe == 1)); then
+    record loopback_listener "$listener_ok" \
+        "$([[ "$listener_ok" == 1 ]] && printf 127.0.0.1:9464 || printf 'missing or non-loopback listener')"
+else
+    record loopback_listener 1 'optional endpoint not configured'
+fi
 
 status_ok=0
 status_detail='status request failed'
@@ -158,14 +201,18 @@ else
     record failed_units 0 'one or more systemd units are failed'
 fi
 
-timers_ok=0
-if command -v systemctl >/dev/null 2>&1 \
-    && systemctl is-active --quiet trench-backup.timer 2>/dev/null \
-    && systemctl is-active --quiet trench-retention.timer 2>/dev/null; then
-    timers_ok=1
+if ((require_maintenance == 1)); then
+    timers_ok=0
+    if command -v systemctl >/dev/null 2>&1 \
+        && systemctl is-active --quiet trench-backup.timer 2>/dev/null \
+        && systemctl is-active --quiet trench-retention.timer 2>/dev/null; then
+        timers_ok=1
+    fi
+    record maintenance_timers "$timers_ok" \
+        "$([[ "$timers_ok" == 1 ]] && printf active || printf 'backup/retention timer not active')"
+else
+    record maintenance_timers 1 'optional until writer-owned backup/retention commands are installed'
 fi
-record maintenance_timers "$timers_ok" \
-    "$([[ "$timers_ok" == 1 ]] && printf active || printf 'backup/retention timer not active')"
 
 paths_ok=1
 for path in /var/lib/trenchbot /var/lib/trenchbot/sqlite /var/lib/trenchbot/parquet /var/backups/trenchbot /run/trenchbot; do

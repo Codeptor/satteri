@@ -13,6 +13,15 @@ setup() {
     [ "$status" -eq 0 ]
 }
 
+@test "smoke test keeps optional gates explicit" {
+    run rg -q -- '--require-health' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run rg -q -- '--require-maintenance' "$SCRIPT"
+    [ "$status" -eq 0 ]
+    run rg -q 'requires collect_only' "$SCRIPT"
+    [ "$status" -eq 0 ]
+}
+
 @test "smoke test rejects an absent activation" {
     run "$SCRIPT" --json --config /nonexistent/trench.toml
     [ "$status" -ne 0 ]
