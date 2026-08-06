@@ -272,7 +272,9 @@ impl Default for WsLimits {
             reconnect_min_delay: MIN_RECONNECT_DELAY,
             reconnect_max_delay: Duration::from_secs(30),
             max_reconnect_attempts: 20,
-            max_inbound_message_bytes: 64 * 1024,
+            // A full native L2 snapshot can exceed 64 KiB while remaining
+            // inside the decoder's bounded 20-level-per-side contract.
+            max_inbound_message_bytes: 256 * 1024,
             output_channel_capacity: 128,
             max_trade_identities: DEFAULT_MAX_TRADE_IDENTITIES,
         }

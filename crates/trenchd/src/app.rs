@@ -1749,10 +1749,31 @@ async fn admit_market_event(
             .position()
             .map(|position| position.market().clone())
     });
-    match authority
+    let route = match authority
         .router
-        .route_market_event(event, open_position_market.as_ref())?
+        .route_market_event(event, open_position_market.as_ref())
     {
+        Ok(route) => route,
+        Err(RoutingError::Book(trench_core::book::BookError::Stale { .. })) => {
+            // A reconnect can deliver a snapshot whose venue timestamp is
+            // already outside the one-second executable freshness bound.
+            // Keep its immutable source evidence and continue; the next
+            // fresh snapshot can establish the market book without killing
+            // the authority loop.
+            admit_typed_engine_event(
+                writer,
+                authority,
+                TypedEngineEvent::SourceRetained {
+                    source: committed_source.clone(),
+                },
+            )
+            .await?;
+            observe_feature_source(authority, &committed_source);
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    match route {
         MarketRoute::Engine(events) => {
             for event in events {
                 admit_typed_engine_event(writer, authority, event).await?;
