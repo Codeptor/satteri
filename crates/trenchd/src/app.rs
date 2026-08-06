@@ -348,20 +348,43 @@ pub async fn run(
     authority
         .readiness
         .set_ntp_synchronized(local_ntp_synchronized());
-    authority.readiness.set_rules_configuration_valid(false);
-    authority.readiness.set_rules_sleeve_warm(false);
-    authority.readiness.set_universe_witness_valid(false);
-    authority.readiness.set_risk_witness_valid(false);
-    if let Some(error) = rules_startup.error() {
-        tracing::warn!(
-            reason = %error,
-            "rules are unready; keeping collection and mandatory-exit paths available"
-        );
+    match &rules_startup {
+        RulesStartup::Ready => {
+            authority.readiness.set_rules_configuration_valid(true);
+            authority.readiness.set_universe_witness_valid(true);
+            authority.readiness.set_risk_witness_valid(true);
+            authority.readiness.set_rules_sleeve_warm(true);
+            tracing::info!(
+                mode = ?mode,
+                execution_enabled = true,
+                "execution_enabled: rules artifact valid; reactor armed"
+            );
+        }
+        RulesStartup::CollectOnly => {
+            authority.readiness.set_rules_configuration_valid(false);
+            authority.readiness.set_rules_sleeve_warm(false);
+            authority.readiness.set_universe_witness_valid(false);
+            authority.readiness.set_risk_witness_valid(false);
+            tracing::info!(
+                mode = ?mode,
+                "entry reactor is sealed collection-only; missing recovery evidence keeps execution fenced"
+            );
+        }
+        RulesStartup::Unready(error) => {
+            authority.readiness.set_rules_configuration_valid(false);
+            authority.readiness.set_rules_sleeve_warm(false);
+            authority.readiness.set_universe_witness_valid(false);
+            authority.readiness.set_risk_witness_valid(false);
+            tracing::warn!(
+                reason = %error,
+                "rules are unready; keeping collection and mandatory-exit paths available"
+            );
+            tracing::info!(
+                mode = ?mode,
+                "entry reactor is sealed collection-only; missing recovery evidence keeps execution fenced"
+            );
+        }
     }
-    tracing::info!(
-        mode = ?mode,
-        "entry reactor is sealed collection-only; missing recovery evidence keeps execution fenced"
-    );
     let cancellation = CancellationToken::new();
     let recovery_client = InfoClient::new(config.endpoints().info_url())?;
     let (recovery_sender, recovery_receiver) = mpsc::channel(RECOVERY_CHANNEL_CAPACITY);
@@ -460,7 +483,7 @@ pub async fn run(
                             run_id: writer.run_id().to_owned(),
                             reconciled: authority.reconciled,
                             mode: mode.into(),
-                            execution_enabled: false,
+                            execution_enabled: matches!(&rules_startup, RulesStartup::Ready),
                             readiness: authority.readiness.snapshot(),
                         });
                     }

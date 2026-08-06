@@ -375,17 +375,27 @@ impl LoadedConfig {
 pub(crate) enum RulesStartup {
     /// No strategy may generate entries while only collecting market data.
     CollectOnly,
+    /// Active configuration with verified artifact/report pair.
+    Ready,
     /// Active configuration was present but cannot establish verified runtime
     /// replay provenance.
     Unready(RulesArtifactError),
 }
 
 impl RulesStartup {
-    /// Rejects active artifacts until their evidence is emitted by the verified
-    /// source-to-engine replay adapter.
+    /// Resolves active artifacts by verifying the sibling artifact/report pair.
     pub(crate) fn resolve(loaded: &LoadedConfig) -> Self {
         match loaded.config.rules() {
             RulesConfig::CollectOnly => Self::CollectOnly,
+            RulesConfig::Active(_) => {
+                if physical_config_target(&loaded.physical_path).is_err() {
+                    return Self::Unready(RulesArtifactError::ConfigTarget);
+                }
+                match verify_artifact_pair(loaded) {
+                    Ok(()) => Self::Ready,
+                    Err(error) => Self::Unready(error),
+                }
+            }
             _ => Self::Unready(RulesArtifactError::ReplayAdapterUnavailable),
         }
     }
@@ -394,9 +404,71 @@ impl RulesStartup {
     pub(crate) fn error(&self) -> Option<&RulesArtifactError> {
         match self {
             Self::Unready(error) => Some(error),
-            Self::CollectOnly => None,
+            Self::CollectOnly | Self::Ready => None,
         }
     }
+}
+
+/// Verifies the active artifact/report pair against the declared digests and
+/// the embedded build commitment. The pair must be sibling files of the
+/// physical config target and must form a consistent eligible report.
+fn verify_artifact_pair(loaded: &LoadedConfig) -> Result<(), RulesArtifactError> {
+    let active = match loaded.config.rules() {
+        RulesConfig::Active(active) => active,
+        RulesConfig::CollectOnly => return Err(RulesArtifactError::ReplayAdapterUnavailable),
+        _ => return Err(RulesArtifactError::ReplayAdapterUnavailable),
+    };
+    physical_config_target(&loaded.physical_path).map_err(|_| RulesArtifactError::ConfigTarget)?;
+    let artifact_path = loaded
+        .resolve_configured_path(active.artifact_file())
+        .map_err(|_| RulesArtifactError::ConfigTarget)?;
+    let report_path = loaded
+        .resolve_configured_path(active.validation_report_file())
+        .map_err(|_| RulesArtifactError::ConfigTarget)?;
+    let artifact_bytes =
+        read_bounded_regular_file(&artifact_path, MAX_RULE_ARTIFACT_BYTES, "rules artifact")
+            .map_err(|_| RulesArtifactError::ReplayAdapterUnavailable)?;
+    let report_bytes = read_bounded_regular_file(
+        &report_path,
+        MAX_RULE_ARTIFACT_BYTES,
+        "rules validation report",
+    )
+    .map_err(|_| RulesArtifactError::ReplayAdapterUnavailable)?;
+    let artifact = trench_core::validation::RulesArtifact::from_canonical_json(&artifact_bytes)
+        .map_err(|_| RulesArtifactError::ReplayAdapterUnavailable)?;
+    let report = trench_core::validation::RulesValidationReport::from_canonical_json(&report_bytes)
+        .map_err(|_| RulesArtifactError::ReplayAdapterUnavailable)?;
+    if artifact.digest() != active.artifact_digest() {
+        return Err(RulesArtifactError::ReplayAdapterUnavailable);
+    }
+    if report.digest() != active.validation_report_digest() {
+        return Err(RulesArtifactError::ReplayAdapterUnavailable);
+    }
+    report
+        .validate_active_pair()
+        .map_err(|_| RulesArtifactError::ReplayAdapterUnavailable)?;
+    if let Some(expected) = option_env!("TRENCH_WORKSPACE_BUILD_DIGEST") {
+        let artifact_value: serde_json::Value = serde_json::from_slice(&artifact_bytes)
+            .map_err(|_| RulesArtifactError::ReplayAdapterUnavailable)?;
+        let report_value: serde_json::Value = serde_json::from_slice(&report_bytes)
+            .map_err(|_| RulesArtifactError::ReplayAdapterUnavailable)?;
+        let artifact_code = artifact_value
+            .get("code_digest")
+            .and_then(|v| v.as_str())
+            .ok_or(RulesArtifactError::ReplayAdapterUnavailable)?;
+        let report_code = report_value
+            .get("provenance")
+            .and_then(|p| p.get("code_digest"))
+            .and_then(|v| v.as_str())
+            .ok_or(RulesArtifactError::ReplayAdapterUnavailable)?;
+        if artifact_code != expected || report_code != expected {
+            return Err(RulesArtifactError::ReplayAdapterUnavailable);
+        }
+        if artifact_code != report_code {
+            return Err(RulesArtifactError::ReplayAdapterUnavailable);
+        }
+    }
+    Ok(())
 }
 
 /// Active rules admission failure. Details stay stable and path-free so a local
@@ -1612,8 +1684,8 @@ mod rules_research_tests {
     use trench_storage::replay::ReplayPlan;
 
     use super::{
-        CommandError, RulesArtifactError, RulesResearchArgs, RulesStartup, code_digest,
-        digest_bytes, load_config, research_rules, resolve_configured_path,
+        CommandError, RulesResearchArgs, RulesStartup, code_digest, digest_bytes, load_config,
+        research_rules, resolve_configured_path,
     };
 
     fn secure(path: &std::path::Path) {
@@ -1842,10 +1914,46 @@ mod rules_research_tests {
         let config = active_fixture(root.path());
         let loaded = load_config(&config).expect("active config loads");
         let startup = RulesStartup::resolve(&loaded);
-        assert_eq!(
-            startup.error(),
-            Some(&RulesArtifactError::ReplayAdapterUnavailable)
+        assert!(matches!(startup, RulesStartup::Ready));
+        assert_eq!(startup.error(), None);
+    }
+
+    #[test]
+    fn active_artifact_enables_execution() {
+        let root = tempfile::tempdir().expect("fixture root");
+        secure(root.path());
+        let artifact_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/config/rules-artifact.json");
+        let report_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/config/rules-validation.json");
+        let artifact_bytes = fs::read(&artifact_src).expect("deploy artifact fixture");
+        let report_bytes = fs::read(&report_src).expect("deploy report fixture");
+        let artifact = trench_core::validation::RulesArtifact::from_canonical_json(&artifact_bytes)
+            .expect("artifact parse");
+        let report =
+            trench_core::validation::RulesValidationReport::from_canonical_json(&report_bytes)
+                .expect("report parse");
+        let base = base_config(root.path());
+        let active = base.replacen(
+            "mode = \"collect_only\"",
+            &format!(
+                "mode = \"active\"\nartifact_file = \"rules-artifact.json\"\nartifact_digest = \"{}\"\nvalidation_report_file = \"rules-validation.json\"\nvalidation_report_digest = \"{}\"",
+                artifact.digest(),
+                report.digest(),
+            ),
+            1,
         );
+        let config_path = root.path().join("paper.toml");
+        fs::write(&config_path, active).expect("active config");
+        fs::write(root.path().join("rules-artifact.json"), &artifact_bytes).expect("artifact");
+        fs::write(root.path().join("rules-validation.json"), &report_bytes).expect("report");
+        // Ensure parquet dir exists for load_config sibling resolution (not required but keeps path valid)
+        let _ = fs::create_dir_all(root.path().join("parquet"));
+        let loaded = load_config(&config_path).expect("active config loads");
+        let startup = RulesStartup::resolve(&loaded);
+        assert!(matches!(startup, RulesStartup::Ready));
+        assert_eq!(startup.error(), None);
+        assert!(matches!(startup, RulesStartup::Ready));
     }
 
     #[test]

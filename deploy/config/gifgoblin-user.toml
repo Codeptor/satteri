@@ -43,6 +43,6 @@ fixed_fee_bps_per_side = "7.5"
 [rules]
 mode = "active"
 artifact_file = "rules-artifact.json"
-artifact_digest = "b3:b43a0745957e8923e69a8bddde0da2257aa000d411b3a9677ddde8585d143c73"
+artifact_digest = "b3:9d8d15f9cdb16c0dbac4f9ed64e901a64736108c6c96aed0a8d032bc15094e22"
 validation_report_file = "rules-validation.json"
-validation_report_digest = "b3:d04c50a166ce2f390a614ce78f9ac47a79cce00dca3e952af13b3121218f7a22"
+validation_report_digest = "b3:ba3199589eadc5d433ac25edb68c6740c0e4c194bd1ef270e6a09aa29b9be832"
