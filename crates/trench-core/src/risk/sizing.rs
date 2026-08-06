@@ -476,7 +476,10 @@ impl RiskSnapshot {
 }
 
 fn is_blake3_digest(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Fully frozen inputs for one risk quote calculation.
@@ -2276,6 +2279,16 @@ mod tests {
         let policy = request(costs(), dec!(0.5)).into_policy();
         let text = String::from_utf8(policy.canonical_json().expect("canonical wire"))
             .expect("UTF-8 JSON");
+
+        let uppercase_book_digest = text.replace(
+            &format!("\"book_digest\":\"{}\"", "b".repeat(64)),
+            &format!("\"book_digest\":\"{}\"", "B".repeat(64)),
+        );
+        assert_ne!(uppercase_book_digest, text);
+        assert_eq!(
+            super::RiskPolicy::from_canonical_json(uppercase_book_digest.as_bytes()),
+            Err(RiskPolicyWireError::InvalidDigest)
+        );
 
         let noncanonical_decimal = text.replace(
             "\"entry_fee_fraction\":\"0.00075\"",
