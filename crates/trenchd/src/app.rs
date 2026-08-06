@@ -5,6 +5,7 @@ use std::future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use sd_notify::{NotifyState, notify, watchdog_enabled};
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -411,6 +412,11 @@ pub async fn run(
     let (authority_sender, mut authority_receiver) = authority_channel();
     let admin_cancellation = cancellation.clone();
     let admin_task = tokio::spawn(server.serve(authority_sender, admin_cancellation));
+    let watchdog_task = tokio::spawn(systemd_watchdog(cancellation.clone()));
+    notify_systemd(&[
+        NotifyState::Ready,
+        NotifyState::Status("collection-only authority ready"),
+    ]);
 
     let stop = stop_signal(duration);
     tokio::pin!(stop);
@@ -600,6 +606,7 @@ pub async fn run(
     }
 
     cancellation.cancel();
+    notify_systemd(&[NotifyState::Stopping]);
     drop(capture_sender);
     drop(recovery_sender);
     if let Some(stream) = authority.live.stream.take() {
@@ -611,6 +618,7 @@ pub async fn run(
         admit_recovery_output(&mut writer, &mut authority, output).await?;
     }
     admin_task.await.map_err(AppError::AdminTaskJoin)??;
+    watchdog_task.await.map_err(AppError::WatchdogTaskJoin)?;
     let counts = writer.journal_counts().await?;
     tracing::info!(
         run_id = writer.run_id(),
@@ -620,6 +628,31 @@ pub async fn run(
         "daemon shutdown completed after durable journal checkpoint"
     );
     Ok(())
+}
+
+fn notify_systemd(states: &[NotifyState<'_>]) {
+    if let Err(error) = notify(states) {
+        tracing::warn!(error = %error, "systemd notification failed");
+    }
+}
+
+async fn systemd_watchdog(cancellation: CancellationToken) {
+    let Some(period) = watchdog_enabled() else {
+        cancellation.cancelled().await;
+        return;
+    };
+    let interval = period
+        .checked_div(2)
+        .unwrap_or(Duration::from_secs(1))
+        .max(Duration::from_secs(1));
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = cancellation.cancelled() => return,
+            _ = ticker.tick() => notify_systemd(&[NotifyState::Watchdog]),
+        }
+    }
 }
 
 /// Opens one explicit Task-14 replay plan without SQLite, network, or mutation.
@@ -1871,6 +1904,9 @@ pub enum AppError {
     /// The admin task panicked or was cancelled outside the daemon shutdown path.
     #[error("admin task join failed")]
     AdminTaskJoin(#[source] tokio::task::JoinError),
+    /// The systemd watchdog task panicked or was cancelled outside shutdown.
+    #[error("systemd watchdog task join failed")]
+    WatchdogTaskJoin(#[source] tokio::task::JoinError),
     /// The only authority request channel was closed before shutdown.
     #[error("admin authority channel closed unexpectedly")]
     AuthorityChannelClosed,

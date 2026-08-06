@@ -16,6 +16,7 @@ serde.workspace = true
 serde_json.workspace = true
 rustix.workspace = true
 rust_decimal.workspace = true
+sd-notify.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
