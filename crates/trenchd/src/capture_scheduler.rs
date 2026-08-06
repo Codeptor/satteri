@@ -5,21 +5,17 @@ use std::time::Duration;
 use thiserror::Error;
 use trench_core::domain::Market;
 use trench_core::event::TimestampNs;
-use trench_hyperliquid::{
-    ContextCaptureError, ContextCaptureRequest, MAX_CONTEXT_EVENTS, MAX_CONTEXT_FUNDING_RECORDS,
-    MAX_CONTEXT_MARKETS, TimeRange,
-};
+use trench_hyperliquid::{ContextCaptureError, ContextCaptureRequest, TimeRange};
 
 const MILLISECOND_NS: i64 = 1_000_000;
 const FIFTEEN_MINUTES_MS: i64 = 15 * 60 * 1_000;
 const HOUR_MS: i64 = 60 * 60 * 1_000;
-const METADATA_EVENT_BUDGET: usize = MAX_CONTEXT_MARKETS * 3;
-const DETAILED_MARKET_EVENT_BUDGET: usize = MAX_CONTEXT_FUNDING_RECORDS + 4;
-
-/// Largest detailed rotating scope which remains valid even when every market
-/// returns the full bounded funding history.
-pub(crate) const MAX_SCHEDULED_DETAILED_MARKETS: usize =
-    (MAX_CONTEXT_EVENTS - METADATA_EVENT_BUDGET) / DETAILED_MARKET_EVENT_BUDGET;
+const DAY_MS: i64 = 24 * HOUR_MS;
+const FIFTEEN_MINUTE_HISTORY_DAYS: i64 = 30;
+const HOURLY_HISTORY_DAYS: i64 = 90;
+/// Historical candles dominate the capture budget. Keep each batch bounded
+/// while rotating the complete dynamic universe across successive captures.
+const MAX_HISTORICAL_DETAILED_MARKETS: usize = 7;
 
 /// One deterministic, single-flight public-context schedule.
 #[derive(Debug, Clone)]
@@ -74,15 +70,17 @@ impl CaptureScheduler {
         if self.in_flight() {
             return Ok(None);
         }
-        let count = self.markets.len().min(MAX_SCHEDULED_DETAILED_MARKETS);
+        let count = self.markets.len().min(MAX_HISTORICAL_DETAILED_MARKETS);
         let detailed_markets = (0..count)
             .map(|offset| self.markets[(self.next_market + offset) % self.markets.len()].clone())
             .collect::<Vec<_>>();
         let now_ms = scheduled_at.value().div_euclid(MILLISECOND_NS);
-        let fifteen_minutes = completed_window(now_ms, FIFTEEN_MINUTES_MS)?;
-        let hourly = completed_window(now_ms, HOUR_MS)?;
+        let fifteen_minutes =
+            completed_history_window(now_ms, FIFTEEN_MINUTES_MS, FIFTEEN_MINUTE_HISTORY_DAYS)?;
+        let hourly = completed_history_window(now_ms, HOUR_MS, HOURLY_HISTORY_DAYS)?;
+        let funding = completed_history_window(now_ms, HOUR_MS, FIFTEEN_MINUTE_HISTORY_DAYS)?;
         let request =
-            ContextCaptureRequest::new(detailed_markets, fifteen_minutes, hourly, hourly)?;
+            ContextCaptureRequest::new(detailed_markets, fifteen_minutes, hourly, funding)?;
         self.in_flight = Some(count);
         Ok(Some(request))
     }
@@ -99,16 +97,24 @@ impl CaptureScheduler {
     }
 }
 
-fn completed_window(now_ms: i64, interval_ms: i64) -> Result<TimeRange, CaptureScheduleError> {
+fn completed_history_window(
+    now_ms: i64,
+    interval_ms: i64,
+    history_days: i64,
+) -> Result<TimeRange, CaptureScheduleError> {
     let completed_boundary = now_ms
         .div_euclid(interval_ms)
         .checked_mul(interval_ms)
         .ok_or(CaptureScheduleError::TimestampOutOfRange)?;
-    let start_ms = completed_boundary
-        .checked_sub(interval_ms)
-        .ok_or(CaptureScheduleError::TimestampOutOfRange)?;
     let end_ms = completed_boundary
         .checked_sub(1)
+        .ok_or(CaptureScheduleError::TimestampOutOfRange)?;
+    let history_ms = interval_ms
+        .checked_mul(history_days)
+        .and_then(|days| days.checked_mul(DAY_MS / HOUR_MS))
+        .ok_or(CaptureScheduleError::TimestampOutOfRange)?;
+    let start_ms = completed_boundary
+        .checked_sub(history_ms)
         .ok_or(CaptureScheduleError::TimestampOutOfRange)?;
     TimeRange::new(start_ms, end_ms).map_err(CaptureScheduleError::Range)
 }
@@ -138,7 +144,7 @@ mod tests {
     use trench_core::domain::Market;
     use trench_core::event::TimestampNs;
 
-    use super::{CaptureScheduler, HOUR_MS, MAX_SCHEDULED_DETAILED_MARKETS, cadence};
+    use super::{CaptureScheduler, DAY_MS, HOUR_MS, MAX_HISTORICAL_DETAILED_MARKETS, cadence};
 
     fn market(value: &str) -> Market {
         Market::new(value).expect("fixture market")
@@ -152,7 +158,7 @@ mod tests {
     fn scheduler_uses_only_closed_windows_at_its_explicit_timer_boundary() {
         let mut scheduler = CaptureScheduler::new(vec![market("BTC")]);
         let request = scheduler
-            .dispatch(timestamp_ms(HOUR_MS * 2 + 123))
+            .dispatch(timestamp_ms(DAY_MS * 100 + HOUR_MS * 2 + 123))
             .expect("scheduled capture request")
             .expect("first timer tick must dispatch");
 
@@ -163,17 +169,17 @@ mod tests {
 
     #[test]
     fn scheduler_is_single_flight_and_rotates_only_after_persistence() {
-        let markets = (0..=MAX_SCHEDULED_DETAILED_MARKETS)
+        let markets = (0..=MAX_HISTORICAL_DETAILED_MARKETS)
             .map(|index| market(&format!("M{index:02}")))
             .collect::<Vec<_>>();
         let mut scheduler = CaptureScheduler::new(markets.clone());
         let first = scheduler
-            .dispatch(timestamp_ms(HOUR_MS * 2))
+            .dispatch(timestamp_ms(DAY_MS * 100 + HOUR_MS * 2))
             .expect("first request")
             .expect("first request dispatches");
         assert_eq!(
             scheduler
-                .dispatch(timestamp_ms(HOUR_MS * 3))
+                .dispatch(timestamp_ms(DAY_MS * 100 + HOUR_MS * 3))
                 .expect("contended tick"),
             None,
             "the timer cannot overlap a capture worker"
@@ -181,14 +187,14 @@ mod tests {
 
         scheduler.complete(false);
         let retry = scheduler
-            .dispatch(timestamp_ms(HOUR_MS * 3))
+            .dispatch(timestamp_ms(DAY_MS * 100 + HOUR_MS * 3))
             .expect("retry request")
             .expect("failed capture is retried before rotating");
         assert_eq!(first.detailed_markets(), retry.detailed_markets());
 
         scheduler.complete(true);
         let rotated = scheduler
-            .dispatch(timestamp_ms(HOUR_MS * 4))
+            .dispatch(timestamp_ms(DAY_MS * 100 + HOUR_MS * 4))
             .expect("rotated request")
             .expect("next successful timer tick");
         assert_ne!(first.detailed_markets(), rotated.detailed_markets());
