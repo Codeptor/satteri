@@ -1,0 +1,38 @@
+[Unit]
+Description=Trench bounded raw-book retention request
+After=trenchd.service
+Requires=trenchd.service
+PartOf=trenchbot.slice
+
+[Service]
+Type=oneshot
+User=trenchbot
+Group=trenchbot
+UMask=0077
+Slice=trenchbot.slice
+# Fenced and journaled by the authority; no direct Parquet or SQLite access.
+ExecStart=/usr/bin/env -- /opt/trenchbot/current/bin/trenchd compact --config /etc/trenchbot/paper.toml
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RemoveIPC=yes
+SystemCallArchitectures=native
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+DevicePolicy=closed
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/var/lib/trenchbot /run/trenchbot
+TimeoutStartSec=30min

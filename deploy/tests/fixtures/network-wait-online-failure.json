@@ -1,0 +1,12 @@
+{
+  "fixture": "generic-route-pending-failure",
+  "schema_version": 1,
+  "primary_link": "redacted-primary-link",
+  "networkd_operational_state": "configuring",
+  "default_route": "present-pending",
+  "dns": "reachable",
+  "tls": "reachable",
+  "wait_online_unit": "failed",
+  "diagnostic": "inspect the exact netplan/networkd route declaration",
+  "acceptance": "link reports configured and wait-online is active after the evidenced route correction"
+}

@@ -1,0 +1,10 @@
+[Unit]
+Description=Trench paper-bot resource boundary
+
+[Slice]
+# Resource controls enable the corresponding accounting on current systemd;
+# explicit *Accounting= keys are deprecated for slice units.
+CPUQuota=300%
+MemoryHigh=3G
+MemoryMax=4G
+TasksMax=512

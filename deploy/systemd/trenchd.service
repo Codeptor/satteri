@@ -1,0 +1,54 @@
+[Unit]
+Description=Trench paper market-data authority
+Documentation=https://github.com/Codeptor/satteri
+Wants=network-online.target
+After=network-online.target
+PartOf=trenchbot.slice
+StartLimitIntervalSec=5min
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=trenchbot
+Group=trenchbot
+UMask=0077
+Slice=trenchbot.slice
+ExecStart=/usr/bin/env -- /opt/trenchbot/current/bin/trenchd run --config /etc/trenchbot/paper.toml
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=2min
+TimeoutStopSec=30s
+WatchdogSec=30s
+LimitNOFILE=65536
+
+# Public read-only HTTPS/WSS plus the private Unix admin socket only.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectKernelLogs=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RemoveIPC=yes
+SystemCallArchitectures=native
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+DevicePolicy=closed
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/trenchbot /var/backups/trenchbot /run/trenchbot
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

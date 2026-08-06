@@ -1,0 +1,19 @@
+{
+  "fixture": "redacted-success-contract",
+  "schema_version": 1,
+  "architecture": "x86_64",
+  "os": "Ubuntu 24.04",
+  "vcpu_count": 4,
+  "memory_gib": 8,
+  "root_filesystem": "ext4",
+  "free_disk_gib": 80,
+  "ntp_synchronized": true,
+  "default_route": true,
+  "dns": true,
+  "tls": true,
+  "metrics_port_9464": "free",
+  "failed_units": [],
+  "networkd_wait_online": "active",
+  "python": "3.12",
+  "libgomp": true
+}
