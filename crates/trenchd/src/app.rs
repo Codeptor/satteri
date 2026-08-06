@@ -11,11 +11,12 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use trench_core::broker::{BrokerConfig, BrokerRunContext, PaperBroker};
-use trench_core::candle::CandleAggregator;
+use trench_core::candle::{Candle, CandleAggregator};
 use trench_core::config::PaperConfig;
 use trench_core::domain::{EventId, LedgerId, Market, RunId, Usdc};
 use trench_core::engine::{Engine, EngineContext, EngineError, EnginePersistenceKind, EngineState};
 use trench_core::event::{DurationNs, MarketEvent, MarketEventKind, TimestampNs};
+use trench_core::features::common::CommonFeatureEngine;
 use trench_core::ledger::LedgerState;
 use trench_hyperliquid::{
     ContextCapture, ContextCaptureBatch, ContextCaptureError, ContextCaptureRequest, GapEvent,
@@ -119,6 +120,12 @@ struct AuthorityState {
     recovery_markets: BTreeSet<Market>,
     recovery_pending: VecDeque<RecoveryInput>,
     recovery_worker_available: bool,
+    /// Canonical feature state reconstructed from the same admitted source
+    /// facts as the engine. It is deliberately non-executable by itself:
+    /// active entries still require a verified universe and risk witness.
+    feature_engine: CommonFeatureEngine,
+    candle_aggregator: CandleAggregator,
+    feature_faulted: bool,
 }
 
 impl std::fmt::Debug for AuthorityState {
@@ -820,6 +827,9 @@ fn new_authority(run_id: &str, initial_at_ns: i64) -> Result<AuthorityState, App
         recovery_markets: BTreeSet::new(),
         recovery_pending: VecDeque::new(),
         recovery_worker_available: true,
+        feature_engine: CommonFeatureEngine::new(),
+        candle_aggregator: CandleAggregator::new(),
+        feature_faulted: false,
     })
 }
 
@@ -830,13 +840,15 @@ fn reconstruct_market_event(
 ) -> Result<(), AppError> {
     let retained_source = source.clone();
     if source_is_late(authority, &retained_source)? {
-        return reconstruct_typed_event(
+        let result = reconstruct_typed_event(
             authority,
             TypedEngineEvent::SourceRetained {
                 source: retained_source,
             },
             journal_event,
         );
+        observe_feature_source(authority, &source);
+        return result;
     }
     let open_position_market = authority.engine_state.as_ref().and_then(|state| {
         state
@@ -844,7 +856,8 @@ fn reconstruct_market_event(
             .position()
             .map(|position| position.market().clone())
     });
-    match authority
+    let feature_source = source.clone();
+    let result = match authority
         .router
         .route_market_event(source, open_position_market.as_ref())?
     {
@@ -858,7 +871,9 @@ fn reconstruct_market_event(
             },
             journal_event,
         ),
-    }
+    };
+    observe_feature_source(authority, &feature_source);
+    result
 }
 
 fn reconstruct_recovery_event(
@@ -1526,6 +1541,121 @@ fn update_readiness_from_typed_event(readiness: &mut Readiness, event: &TypedEng
     }
 }
 
+/// Feeds one durably admitted normalized source fact into the bounded feature
+/// state. Any malformed, late, or conflicting feature input quarantines only
+/// feature-driven entries; the authority and mandatory-exit engine continue.
+fn observe_feature_source(authority: &mut AuthorityState, event: &MarketEvent) {
+    if authority.feature_faulted {
+        return;
+    }
+    if let Err(error) = authority.feature_engine.observe(event) {
+        authority.feature_faulted = true;
+        if let Some(gates) = authority.readiness.market_gates_mut(event.market()) {
+            gates.set_common_features_warm(false);
+        }
+        tracing::warn!(
+            market = event.market().as_str(),
+            event_id = event.event_id().as_str(),
+            error = %error,
+            "feature input rejected; rules entries remain fail-closed"
+        );
+        return;
+    }
+
+    let mut completed = Vec::new();
+    match event.kind() {
+        MarketEventKind::Trade(_) => {
+            if let Err(error) = authority.candle_aggregator.ingest(event) {
+                authority.feature_faulted = true;
+                tracing::warn!(
+                    market = event.market().as_str(),
+                    event_id = event.event_id().as_str(),
+                    error = %error,
+                    "candle input rejected; rules entries remain fail-closed"
+                );
+                return;
+            }
+            match authority
+                .candle_aggregator
+                .complete_through(event.event_time())
+            {
+                Ok(candles) => completed = candles,
+                Err(error) => {
+                    authority.feature_faulted = true;
+                    tracing::warn!(
+                        market = event.market().as_str(),
+                        event_id = event.event_id().as_str(),
+                        error = %error,
+                        "candle finalization rejected; rules entries remain fail-closed"
+                    );
+                    return;
+                }
+            }
+        }
+        MarketEventKind::CompletedCandle(_) => match Candle::from_completed_event(event) {
+            Ok(candle) => completed.push(candle),
+            Err(error) => {
+                authority.feature_faulted = true;
+                tracing::warn!(
+                    market = event.market().as_str(),
+                    event_id = event.event_id().as_str(),
+                    error = %error,
+                    "completed candle source rejected; rules entries remain fail-closed"
+                );
+                return;
+            }
+        },
+        MarketEventKind::Metadata(_)
+        | MarketEventKind::AssetContext(_)
+        | MarketEventKind::Funding(_)
+        | MarketEventKind::BookSnapshot(_)
+        | MarketEventKind::Bbo(_) => {}
+    }
+    for candle in completed {
+        if let Err(error) = authority.feature_engine.ingest_candle(candle) {
+            authority.feature_faulted = true;
+            tracing::warn!(
+                market = event.market().as_str(),
+                event_id = event.event_id().as_str(),
+                error = %error,
+                "completed candle feature state rejected; rules entries remain fail-closed"
+            );
+            return;
+        }
+    }
+    update_feature_readiness(authority, event);
+}
+
+fn update_feature_readiness(authority: &mut AuthorityState, event: &MarketEvent) {
+    if !matches!(
+        event.kind(),
+        MarketEventKind::CompletedCandle(_) | MarketEventKind::Trade(_)
+    ) {
+        return;
+    }
+    let Some(snapshot) = authority
+        .feature_engine
+        .snapshots_at(
+            trench_core::event::CandleInterval::FifteenMinutes,
+            event.event_time(),
+        )
+        .into_iter()
+        .find(|snapshot| snapshot.market() == event.market())
+    else {
+        return;
+    };
+    let complete = snapshot.completeness();
+    let warmed = complete.candles()
+        && complete.context()
+        && complete.funding()
+        && complete.microstructure()
+        && complete.regime()
+        && complete.calculations();
+    if let Some(gates) = authority.readiness.market_gates_mut(event.market()) {
+        gates.set_common_features_warm(warmed);
+    }
+}
+
 fn gap_market(gap: &GapEvent) -> &trench_core::domain::Market {
     match gap {
         GapEvent::Opened(opened) => opened.market(),
@@ -1563,6 +1693,7 @@ async fn admit_market_event(
         {
             retain_recovery_source(sender, authority, committed_source);
         }
+        observe_feature_source(authority, &event);
         return Ok(());
     }
     let open_position_market = authority.engine_state.as_ref().and_then(|state| {
@@ -1600,8 +1731,9 @@ async fn admit_market_event(
     if let Some(sender) = recovery_sender
         && authority.recovery_worker_available
     {
-        retain_recovery_source(sender, authority, committed_source);
+        retain_recovery_source(sender, authority, committed_source.clone());
     }
+    observe_feature_source(authority, &committed_source);
     Ok(())
 }
 
@@ -1951,11 +2083,11 @@ mod tests {
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     use super::{
-        AppError, AuthorityState, CaptureOutput, LiveSubscription, RecoveryInput, RecoveryOutput,
-        StreamScopeAction, SystemReceiptClock, admit_capture_output, admit_market_event,
-        admit_recovery_output, admit_typed_engine_event, capture_worker, configured_path,
-        current_time_ns, initial_engine_state, maximum_book_age, persist_live_market_event,
-        reconstruct_authority, recover_source_stream, recovery_worker,
+        AppError, AuthorityState, CandleAggregator, CaptureOutput, CommonFeatureEngine,
+        LiveSubscription, RecoveryInput, RecoveryOutput, StreamScopeAction, SystemReceiptClock,
+        admit_capture_output, admit_market_event, admit_recovery_output, admit_typed_engine_event,
+        capture_worker, configured_path, current_time_ns, initial_engine_state, maximum_book_age,
+        persist_live_market_event, reconstruct_authority, recover_source_stream, recovery_worker,
     };
     use crate::capture_scheduler::CaptureScheduler;
     use crate::readiness::Readiness;
@@ -2042,6 +2174,9 @@ mod tests {
             recovery_markets: BTreeSet::new(),
             recovery_pending: VecDeque::new(),
             recovery_worker_available: true,
+            feature_engine: CommonFeatureEngine::new(),
+            candle_aggregator: CandleAggregator::new(),
+            feature_faulted: false,
         }
     }
 
@@ -2327,6 +2462,9 @@ mod tests {
             recovery_markets: BTreeSet::new(),
             recovery_pending: VecDeque::new(),
             recovery_worker_available: false,
+            feature_engine: CommonFeatureEngine::new(),
+            candle_aggregator: CandleAggregator::new(),
+            feature_faulted: false,
         };
         for event in recovered.events {
             admit_market_event(&mut writer, &mut authority, event, None)

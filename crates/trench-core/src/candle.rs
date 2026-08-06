@@ -112,6 +112,41 @@ impl CandleGap {
 }
 
 impl Candle {
+    /// Adapts one authoritative completed-candle source fact into the feature
+    /// engine's candle contract.
+    ///
+    /// Official venue candles do not carry aggressor-side trade identities.
+    /// Their OHLCV remains authoritative, while microstructure features are
+    /// sourced exclusively from normalized trades observed by the live feed.
+    /// The source event identity is retained for deterministic provenance.
+    pub fn from_completed_event(event: &MarketEvent) -> Result<Self, CandleError> {
+        let MarketEventKind::CompletedCandle(candle) = event.kind() else {
+            return Err(CandleError::ExpectedCompletedCandle);
+        };
+        let close_time = candle
+            .open_time()
+            .checked_add(candle.interval().duration())?;
+        let last_event_time = TimestampNs::new(i128::from(close_time.value()) - 1)?;
+        if event.event_time() < close_time || event.received_at() < event.event_time() {
+            return Err(CandleError::InvalidCompletedCandleSource {
+                event_id: event.event_id().clone(),
+            });
+        }
+        Ok(Self {
+            market: event.market().clone(),
+            candle: *candle,
+            first_event_id: event.event_id().clone(),
+            last_event_id: event.event_id().clone(),
+            first_event_time: candle.open_time(),
+            last_event_time,
+            first_received_at: event.received_at(),
+            last_received_at: event.received_at(),
+            source_available_at: event.received_at(),
+            buy_notional: Decimal::ZERO,
+            sell_notional: Decimal::ZERO,
+        })
+    }
+
     /// Returns the market whose trades formed this candle.
     #[must_use]
     pub const fn market(&self) -> &Market {
@@ -194,6 +229,15 @@ impl Candle {
 /// Candle aggregation failure.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CandleError {
+    /// A completed-candle adapter received a non-candle source fact.
+    #[error("completed-candle adaptation requires a normalized completed candle")]
+    ExpectedCompletedCandle,
+    /// The completed-candle source did not satisfy its causal timestamp contract.
+    #[error("completed candle source {event_id:?} has invalid causal timestamps")]
+    InvalidCompletedCandleSource {
+        /// Invalid source identity.
+        event_id: EventId,
+    },
     /// A non-trade event was supplied to the trade-only aggregator.
     #[error("candle aggregation requires a normalized trade")]
     ExpectedTrade,
@@ -802,9 +846,11 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use crate::domain::{Market, Price, Quantity, Side};
-    use crate::event::{CandleInterval, EventError, MarketEvent, TimestampNs, Trade};
+    use crate::event::{
+        CandleInterval, CompletedCandle, EventError, MarketEvent, TimestampNs, Trade,
+    };
 
-    use super::{CandleAggregator, CandleError, CandleGap};
+    use super::{Candle, CandleAggregator, CandleError, CandleGap};
 
     fn timestamp(value: i128) -> TimestampNs {
         TimestampNs::new(value).expect("test timestamp must be valid")
@@ -833,6 +879,39 @@ mod tests {
             .expect("test trade must be valid"),
         )
         .expect("test event must be valid")
+    }
+
+    #[test]
+    fn official_completed_candle_preserves_causal_provenance_without_inventing_flow() {
+        let open = timestamp(0);
+        let interval = CandleInterval::FifteenMinutes;
+        let candle = CompletedCandle::new(
+            interval,
+            open,
+            Price::new(dec!(100)).expect("price"),
+            Price::new(dec!(101)).expect("price"),
+            Price::new(dec!(99)).expect("price"),
+            Price::new(dec!(100.5)).expect("price"),
+            Quantity::new(dec!(1)).expect("quantity"),
+            1,
+        )
+        .expect("candle");
+        let event = MarketEvent::completed_candle(
+            timestamp(i128::from(interval.duration().value())),
+            timestamp(i128::from(interval.duration().value())),
+            Market::new("BTC").expect("market"),
+            candle,
+        )
+        .expect("source event");
+
+        let adapted = Candle::from_completed_event(&event).expect("official candle");
+        assert_eq!(adapted.first_event_id(), event.event_id());
+        assert_eq!(adapted.last_event_id(), event.event_id());
+        assert_eq!(adapted.first_event_time(), open);
+        assert!(adapted.last_event_time() < adapted.close_time().expect("close"));
+        assert_eq!(adapted.source_available_at(), event.received_at());
+        assert_eq!(adapted.buy_notional(), rust_decimal::Decimal::ZERO);
+        assert_eq!(adapted.sell_notional(), rust_decimal::Decimal::ZERO);
     }
 
     #[test]
