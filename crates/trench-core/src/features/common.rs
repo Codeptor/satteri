@@ -47,7 +47,10 @@ const MAX_CANDLE_HISTORY: usize = DERIVATIVE_15_MINUTE_BARS + MAX_OPEN_INTEREST_
 const MAX_HOURLY_CANDLE_HISTORY: usize =
     HOURLY_REALIZED_VOLATILITY_WINDOW + HOURLY_REALIZED_VOLATILITY_HISTORY + 1;
 const CONTEXT_WINDOW: usize = 30;
-const MAX_MARKETS: usize = 128;
+// The venue currently exposes more than 200 native perpetuals. Feature state
+// remains bounded while allowing the dynamic selector to inspect the complete
+// point-in-time metadata universe rather than failing at an arbitrary 128.
+const MAX_MARKETS: usize = 256;
 const POINT_EVENT_HISTORY: usize = 64;
 // Raw source events are retained only long enough to attach observations to
 // newly completed bars. Thirty-day strategy state lives in canonical boundary

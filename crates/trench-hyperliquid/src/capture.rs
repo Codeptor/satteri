@@ -29,7 +29,10 @@ use crate::{
 };
 
 /// Maximum native perpetual rows accepted from one metadata response.
-pub const MAX_CONTEXT_MARKETS: usize = 128;
+///
+/// Hyperliquid currently exposes more than 200 native perpetuals. Keep enough
+/// bounded headroom for the venue universe while retaining a hard finite cap.
+pub const MAX_CONTEXT_MARKETS: usize = 256;
 /// Maximum detailed markets captured in one bounded public context batch.
 pub const MAX_DETAILED_CONTEXT_MARKETS: usize = 30;
 /// Maximum public REST operations in flight for one context batch.
