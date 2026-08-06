@@ -1125,7 +1125,7 @@ async fn admit_capture_output(
 ) -> Result<StreamScopeAction, AppError> {
     match output {
         CaptureOutput::Captured(batch) => {
-            let fresh_events = capture_fresh_events(parquet_store, batch.events())?;
+            let fresh_events = capture_fresh_events(parquet_store, authority, batch.events())?;
             if fresh_events.is_empty() {
                 tracing::debug!(
                     events = batch.events().len(),
@@ -1816,20 +1816,35 @@ fn is_verified_historical_source_retry(
 /// while changed payloads or regressed receipt times remain integrity errors.
 fn capture_fresh_events(
     parquet_store: &ParquetStore,
+    authority: &AuthorityState,
     events: &[MarketEvent],
 ) -> Result<Vec<MarketEvent>, AppError> {
     let mut fresh = Vec::with_capacity(events.len());
+    // A non-empty live scope proves this is a rolling capture. In that mode,
+    // an already durable source row is expected overlap and can be omitted
+    // before the next atomic capture commit. An empty scope is the initial
+    // capture boundary: leaving the overlap in the batch lets storage reject
+    // mixed legacy data before any staged facts become visible.
+    let rolling_capture = !authority.live.scope.is_empty();
     for event in events {
+        if let Some(historical) = authority.historical_sources.get(event.event_id()) {
+            if historical == event || source_payload_equivalent(historical, event) {
+                continue;
+            }
+            return Err(AppError::HistoricalSourceConflict {
+                event_id: event.event_id().as_str().to_owned(),
+            });
+        }
         let Some(historical) = parquet_store.event_by_id(event.event_id()) else {
             fresh.push(event.clone());
             continue;
         };
-        if historical == *event || source_payload_equivalent(&historical, event) {
+        if rolling_capture
+            && (historical == *event || source_payload_equivalent(&historical, event))
+        {
             continue;
         }
-        return Err(AppError::HistoricalSourceConflict {
-            event_id: event.event_id().as_str().to_owned(),
-        });
+        fresh.push(event.clone());
     }
     Ok(fresh)
 }
