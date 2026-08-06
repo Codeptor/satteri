@@ -1807,6 +1807,17 @@ async fn stop_signal(duration: Option<Duration>) -> Result<(), AppError> {
     match duration {
         Some(duration) => tokio::time::sleep(duration).await,
         None => {
+            #[cfg(unix)]
+            {
+                let mut terminate =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .map_err(AppError::Signal)?;
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => result.map_err(AppError::Signal)?,
+                    _ = terminate.recv() => {},
+                }
+            }
+            #[cfg(not(unix))]
             tokio::signal::ctrl_c().await.map_err(AppError::Signal)?;
         }
     }
