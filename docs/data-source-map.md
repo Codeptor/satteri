@@ -1,0 +1,146 @@
+# Rules-only data source map
+
+**Status:** acquisition map for the first paper-only `rules_only` deployment
+**Last reviewed:** 2026-08-06
+
+This file is the source of truth for where each required input comes from, what
+can be used for production replay, and what remains only exploratory. A source
+is not production-valid merely because it contains the right columns: every
+decision input must be bound to an event time, receipt/availability time,
+source identity, and continuity proof.
+
+## Required contracts
+
+| Contract | Required data | Primary source | Free/public status | Production acceptance |
+| --- | --- | --- | --- | --- |
+| Native perp metadata | Symbol, listing/delisting state, price/size decimals, venue leverage and contract constraints | Hyperliquid `meta` / `metaAndAssetCtxs` Info API; live context capture | Public API | Accept only typed, receipt-time-stamped metadata and a frozen digest |
+| Asset context | Mark/oracle price, premium, funding, open interest, context timestamps | Live `activeAssetCtx`/context capture; official `asset_ctxs` archive for historical context | API is public; official archive is requester-pays | Historical rows require source manifest, exact timestamps, and no late decision reuse |
+| Executable L2 | Ordered top-20 bids/asks, quantities, exchange time, sequence/block identity | Live `l2Book` WebSocket; official `market_data/.../l2Book` archive | WebSocket is public; official archive is requester-pays | Must pass book ordering, freshness, recovery-fence, digest, and continuity checks |
+| BBO | Best bid/ask and quantities | Live `bbo` WebSocket or derived from an accepted L2 snapshot | Public live feed | Historical BBO is derived only from accepted L2; never midpoint-imputed |
+| Trades | Price, quantity, side, exchange identity/time, receipt time | Live `trades` WebSocket; official node fills/trades buckets; validated third-party files | Live feed is public; official buckets are requester-pays | Required for causal candle construction and trade-stream continuity |
+| Completed candles | Exact 15-minute and hourly OHLCV bars plus contributing trade identities | Derived by the repository candle aggregator from timely trades | No separate official historical archive | API candles may warm exploratory state, but late backfill cannot become a past decision input without availability proof |
+| Funding history | Funding rate at every settlement/observation boundary | Public Info API funding history; asset context archive; live context stream | Public API; archive requester-pays | Preserve signed rate, source timestamp, receipt time, and gap status |
+| Universe candidates | Liquidity, spread, executable depth, daily notional, listing state, coverage, exclusions | Recomputed from metadata, accepted books, trades, and context at each hourly boundary | No authoritative ready-made feed | `UniverseSelector` must recompute and digest the raw candidate inputs point-in-time |
+| Risk inputs | Precision, leverage limits, impact ladder, spread/depth, funding reserve distribution, book digest | Metadata + accepted L2/trades/funding/context | No authoritative ready-made policy feed | `RiskPolicy` must be constructed from raw inputs; serialized policy alone is never trusted |
+| Recovery/continuity | Archive manifest, REST page chain, WebSocket sequence/heartbeat range, predecessor/successor identities | Official archive manifests, paginated API evidence, or our captured WS epochs | Depends on source | Mandatory; missing proof becomes an explicit excluded gap |
+
+## Source inventory
+
+### 1. Official Hyperliquid live feeds — primary forward source
+
+Use the public WebSocket for `l2Book`, `trades`, `bbo`, candles, and asset
+context. The current GIFGOBLIN collector already uses this path and persists
+raw normalized facts before authority admission.
+
+- [WebSocket subscriptions](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions)
+- [Info API](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint)
+
+This is the preferred source from the moment collection starts because the
+collector controls receipt timestamps, reconnect epochs, duplicate handling,
+and continuity evidence.
+
+### 2. Official Hyperliquid archive — historical backfill candidate
+
+The official archive contains hourly L2 book files under `market_data` and
+asset-context files under `asset_ctxs`. It also documents node fills/trades
+under `hl-mainnet-node-data`.
+
+- [Historical data documentation](https://hyperliquid.gitbook.io/hyperliquid-docs/historical-data)
+
+Constraints:
+
+- S3 is requester-pays; transfer is not free.
+- The archive does not provide historical candles.
+- Archive availability can be incomplete or delayed.
+- Historical L2 alone cannot satisfy the full candle/funding/context contract.
+
+Acquire this on a dedicated/off-VPS machine, verify every object and manifest,
+then transfer only the immutable verified bundle to the deployment storage.
+
+### 3. Public Info API — bounded backfill/warmup source
+
+Use the public API for metadata, funding, asset context, and candle snapshots.
+The candle endpoint currently exposes at most the latest 5,000 candles.
+
+API responses fetched after the fact are not automatically valid historical
+decision inputs. They may be retained as warmup evidence only when their
+availability and causal boundary are proven; otherwise the affected interval
+is excluded.
+
+### 4. SonarX public L2 mirror — optional secondary source
+
+[SonarX public snapshots](https://docs.sonarx.com/datasets/HYPERLIQUID/public-l2-snapshots)
+provide CC0 top-20 L2 summaries every 20 blocks, with block height and block
+timestamp. The public bucket is requester-pays and weekly with a lag.
+
+Use only as a secondary candidate until schema, coverage, source identity, and
+availability proofs are verified. It does not supply trades, candles, funding,
+or asset context, so it cannot be the complete production source by itself.
+
+### 5. CryptoHFTData — free third-party candidate to validate
+
+[CryptoHFTData documentation](https://www.cryptohftdata.com/docs) claims
+Hyperliquid L2, trades, funding, mark prices, open interest, liquidations, and
+hourly Zstandard-compressed Parquet history. It advertises free signup/API
+access and Hyperliquid coverage from September 2025.
+
+Before accepting it for replay, verify:
+
+1. Raw schema maps losslessly to our normalized event types.
+2. Exchange timestamps and source availability/receipt semantics are present.
+3. Gaps, revisions, and duplicate identities are exposed rather than hidden.
+4. Terms/licensing permit redistribution in this open-source project.
+5. A sample reproduces exact event and continuity digests after import.
+
+Until those checks pass, treat it as exploratory/backup data, not an artifact
+authorization source.
+
+### 6. Community GitHub datasets and collectors — partial only
+
+- [Hyperliquid historical_data](https://github.com/hyperliquid-dex/historical_data)
+  contains selected trades, liquidations, and ledger updates, not the complete
+  book/candle/funding/context set.
+- [Community realtime collector](https://github.com/bwroniszewski/hyperliquid-realtime-data)
+  demonstrates public WebSocket collection but is session-oriented and does
+  not provide the repository's continuity, provenance, or atomic-write proofs.
+
+These are useful for format fixtures or exploratory checks only.
+
+## What the repository derives
+
+No external source supplies the final witnesses or rules artifact. The
+repository must derive and verify:
+
+1. Hourly universe candidate inputs and `UniverseSnapshot` commitments.
+2. Completed-bar feature snapshots and long-horizon rule history.
+3. Raw risk inputs and canonical `RiskPolicy` commitments.
+4. Recovery boundaries and excluded source gaps.
+5. Rules walk-forward report and content-addressed rules artifact.
+6. Paper orders, fills, positions, PnL, leverage, and breaker transitions on
+   the synthetic 100 USDC ledger.
+
+The dashboard reads these SQLite/readonly API outputs; it never becomes a
+source of trading truth.
+
+## Acquisition policy
+
+- **Allowed:** public REST/WebSocket/S3 endpoints, public datasets, and normal
+  rate-limited downloads.
+- **Not allowed:** wallet authentication, private account feeds, credential
+  scraping, rate-limit bypass, or live `/exchange` actions.
+- Keep acquisition credentials off the shared GIFGOBLIN VPS. Transfer only
+  verified immutable data and manifests.
+- Preserve raw source bytes long enough to reproduce every promoted decision;
+  cold-archive them after the hot operational window is compacted.
+
+## Current status
+
+| Item | Status |
+| --- | --- |
+| GIFGOBLIN forward WebSocket collection | Running, rules-only scope, collection-only mode |
+| Official historical archive access | Not available; requester-pays credentials/data absent |
+| External storage | Not provisioned |
+| Complete verified source bundle | Missing |
+| Universe/feature/risk witnesses | Not promotable without the bundle |
+| Rules artifact/report | Not eligible; runtime remains fail-closed |
+| Wallet, signer, Telegram, live exchange path | Intentionally absent |
