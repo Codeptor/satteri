@@ -10,6 +10,7 @@ pub mod research_plan;
 pub mod research_runs;
 pub mod research_sidecar;
 pub mod research_witness;
+pub mod rules_research;
 pub mod sqlite;
 
 #[cfg(test)]
