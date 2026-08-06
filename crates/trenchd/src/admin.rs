@@ -20,7 +20,10 @@ use tokio_util::sync::CancellationToken;
 use crate::readiness::ReadinessSnapshot;
 
 const ADMIN_SCHEMA_VERSION: u8 = 1;
-const MAX_ADMIN_FRAME_BYTES: usize = 4 * 1024;
+// A full readiness projection includes every market in the bounded dynamic
+// universe. Keep the frame fixed and bounded, but large enough for the
+// current 256-market admission limit.
+const MAX_ADMIN_FRAME_BYTES: usize = 64 * 1024;
 const MAX_ADMIN_CONNECTIONS: usize = 16;
 const ADMIN_CHANNEL_CAPACITY: usize = 32;
 
@@ -481,8 +484,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        AdminError, AdminServer, AuthorityRequest, DaemonMode, DaemonStatus, authority_channel,
-        peer_uid_allowed, request_status,
+        AdminError, AdminServer, AuthorityRequest, DaemonMode, DaemonStatus, MAX_ADMIN_FRAME_BYTES,
+        authority_channel, peer_uid_allowed, request_status,
     };
     use crate::readiness::Readiness;
 
@@ -597,7 +600,7 @@ mod tests {
             .await
             .expect("connect admin");
         oversized
-            .write_u32(4_097)
+            .write_u32((MAX_ADMIN_FRAME_BYTES as u32) + 1)
             .await
             .expect("write oversized length");
         oversized.shutdown().await.expect("close oversized stream");

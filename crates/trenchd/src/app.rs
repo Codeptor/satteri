@@ -528,6 +528,10 @@ pub async fn run(
                         end_live_epoch(&mut authority.live, &mut authority.readiness).await;
                     }
                 }
+                // A live WebSocket can remain continuously ready. Yield after
+                // each fact so bounded admin/status requests cannot be starved
+                // by a hot market-data stream.
+                tokio::task::yield_now().await;
             }
             _ = wait_for_stream_restart(restart_at), if restart_at.is_some() => {
                 let stream_action = authority.live.restart_due();
