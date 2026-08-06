@@ -8,6 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 use trench_core::domain::Market;
+use trench_core::event::TimestampNs;
+
+const STALE_MARKET_DATA_NS: i64 = 300_000_000_000;
 
 /// A global prerequisite that blocks new paper entries for every ledger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -41,6 +44,10 @@ pub enum MarketBlocker {
     CommonFeatures,
     /// The market was removed by data-quality validation.
     DataQuality,
+    /// Last BBO at bar-close is missing or older than 5 minutes.
+    StaleBbo,
+    /// Last AllMids is missing or older than 5 minutes.
+    StaleAllMids,
 }
 
 /// A rules-ledger-local condition that blocks only rules entries.
@@ -126,6 +133,9 @@ pub struct Readiness {
     rules_sleeve_warm: bool,
     universe_witness_valid: bool,
     risk_witness_valid: bool,
+    current_time: Option<TimestampNs>,
+    bbo_close_at: BTreeMap<Market, TimestampNs>,
+    all_mids_at: BTreeMap<Market, TimestampNs>,
 }
 
 impl Readiness {
@@ -195,6 +205,31 @@ impl Readiness {
         self.risk_witness_valid = value;
     }
 
+    /// Records the current wall-clock time used for staleness checks.
+    pub fn set_current_time(&mut self, at: TimestampNs) {
+        self.current_time = Some(at);
+    }
+
+    /// Records the last BBO at bar-close time for a market.
+    pub fn set_bbo_close_at(&mut self, market: Market, at: TimestampNs) {
+        self.bbo_close_at.insert(market, at);
+    }
+
+    /// Records the last AllMids time for a market.
+    pub fn set_all_mids_at(&mut self, market: Market, at: TimestampNs) {
+        self.all_mids_at.insert(market, at);
+    }
+
+    fn is_stale(last: Option<TimestampNs>, now: Option<TimestampNs>) -> bool {
+        match (last, now) {
+            (Some(last), Some(now)) => now
+                .checked_duration_since(last)
+                .map_or(true, |age| age.value() > STALE_MARKET_DATA_NS),
+            (None, Some(_)) => true,
+            _ => false,
+        }
+    }
+
     /// Returns every global condition currently blocking fresh entries.
     #[must_use]
     pub fn global_blockers(&self) -> BTreeSet<GlobalBlocker> {
@@ -232,10 +267,17 @@ impl Readiness {
     /// Returns market-local entry blockers without duplicating global state.
     #[must_use]
     pub fn market_blockers(&self, market: &Market) -> BTreeSet<MarketBlocker> {
-        self.markets.get(market).map_or_else(
+        let mut blockers = self.markets.get(market).map_or_else(
             || BTreeSet::from([MarketBlocker::Recovery, MarketBlocker::ExecutableBook]),
             |gates| gates.blockers(),
-        )
+        );
+        if Self::is_stale(self.bbo_close_at.get(market).copied(), self.current_time) {
+            blockers.insert(MarketBlocker::StaleBbo);
+        }
+        if Self::is_stale(self.all_mids_at.get(market).copied(), self.current_time) {
+            blockers.insert(MarketBlocker::StaleAllMids);
+        }
+        blockers
     }
 
     /// Returns rules-ledger-local blockers.
@@ -456,5 +498,69 @@ mod tests {
 
         assert!(!readiness.rules_entry_ready(&market));
         assert!(readiness.mandatory_exit_ready(&market));
+    }
+
+    #[test]
+    fn stale_bbo_or_all_mids_blocks_fresh_entries_but_allows_mandatory_exit() {
+        let market = market();
+        let mut readiness = Readiness::default();
+        readiness.register_market(market.clone());
+        readiness.set_fresh_book_markets(BTreeSet::from([market.clone()]));
+        for enabled in [
+            Readiness::set_ntp_synchronized,
+            Readiness::set_sqlite_reconciled,
+            Readiness::set_storage_writable,
+            Readiness::set_stream_connected,
+            Readiness::set_metadata_current,
+            Readiness::set_context_capture_current,
+            Readiness::set_rules_configuration_valid,
+            Readiness::set_rules_sleeve_warm,
+            Readiness::set_universe_witness_valid,
+            Readiness::set_risk_witness_valid,
+        ] {
+            enabled(&mut readiness, true);
+        }
+        {
+            let gates = readiness.market_gates_mut(&market).expect("market");
+            gates.set_recovered(true);
+            gates.set_executable_book(true);
+            gates.set_common_features_warm(true);
+            gates.set_data_quality_valid(true);
+        }
+        let now = trench_core::event::TimestampNs::new(1_000_000_000_000).expect("now");
+        let fresh_bbo =
+            trench_core::event::TimestampNs::new(i128::from(now.value() - 60_000_000_000))
+                .expect("fresh bbo");
+        let fresh_mids =
+            trench_core::event::TimestampNs::new(i128::from(now.value() - 60_000_000_000))
+                .expect("fresh mids");
+        let stale = trench_core::event::TimestampNs::new(i128::from(now.value() - 400_000_000_000))
+            .expect("stale");
+
+        readiness.set_current_time(now);
+        readiness.set_bbo_close_at(market.clone(), fresh_bbo);
+        readiness.set_all_mids_at(market.clone(), fresh_mids);
+        assert!(readiness.rules_entry_ready(&market));
+        assert!(readiness.mandatory_exit_ready(&market));
+
+        readiness.set_bbo_close_at(market.clone(), stale);
+        assert_eq!(
+            readiness.market_blockers(&market),
+            BTreeSet::from([MarketBlocker::StaleBbo])
+        );
+        assert!(!readiness.rules_entry_ready(&market));
+        assert!(readiness.mandatory_exit_ready(&market));
+
+        readiness.set_bbo_close_at(market.clone(), fresh_bbo);
+        readiness.set_all_mids_at(market.clone(), stale);
+        assert_eq!(
+            readiness.market_blockers(&market),
+            BTreeSet::from([MarketBlocker::StaleAllMids])
+        );
+        assert!(!readiness.rules_entry_ready(&market));
+        assert!(readiness.mandatory_exit_ready(&market));
+
+        readiness.set_all_mids_at(market.clone(), fresh_mids);
+        assert!(readiness.rules_entry_ready(&market));
     }
 }

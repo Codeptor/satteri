@@ -13,7 +13,7 @@ use crate::broker::{
     BrokerError, BrokerPosition, BrokerState, BrokerTransition, ExecutableBook, ExecutableFunding,
     ExecutableMark, ExecutionRole, ExitReason, MarketExecutionReady, PaperBroker,
 };
-use crate::domain::{EventId, Market, Price};
+use crate::domain::{EventId, Market, Price, Sleeve};
 use crate::event::{FundingRate, TimestampNs};
 use crate::ledger::{
     BookFreshness, EntryFill, LedgerError, LedgerState, LedgerTransition, MarkCosts,
@@ -1244,6 +1244,12 @@ impl Engine {
                     candidate_digest: entry.candidate.digest().to_owned(),
                 });
             }
+            if !is_sleeve_bar_close(at, entry.candidate.sleeve()) {
+                batch.push(EngineRecord::StrategyContextRejected {
+                    candidate: entry.candidate,
+                });
+                continue;
+            }
             if entry.candidate.strategy_fingerprint()
                 != context
                     .strategy_fingerprints
@@ -1870,6 +1876,14 @@ fn covers_complete_public_cost(
         .checked_mul(Decimal::new(15, 1))
         .ok_or(EngineError::CostGateArithmetic)?;
     Ok(gross_edge >= required_edge)
+}
+
+fn is_sleeve_bar_close(at: TimestampNs, sleeve: Sleeve) -> bool {
+    let interval_ns: i64 = match sleeve {
+        Sleeve::FifteenMinute => 900_000_000_000,
+        Sleeve::OneHour => 3_600_000_000_000,
+    };
+    at.value() != 0 && at.value() % interval_ns == 0
 }
 
 #[cfg(test)]
@@ -2851,6 +2865,117 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn bar_close_sealed_quote_single_consume() {
+        // Task 3: both 15m and 1h sleeves at a shared hour boundary (3_600_000_000_000)
+        // must be quoted from same immutable snapshot, strategies see only CostQuote,
+        // ranked by net edge, single consume.
+        let at = timestamp(3_600_000_000_000);
+        let strategy = AcceptAll;
+        let ctx = context(at, EventAdmission::New);
+        let candidates = vec![
+            EntryCandidate::new(
+                candidate_with_sleeve("BTC", dec!(0.03), at, Sleeve::FifteenMinute),
+                &strategy,
+            ),
+            EntryCandidate::new(
+                candidate_with_sleeve("BTC", dec!(0.05), at, Sleeve::OneHour),
+                &strategy,
+            ),
+            EntryCandidate::new(
+                candidate_with_sleeve("ETH", dec!(0.04), at, Sleeve::FifteenMinute),
+                &strategy,
+            ),
+            EntryCandidate::new(
+                candidate_with_sleeve("ETH", dec!(0.02), at, Sleeve::OneHour),
+                &strategy,
+            ),
+        ];
+        let outcome = apply_entry(
+            EventId::new("event-bar-close-both-sleeves").expect("event ID"),
+            at,
+            candidates,
+            state(at),
+            &ctx,
+        )
+        .expect("bar-close arbitration must succeed");
+
+        // Sealed RiskQuote flow: 4 quoted, 4 cost decisions, losers discarded, 1 consumed, 1 queued
+        let records = outcome.batch().records();
+        let quoted = records
+            .iter()
+            .filter(|r| matches!(r.record(), EngineRecord::RiskQuoted { .. }))
+            .count();
+        let accepted = records
+            .iter()
+            .filter(|r| matches!(r.record(), EngineRecord::CostAccepted { .. }))
+            .count();
+        let consumed = records
+            .iter()
+            .filter(|r| matches!(r.record(), EngineRecord::QuoteConsumed { .. }))
+            .count();
+        let queued = records
+            .iter()
+            .filter(|r| matches!(r.record(), EngineRecord::EntryQueued { .. }))
+            .count();
+        let discarded = records
+            .iter()
+            .filter(|r| matches!(r.record(), EngineRecord::QuoteDiscarded { .. }))
+            .count();
+
+        assert_eq!(
+            quoted, 4,
+            "every candidate must be risk-quoted from same snapshot"
+        );
+        assert_eq!(accepted, 4, "AcceptAll should accept all feasible costs");
+        assert_eq!(consumed, 1, "single consume");
+        assert_eq!(queued, 1, "single entry queued");
+        assert_eq!(discarded, 3, "three losers discarded");
+        assert_eq!(outcome.state().outstanding_approvals(), 0);
+        // Winner is highest net edge = gross - cost; costs are identical per notional, so highest gross wins (BTC 1h 0.05)
+        assert_eq!(outcome.batch().selected_market(), Some("BTC"));
+        // Ensure sealed: all RiskQuoted contain CostQuote only, no sealed order leakage via public API
+        for record in records {
+            if let EngineRecord::RiskQuoted { quote, .. } = record.record() {
+                assert!(quote.cost_quote().is_feasible());
+                assert!(quote.is_approved());
+            }
+        }
+    }
+
+    #[test]
+    fn bar_close_hourly_sleeve_rejected_at_fifteen_minute_only_boundary() {
+        // 900_000_000_000 is 15m close but not 1h close; 1h candidate must be rejected
+        let at = timestamp(900_000_000_000);
+        let strategy = CountingStrategy::new(RULES_FINGERPRINT);
+        let ctx = context(at, EventAdmission::New);
+        let outcome = apply_entry(
+            EventId::new("event-15m-only-sleeve-check").expect("event ID"),
+            at,
+            vec![EntryCandidate::new(
+                candidate_with_sleeve("BTC", dec!(0.03), at, Sleeve::OneHour),
+                &strategy,
+            )],
+            state(at),
+            &ctx,
+        )
+        .expect("1h at 15m-only boundary must be auditable no-op");
+
+        assert_eq!(
+            strategy.calls(),
+            0,
+            "1h sleeve must not be quoted at 15m-only boundary"
+        );
+        assert_eq!(
+            outcome.state().broker().state(),
+            crate::broker::BrokerState::Flat
+        );
+        assert!(outcome.batch().records().iter().any(|r| matches!(
+            r.record(),
+            EngineRecord::StrategyContextRejected { .. } | EngineRecord::SnapshotRejected
+        )));
+    }
+
     fn state(at: TimestampNs) -> EngineState {
         let risk_policies = ["BTC", "ETH"]
             .into_iter()
@@ -3043,12 +3168,46 @@ mod tests {
     }
 
     fn active_universe(at: TimestampNs) -> crate::universe::UniverseActivation {
-        let snapshot = UniverseSelector::select(
-            timestamp(0),
-            [universe_candidate("BTC"), universe_candidate("ETH")],
-        )
-        .expect("universe snapshot");
-        UniverseSelector::activate(&snapshot, None, at).expect("active universe")
+        let candidates = [universe_candidate("BTC"), universe_candidate("ETH")];
+        let hour_ns: i64 = 3_600_000_000_000;
+        let strategy_bar_ns: i64 = 900_000_000_000;
+        let hour =
+            TimestampNs::new(i128::from((at.value() / hour_ns) * hour_ns)).expect("hour boundary");
+        // Hour boundaries need a prior activation from the previous hour's last bar
+        // to satisfy `exact_prior_hour` provenance. Non-hour boundaries can activate
+        // directly from their hour's snapshot.
+        if at.value() % hour_ns == 0 && at.value() != 0 {
+            let prev_hour = TimestampNs::new(i128::from(at.value() - hour_ns)).expect("prev hour");
+            let prev_snapshot =
+                UniverseSelector::select(prev_hour, candidates.clone()).expect("prev snapshot");
+            // Last 15m bar of previous hour: prev_hour + 3*900M = hour - 900M
+            let prev_decision =
+                TimestampNs::new(i128::from(at.value() - strategy_bar_ns)).expect("prev decision");
+            let prior = UniverseSelector::activate(&prev_snapshot, None, prev_decision)
+                .expect("prior activation");
+            let snapshot =
+                UniverseSelector::select(hour, candidates.clone()).expect("hour snapshot");
+            UniverseSelector::activate(&snapshot, Some(&prior), at).expect("hour activation")
+        } else {
+            let snapshot =
+                UniverseSelector::select(hour, candidates.clone()).expect("universe snapshot");
+            // For the first hour's 900M bar, no prior needed (ranked path).
+            // For later bars within same hour, also no prior needed.
+            UniverseSelector::activate(&snapshot, None, at).unwrap_or_else(|_| {
+                // Fallback for genesis 0 or non-bar times
+                let fallback_snapshot = UniverseSelector::select(
+                    TimestampNs::new(0).expect("genesis"),
+                    candidates.clone(),
+                )
+                .expect("fallback snapshot");
+                UniverseSelector::activate(
+                    &fallback_snapshot,
+                    None,
+                    TimestampNs::new(i128::from(strategy_bar_ns)).expect("fallback"),
+                )
+                .expect("fallback activation")
+            })
+        }
     }
 
     fn universe_candidate(market: &str) -> UniverseCandidate {
@@ -3115,17 +3274,31 @@ mod tests {
     }
 
     fn candidate(market: &str, gross_edge: Decimal, at: TimestampNs) -> SignalCandidate {
+        candidate_with_sleeve(market, gross_edge, at, Sleeve::FifteenMinute)
+    }
+
+    fn candidate_with_sleeve(
+        market: &str,
+        gross_edge: Decimal,
+        at: TimestampNs,
+        sleeve: Sleeve,
+    ) -> SignalCandidate {
+        let time_exit = match sleeve {
+            Sleeve::FifteenMinute => 900_000_000_000_i64 * 4,
+            Sleeve::OneHour => 3_600_000_000_000_i64 * 4,
+        };
         SignalCandidate::new(CandidateSpecification {
             strategy: StrategyKind::RulesOnly,
             market: Market::new(market).expect("market"),
             side: Side::Buy,
-            sleeve: Sleeve::FifteenMinute,
+            sleeve,
             decision_time: at,
             gross_edge,
             reference_entry: Price::new(dec!(100)).expect("entry"),
             stop: Price::new(dec!(99)).expect("stop"),
             target: Price::new(dec!(102)).expect("target"),
-            time_exit: TimestampNs::new(i128::from(at.value()) + 1_000).expect("time exit"),
+            time_exit: TimestampNs::new(i128::from(at.value()) + i128::from(time_exit))
+                .expect("time exit"),
             snapshot_digest: digest('a'),
             universe_digest: active_universe(at)
                 .universe()

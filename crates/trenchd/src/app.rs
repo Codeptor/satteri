@@ -36,7 +36,7 @@ use crate::execution::{MarketRoute, RoutingError, TypedEngineEvent, TypedMarketR
 use crate::readiness::Readiness;
 use crate::writer::{EngineWriter, SourceEvent, WriterError};
 
-const SOURCE_CHANNEL_CAPACITY: usize = 128;
+const SOURCE_CHANNEL_CAPACITY: usize = 1024;
 const CAPTURE_CHANNEL_CAPACITY: usize = 1;
 const CAPTURE_RESULT_CHANNEL_CAPACITY: usize = 1;
 const RECOVERY_CHANNEL_CAPACITY: usize = 16;
@@ -588,6 +588,7 @@ pub async fn run(
             _ = recovery_clock.tick(), if authority.recovery_worker_available && !authority.recovery_markets.is_empty() => {
                 let at = TimestampNs::new(i128::from(current_time_ns()?))
                     .map_err(|_| AppError::SystemTime)?;
+                authority.readiness.set_current_time(at);
                 for market in authority.recovery_markets.clone() {
                     advance_recovery_clock(&recovery_sender, &mut authority, market, at);
                     if !authority.recovery_worker_available {
@@ -596,6 +597,9 @@ pub async fn run(
                 }
             }
             _ = capture_clock.tick(), if capture_results_open => {
+                if let Ok(now) = current_time_ns().and_then(|v| TimestampNs::new(i128::from(v)).map_err(|_| AppError::SystemTime)) {
+                    authority.readiness.set_current_time(now);
+                }
                 match TimestampNs::new(i128::from(current_time_ns()?)) {
                     Ok(scheduled_at) => match capture_scheduler.dispatch(scheduled_at) {
                         Ok(Some(request)) => match capture_sender.try_send(request) {
@@ -1567,6 +1571,23 @@ fn update_readiness_from_typed_event(readiness: &mut Readiness, event: &TypedEng
     }
 }
 
+fn update_market_data_readiness(authority: &mut AuthorityState, event: &MarketEvent) {
+    if let MarketEventKind::Bbo(_) = event.kind()
+        && event.event_time().value() != 0
+        && event.event_time().value() % 900_000_000_000 == 0
+    {
+        authority
+            .readiness
+            .set_bbo_close_at(event.market().clone(), event.event_time());
+    }
+    if let MarketEventKind::AssetContext(_) = event.kind() {
+        authority
+            .readiness
+            .set_all_mids_at(event.market().clone(), event.event_time());
+    }
+    authority.readiness.set_current_time(event.received_at());
+}
+
 /// Feeds one durably admitted normalized source fact into the bounded feature
 /// state. Any malformed, late, or conflicting feature input quarantines only
 /// feature-driven entries; the authority and mandatory-exit engine continue.
@@ -1738,9 +1759,10 @@ async fn admit_market_event(
         if let Some(sender) = recovery_sender
             && authority.recovery_worker_available
         {
-            retain_recovery_source(sender, authority, committed_source);
+            retain_recovery_source(sender, authority, committed_source.clone());
         }
         observe_feature_source(authority, &event);
+        update_market_data_readiness(authority, &committed_source);
         return Ok(());
     }
     let open_position_market = authority.engine_state.as_ref().and_then(|state| {
@@ -1769,6 +1791,7 @@ async fn admit_market_event(
             )
             .await?;
             observe_feature_source(authority, &committed_source);
+            update_market_data_readiness(authority, &committed_source);
             return Ok(());
         }
         Err(error) => return Err(error.into()),
@@ -1802,6 +1825,7 @@ async fn admit_market_event(
         retain_recovery_source(sender, authority, committed_source.clone());
     }
     observe_feature_source(authority, &committed_source);
+    update_market_data_readiness(authority, &committed_source);
     Ok(())
 }
 
