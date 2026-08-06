@@ -15,7 +15,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -428,6 +428,8 @@ pub enum CaptureBatchFailure {
 pub struct ParquetStore {
     root: PathBuf,
     provenance: DataProvenance,
+    event_index: Arc<Mutex<BTreeMap<EventId, MarketEvent>>>,
+    provenance_valid: bool,
 }
 
 /// One exact, verified immutable partition member opened without discovery.
@@ -477,6 +479,34 @@ impl OpenedPartitionMember {
     }
 }
 
+fn load_event_index(
+    root: &Path,
+    provenance: &DataProvenance,
+) -> Result<(BTreeMap<EventId, MarketEvent>, bool), ParquetError> {
+    let mut index = BTreeMap::new();
+    for candidate in scan_complete_partition_directories(root, provenance)? {
+        let _manifest = match read_partition_directory(
+            &candidate.directory,
+            provenance,
+            &candidate.key,
+            &candidate.partition_id,
+        ) {
+            Ok(manifest) => manifest,
+            Err(ParquetError::ProvenanceMismatch) => return Ok((BTreeMap::new(), false)),
+            Err(error) => return Err(error),
+        };
+        for event in read_events_file(&candidate.directory.join(EVENT_FILE))? {
+            let event_id = event.event_id().clone();
+            if index.insert(event_id.clone(), event).is_some() {
+                return Err(ParquetError::DuplicateEvent {
+                    event_id: event_id.as_str().to_owned(),
+                });
+            }
+        }
+    }
+    Ok((index, true))
+}
+
 impl ParquetStore {
     /// Opens or creates a private local store rooted at an absolute path.
     ///
@@ -498,7 +528,14 @@ impl ParquetStore {
         cleanup_staged_capture_batches(&capture_batches)?;
         let recovery_outcomes = root.join(RECOVERY_OUTCOMES_DIRECTORY);
         ensure_private_directory(&recovery_outcomes)?;
-        Ok(Self { root, provenance })
+        let (event_index, provenance_valid) = load_event_index(&root, &provenance)?;
+        let store = Self {
+            root,
+            provenance,
+            event_index: Arc::new(Mutex::new(event_index)),
+            provenance_valid,
+        };
+        Ok(store)
     }
 
     /// Opens an existing private store without creating any path or partition.
@@ -519,7 +556,14 @@ impl ParquetStore {
         let root = validate_private_root(root)?;
         ensure_existing_private_directory(&root.join(PARTITIONS_DIRECTORY))?;
         ensure_existing_private_directory(&root.join(RECOVERY_OUTCOMES_DIRECTORY))?;
-        Ok(Self { root, provenance })
+        let (event_index, provenance_valid) = load_event_index(&root, &provenance)?;
+        let store = Self {
+            root,
+            provenance,
+            event_index: Arc::new(Mutex::new(event_index)),
+            provenance_valid,
+        };
+        Ok(store)
     }
 
     /// Returns the BLAKE3 hash of the only physical Arrow schema accepted here.
@@ -532,6 +576,27 @@ impl ParquetStore {
     #[must_use]
     pub const fn provenance(&self) -> &DataProvenance {
         &self.provenance
+    }
+
+    fn index_events(&self, events: &[MarketEvent]) -> Result<(), ParquetError> {
+        let mut index = self
+            .event_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for event in events {
+            match index.get(event.event_id()) {
+                Some(existing) if existing != event => {
+                    return Err(ParquetError::ConflictingEvent {
+                        event_id: event.event_id().as_str().to_owned(),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    index.insert(event.event_id().clone(), event.clone());
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn recovery_outcomes_descriptor(&self) -> Result<File, ParquetError> {
@@ -629,9 +694,9 @@ impl ParquetStore {
             batches.join(capture_batch_directory_name(batch.batch_id(), true));
 
         if final_directory.exists() {
-            return self
-                .validate_existing_capture_batch(&final_directory, &batch)
-                .map(|_| batch);
+            self.validate_existing_capture_batch(&final_directory, &batch)?;
+            self.index_events(events)?;
+            return Ok(batch);
         }
         // Capture retries are all-or-nothing. A partition-level retry is not
         // enough here: republishing one old member alongside new members would
@@ -689,6 +754,7 @@ impl ParquetStore {
             }
         })?;
         sync_directory(&batches)?;
+        self.index_events(events)?;
         Ok(batch)
     }
 
@@ -707,10 +773,13 @@ impl ParquetStore {
         // whole partition, but no partial/superset batch may reuse its events.
         self.fence_existing_events(&partitions, true)?;
 
-        partitions
-            .into_iter()
-            .map(|(key, events)| self.write_partition(&key, &events, failure))
-            .collect()
+        let mut manifests = Vec::with_capacity(partitions.len());
+        for (key, events) in partitions {
+            let manifest = self.write_partition(&key, &events, failure)?;
+            self.index_events(&events)?;
+            manifests.push(manifest);
+        }
+        Ok(manifests)
     }
 
     fn fence_existing_events(
@@ -718,18 +787,13 @@ impl ParquetStore {
         candidates: &BTreeMap<PartitionKey, Vec<MarketEvent>>,
         allow_exact_legacy_partition_retries: bool,
     ) -> Result<(), ParquetError> {
-        let manifests = self.partitions()?;
-        let mut existing_events = BTreeMap::<EventId, MarketEvent>::new();
-        for manifest in &manifests {
-            for event in self.read_partition(manifest)? {
-                let event_id = event.event_id().clone();
-                if existing_events.insert(event_id.clone(), event).is_some() {
-                    return Err(ParquetError::DuplicateEvent {
-                        event_id: event_id.as_str().to_owned(),
-                    });
-                }
-            }
+        if !self.provenance_valid {
+            return Err(ParquetError::ProvenanceMismatch);
         }
+        let existing_events = self
+            .event_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for (key, events) in candidates {
             let normalized = normalize_partition_events(events)?;
             let candidate =
