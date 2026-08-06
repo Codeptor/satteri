@@ -583,6 +583,20 @@ impl ParquetStore {
         &self.provenance
     }
 
+    /// Returns an immutable source fact already indexed by canonical identity.
+    ///
+    /// Runtime capture admission uses this read-only index to distinguish a
+    /// benign rolling-window overlap from changed source evidence before any
+    /// new capture directory is staged.
+    #[must_use]
+    pub fn event_by_id(&self, event_id: &EventId) -> Option<MarketEvent> {
+        self.event_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(event_id)
+            .cloned()
+    }
+
     fn index_events(&self, events: &[MarketEvent]) -> Result<(), ParquetError> {
         let mut index = self
             .event_index

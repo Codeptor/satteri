@@ -1125,7 +1125,7 @@ async fn admit_capture_output(
 ) -> Result<StreamScopeAction, AppError> {
     match output {
         CaptureOutput::Captured(batch) => {
-            let fresh_events = capture_fresh_events(authority, batch.events())?;
+            let fresh_events = capture_fresh_events(parquet_store, batch.events())?;
             if fresh_events.is_empty() {
                 tracing::debug!(
                     events = batch.events().len(),
@@ -1814,16 +1814,16 @@ fn is_verified_historical_source_retry(
 /// that are already durable are omitted from the new atomic capture commit,
 /// while changed payloads or regressed receipt times remain integrity errors.
 fn capture_fresh_events(
-    authority: &AuthorityState,
+    parquet_store: &ParquetStore,
     events: &[MarketEvent],
 ) -> Result<Vec<MarketEvent>, AppError> {
     let mut fresh = Vec::with_capacity(events.len());
     for event in events {
-        let Some(historical) = authority.historical_sources.get(event.event_id()) else {
+        let Some(historical) = parquet_store.event_by_id(event.event_id()) else {
             fresh.push(event.clone());
             continue;
         };
-        if historical == event || capture_source_equivalent(historical, event) {
+        if historical == *event || capture_source_equivalent(&historical, event) {
             continue;
         }
         return Err(AppError::HistoricalSourceConflict {
@@ -2775,9 +2775,9 @@ mod tests {
         .await
         .expect("fixture writer");
         let mut authority = authority("run-capture-mixed-history");
-        authority
-            .historical_sources
-            .insert(historical.event_id().clone(), historical);
+        store
+            .write_events(std::slice::from_ref(&historical))
+            .expect("historical source is already durable");
         let _ = authority.live.replace_persisted_scope(vec![btc()]);
         let scope_before = authority.live.scope.clone();
         let epoch_before = authority.live.epoch;
