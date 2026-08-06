@@ -79,6 +79,26 @@ impl AvailabilityCutoff {
         Ok(value)
     }
 
+    /// Returns the local receipt boundary carried by this cutoff.
+    #[must_use]
+    pub fn received_at(&self) -> TimestampNs {
+        TimestampNs::new(i128::from(self.received_at_ns))
+            .expect("validated availability cutoff receipt timestamp")
+    }
+
+    /// Returns the source event-time boundary carried by this cutoff.
+    #[must_use]
+    pub fn event_time(&self) -> TimestampNs {
+        TimestampNs::new(i128::from(self.event_time_ns))
+            .expect("validated availability cutoff event timestamp")
+    }
+
+    /// Returns the event identity that closes this availability cutoff.
+    #[must_use]
+    pub fn event_id(&self) -> EventId {
+        EventId::new(self.event_id.clone()).expect("validated availability cutoff event ID")
+    }
+
     fn validate(&self) -> Result<(), ResearchSidecarError> {
         TimestampNs::new(i128::from(self.received_at_ns))?;
         TimestampNs::new(i128::from(self.event_time_ns))?;
@@ -1251,6 +1271,18 @@ impl DecisionWitnessIndex {
         EventId::new(self.decision_id.clone()).expect("validated decision ID")
     }
 
+    /// Returns the exact availability cutoff admitted for this decision.
+    #[must_use]
+    pub const fn cutoff(&self) -> &AvailabilityCutoff {
+        &self.cutoff
+    }
+
+    /// Returns the raw source references consumed by the four witnesses.
+    #[must_use]
+    pub fn input_references(&self) -> &[AvailabilitySourceReference] {
+        &self.input_references
+    }
+
     /// Returns the four ordered raw-witness references required for this decision.
     #[must_use]
     pub fn witnesses(&self) -> [&WitnessReference; 4] {
@@ -1292,6 +1324,12 @@ impl DecisionIndexShard {
         };
         value.validate()?;
         Ok(value)
+    }
+
+    /// Returns the ordered decision records carried by this shard.
+    #[must_use]
+    pub fn records(&self) -> &[DecisionWitnessIndex] {
+        &self.records
     }
 
     fn validate(&self) -> Result<(), ResearchSidecarError> {

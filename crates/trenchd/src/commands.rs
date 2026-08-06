@@ -19,6 +19,11 @@ use trench_hyperliquid::{
 };
 use trench_storage::parquet::{DataProvenance, ParquetError, ParquetStore};
 use trench_storage::replay::{ReplayError, ReplayPlan};
+use trench_storage::research_compile::{ResearchCompileError, ResearchEvidenceCompiler};
+use trench_storage::research_plan::{
+    ResearchMemberLocator, ResearchPlanError, ResearchSourcePlanBuilder,
+};
+use trench_storage::research_runs::{ResearchRunError, VerifiedResearchSourcePlan};
 
 use crate::admin;
 use crate::app::{self, RuntimeMode};
@@ -421,15 +426,11 @@ fn physical_config_target(config_path: &Path) -> Result<PathBuf, RulesArtifactEr
     Ok(target)
 }
 
-/// Runs the authoritative rules-research admission path.
-///
-/// The present archived source format contains normalized market facts only;
-/// it does not yet contain the point-in-time universe/features/recovery input
-/// stream required to construct real `Engine` entry arbitration. The command
-/// therefore writes a canonical ineligible report instead of substituting a
-/// candle or approximate-cost backtest. Once that typed replay adapter exists,
-/// it must implement `trench_core::validation::RuleReplay` and supply actual
-/// engine/broker/ledger stream commitments to the core validator.
+/// Builds and validates the causal source run before the rules-research
+/// admission path evaluates history. The source run is intentionally kept
+/// separate from strategy validation: normalized facts alone still cannot
+/// produce a rules artifact, and the command remains fail-closed until the
+/// typed universe/feature/risk replay adapter is supplied.
 pub fn research_rules(arguments: RulesResearchArgs) -> Result<RulesResearchResult, CommandError> {
     require_absolute(&arguments.manifest, "manifest")?;
     require_absolute(&arguments.output, "output")?;
@@ -446,6 +447,17 @@ pub fn research_rules(arguments: RulesResearchArgs) -> Result<RulesResearchResul
     let parquet_root = loaded.resolve_configured_path(loaded.config.storage().parquet_path())?;
     let replay =
         trench_storage::replay::DeterministicReplay::open_plan(&parquet_root, plan.clone())?;
+    let output = research_output_directory(&arguments.output)?;
+    let source_plan =
+        build_verified_source_plan(&parquet_root, &replay, plan.provenance(), &output)?;
+    let causal = ResearchEvidenceCompiler::new().compile(&source_plan)?;
+    tracing::debug!(
+        source_plan_digest = %source_plan.source_plan_digest(),
+        availability_run_digest = %source_plan.availability_run().digest(),
+        decisions = causal.decisions().len(),
+        excluded_gaps = causal.excluded_gaps().len(),
+        "validated causal source run before rules research"
+    );
     let provenance = research_provenance(&loaded.bytes, &plan, replay.events())?;
     let observed_days = observed_source_span_days(replay.events());
     let report = if observed_days < trench_core::validation::ValidationPlan::minimum_complete_days()
@@ -454,7 +466,60 @@ pub fn research_rules(arguments: RulesResearchArgs) -> Result<RulesResearchResul
     } else {
         RulesValidationReport::required_data_unavailable(provenance, observed_days, Vec::new())?
     };
-    write_research_report(&arguments.output, &report)
+    write_research_report(&output, &report)
+}
+
+fn build_verified_source_plan(
+    parquet_root: &Path,
+    replay: &trench_storage::replay::DeterministicReplay,
+    provenance: &DataProvenance,
+    output: &Path,
+) -> Result<VerifiedResearchSourcePlan, CommandError> {
+    let events = replay.events();
+    let first = events
+        .iter()
+        .map(|event| event.event_time())
+        .min()
+        .ok_or(CommandError::ResearchSourceEmpty)?;
+    let last = events
+        .iter()
+        .map(|event| event.event_time())
+        .max()
+        .ok_or(CommandError::ResearchSourceEmpty)?;
+    let warmup_start =
+        trench_core::event::TimestampNs::new(i128::from(first.value().saturating_sub(1)))?;
+    let warmup_end = if first.value() == i64::MAX {
+        return Err(CommandError::ResearchSourceWindow);
+    } else {
+        trench_core::event::TimestampNs::new(i128::from(first.value().saturating_add(1)))?
+    };
+    let evaluation_end_value = i128::from(last.value())
+        .checked_add(1)
+        .ok_or(CommandError::ResearchSourceWindow)?
+        .max(
+            i128::from(warmup_end.value())
+                .checked_add(1)
+                .ok_or(CommandError::ResearchSourceWindow)?,
+        );
+    let evaluation_end = trench_core::event::TimestampNs::new(evaluation_end_value)?;
+    if evaluation_end <= warmup_end {
+        return Err(CommandError::ResearchSourceWindow);
+    }
+    let store = ParquetStore::open_existing(parquet_root, provenance.clone())?;
+    let draft = ResearchSourcePlanBuilder::new(
+        trench_core::validation::TimeRange::new(warmup_start, warmup_end)?,
+        trench_core::validation::TimeRange::new(warmup_end, evaluation_end)?,
+    )?
+    .build(
+        &store,
+        replay
+            .manifests()
+            .iter()
+            .map(ResearchMemberLocator::legacy)
+            .collect(),
+        Vec::new(),
+    )?;
+    Ok(draft.publish_to(&store, output.join("source-plan"))?)
 }
 
 fn research_provenance(
@@ -1156,6 +1221,9 @@ pub enum CommandError {
     /// The replay source contained no normalized market facts.
     #[error("research replay source is empty")]
     ResearchSourceEmpty,
+    /// The replay source cannot form two bounded contiguous source windows.
+    #[error("research replay source cannot form a bounded source window")]
+    ResearchSourceWindow,
     /// A local filesystem operation failed.
     #[error("filesystem operation failed while {operation}")]
     Filesystem {
@@ -1181,6 +1249,18 @@ pub enum CommandError {
     /// The frozen replay-plan construction or persistence failed.
     #[error(transparent)]
     Replay(#[from] ReplayError),
+    /// The verified research source-plan construction failed.
+    #[error(transparent)]
+    ResearchPlan(#[from] ResearchPlanError),
+    /// The verified availability run could not be reopened or published.
+    #[error(transparent)]
+    ResearchRun(#[from] ResearchRunError),
+    /// Causal source compilation rejected the verified source run.
+    #[error(transparent)]
+    ResearchCompile(#[from] ResearchCompileError),
+    /// A normalized source timestamp could not be represented.
+    #[error(transparent)]
+    Event(#[from] trench_core::event::EventError),
     /// Daemon lifecycle or deterministic replay orchestration failed.
     #[error(transparent)]
     App(#[from] crate::app::AppError),

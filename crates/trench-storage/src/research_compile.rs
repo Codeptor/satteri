@@ -22,8 +22,8 @@ use crate::{
         AvailabilityKey, AvailabilitySourceReference, ResearchRunError, VerifiedResearchSourcePlan,
     },
     research_sidecar::{
-        AvailabilityCutoff, ExcludedGap, ExclusionReason, RecoverySource, RecoveryStatus,
-        RecoveryWitness, ResearchSidecarError, ResearchSidecarWriter,
+        AvailabilityCutoff, DecisionIndexShard, ExcludedGap, ExclusionReason, RecoverySource,
+        RecoveryStatus, RecoveryWitness, ResearchSidecarError, ResearchSidecarWriter, WitnessShard,
     },
 };
 
@@ -352,6 +352,58 @@ impl ResearchEvidenceCompiler {
             recovery_witnesses,
         })
     }
+
+    /// Completes the causal pass with a source-bound typed witness set.
+    ///
+    /// This is the only bridge from the availability compiler to sidecar
+    /// publication. It does not derive or trust any witness output: callers
+    /// must provide records produced by the typed universe/feature/risk
+    /// recomputation APIs, and every decision boundary must be represented
+    /// exactly once. Publishing remains an explicit caller action and this
+    /// method never changes daemon readiness or strategy configuration.
+    pub fn complete_sidecar_writer(
+        &self,
+        source_plan: &VerifiedResearchSourcePlan,
+        result: &ResearchCompileResult,
+        witness_shards: Vec<WitnessShard>,
+        decision_shards: Vec<DecisionIndexShard>,
+    ) -> Result<ResearchSidecarWriter, ResearchCompileError> {
+        if result.decisions.is_empty() {
+            return Err(ResearchCompileError::IncompleteWitnesses);
+        }
+        if witness_shards.is_empty() || decision_shards.is_empty() {
+            return Err(ResearchCompileError::IncompleteWitnesses);
+        }
+
+        let expected = result
+            .decisions
+            .iter()
+            .map(|decision| {
+                (
+                    decision.decision_id().as_str().to_owned(),
+                    decision.availability_cutoff().clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut observed = BTreeSet::new();
+        for decision in decision_shards.iter().flat_map(DecisionIndexShard::records) {
+            if expected
+                .get(decision.decision_id())
+                .is_none_or(|cutoff| cutoff != decision.cutoff())
+                || !observed.insert(decision.decision_id().to_owned())
+            {
+                return Err(ResearchCompileError::InvalidWitnessSet);
+            }
+            source_plan.validate_source_references(decision.input_references())?;
+        }
+        if observed.len() != expected.len() {
+            return Err(ResearchCompileError::InvalidWitnessSet);
+        }
+
+        Ok(ResearchSidecarWriter::new(source_plan)?
+            .with_witness_shards(witness_shards)?
+            .with_decision_index_shards(decision_shards)?)
+    }
 }
 
 fn availability_source_reference(
@@ -486,4 +538,7 @@ pub enum ResearchCompileError {
     /// A bounded causal input exceeded its fixed resource limit.
     #[error("research compiler resource limit exceeded")]
     ResourceLimit,
+    /// The typed sidecar decision indexes do not exactly cover the causal pass.
+    #[error("typed sidecar witnesses do not exactly cover the causal decisions")]
+    InvalidWitnessSet,
 }
