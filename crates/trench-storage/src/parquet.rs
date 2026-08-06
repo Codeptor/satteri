@@ -484,7 +484,12 @@ fn load_event_index(
     provenance: &DataProvenance,
 ) -> Result<(BTreeMap<EventId, MarketEvent>, bool), ParquetError> {
     let mut index = BTreeMap::new();
-    for candidate in scan_complete_partition_directories(root, provenance)? {
+    let candidates = match scan_complete_partition_directories(root, provenance) {
+        Ok(candidates) => candidates,
+        Err(ParquetError::ProvenanceMismatch) => return Ok((BTreeMap::new(), false)),
+        Err(error) => return Err(error),
+    };
+    for candidate in candidates {
         let _manifest = match read_partition_directory(
             &candidate.directory,
             provenance,
