@@ -17,7 +17,6 @@ import { BentoGrid } from "@/components/ui/bento-grid"
 import { BorderBeam } from "@/components/ui/border-beam"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card"
-import { ChartContainer, ChartTooltip as ShadChartTooltip, ChartTooltipContent } from "@/components/ui/chart"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
 import {
@@ -136,9 +135,6 @@ export default async function Page() {
   const readinessPct = markets.length ? Math.round((entryReadyCount / markets.length) * 100) : 0
 
   const evilData = equityData.map((d) => ({ t: d.t, equity: d.equity }))
-  const evilConfig = {
-    equity: { label: "Equity (USDC)", color: "hsl(var(--chart-1))" },
-  }
 
   const auditRows: Array<[string, string, string, string]> = [
     ["transport", "unix socket", "browser isolated", ok ? "safe" : "wait"],
