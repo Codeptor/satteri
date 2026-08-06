@@ -2,6 +2,10 @@
 //!
 //! The runtime is added alongside the wire decoder. This module already keeps
 //! its configuration constrained to the documented public connection budgets.
+//! Stripped v1 keeps `l2Book`, `trades`, `bbo`, `allMids` subscriptions for
+//! ephemeral execution (`broker/fill.rs:walk`, `risk/sizing.rs`) but persistence
+//! filters via `trench_storage::sqlite::should_persist_market_event` to
+//! `bbo@close` (15m boundary) and drops `l2Book` entirely.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;

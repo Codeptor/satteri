@@ -477,6 +477,8 @@ impl SqliteStore {
             .await
             .map_err(StoreError::Migration)?;
 
+        ensure_persistence_indexes(&mut connection).await?;
+
         let mut store = Self { connection };
         store.verify_pragmas().await?;
         Ok(store)
@@ -1024,6 +1026,20 @@ impl SqliteStore {
         read_pragmas(&mut self.connection).await
     }
 
+    /// Deletes stale `bbo` events before `cutoff_ns` for nightly pruning.
+    ///
+    /// `events(event_time_ns, event_kind)` is indexed via `idx_events_time_kind`.
+    /// Returns rows deleted.
+    pub async fn prune_bbo_before(&mut self, cutoff_ns: i64) -> Result<u64, StoreError> {
+        validate_timestamp("cutoff_ns", cutoff_ns)?;
+        let result =
+            sqlx::query("DELETE FROM events WHERE event_kind = 'bbo' AND event_time_ns < ?1")
+                .bind(cutoff_ns)
+                .execute(&mut self.connection)
+                .await?;
+        Ok(result.rows_affected())
+    }
+
     async fn verify_pragmas(&mut self) -> Result<(), StoreError> {
         let pragmas = read_pragmas(&mut self.connection).await?;
         if !pragmas.journal_mode.eq_ignore_ascii_case("wal") {
@@ -1336,5 +1352,80 @@ fn validate_timestamp(field: &'static str, value: i64) -> Result<(), StoreError>
             reason: "must be a non-negative Unix nanosecond timestamp",
         });
     }
+    Ok(())
+}
+
+/// 15-minute bar-close interval in nanoseconds, derived from
+/// `trench_core::event::CandleInterval::FifteenMinutes`.
+pub const FIFTEEN_MINUTE_NS: i64 = 900_000_000_000;
+
+/// Returns whether a BBO `event_time_ns` is exactly on a 15-minute bar-close boundary.
+///
+/// This is the `CandleInterval::FifteenMinutes` boundary using
+/// `CandleAggregator::bucket_open` semantics (`t % 15m == 0`). Zero is
+/// considered not at close to avoid persisting genesis-time synthetic ticks.
+/// Uses `CandleInterval::FifteenMinutes.duration()` as the canonical source
+/// (see `crates/trench-core/src/candle.rs` — `bar_boundary` does not exist).
+#[must_use]
+pub fn is_bbo_at_bar_close(event_time_ns: i64) -> bool {
+    // Canonical duration from `trench_core::event::CandleInterval`.
+    let interval = trench_core::event::CandleInterval::FifteenMinutes
+        .duration()
+        .value();
+    event_time_ns != 0 && event_time_ns % interval == 0
+}
+
+/// Returns whether a normalized market event should be durably persisted.
+///
+/// Stripped v1 persists only `trades+allMids(1/min)+BBO@close+15m/1h candles+funding/universe/ledger`.
+/// `l2Book` (`BookSnapshot`) is kept ephemerally for `broker/fill.rs:walk` and
+/// `risk/sizing.rs` but never persisted. BBO is persisted only when
+/// `event_time_ns` is on a 15m close.
+#[must_use]
+pub fn should_persist_market_event(event: &trench_core::event::MarketEvent) -> bool {
+    use trench_core::event::MarketEventKind;
+    match event.kind() {
+        MarketEventKind::BookSnapshot(_) => false,
+        MarketEventKind::Bbo(_) => is_bbo_at_bar_close(event.event_time().value()),
+        _ => true,
+    }
+}
+
+/// Filters a batch of normalized market events to only those that should be persisted.
+///
+/// Drops `l2Book` rows entirely and keeps `bbo` only at 15m boundaries.
+#[must_use]
+pub fn filter_events_for_persistence(
+    events: &[trench_core::event::MarketEvent],
+) -> Vec<trench_core::event::MarketEvent> {
+    events
+        .iter()
+        .filter(|event| should_persist_market_event(event))
+        .cloned()
+        .collect()
+}
+
+/// Prunes stale BBO events before `cutoff_ns` from the `events` table.
+///
+/// Caller must ensure this is called only for nightly maintenance and not
+/// concurrently with `append_engine_outcome`. Returns rows deleted.
+pub async fn prune_bbo_before(
+    connection: &mut SqliteConnection,
+    cutoff_ns: i64,
+) -> Result<u64, StoreError> {
+    validate_timestamp("cutoff_ns", cutoff_ns)?;
+    let result = sqlx::query("DELETE FROM events WHERE event_kind = 'bbo' AND event_time_ns < ?1")
+        .bind(cutoff_ns)
+        .execute(connection)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+async fn ensure_persistence_indexes(connection: &mut SqliteConnection) -> Result<(), StoreError> {
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_events_time_kind ON events(event_time_ns, event_kind)",
+    )
+    .execute(connection)
+    .await?;
     Ok(())
 }

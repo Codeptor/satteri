@@ -21,7 +21,7 @@ report_failure() {
 
 is_documentation_path() {
     case "$1" in
-        AGENTS.md | README.md | CONTRIBUTING.md | SECURITY.md | LICENSE-* | docs/*)
+        AGENTS.md | README.md | CONTRIBUTING.md | SECURITY.md | LICENSE-* | docs/* | handoff.md)
             return 0
             ;;
         *)

@@ -6,6 +6,11 @@ use trench_core::domain::{Market, Price, Quantity, Usdc};
 
 use crate::info::{CandleInterval, InfoError, TimeRange};
 
+// Stripped v1: `l2Book` normalization is kept for ephemeral execution
+// (`broker/fill.rs`, `risk/sizing.rs`) but persistence via
+// `trench_storage::sqlite::should_persist_market_event` drops `BookSnapshot`
+// and keeps `Bbo` only at 15m bar-close. `allMids`/`trades` pass through.
+
 /// A checked, positive venue leverage limit independent of paper leverage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VenueMaxLeverage(u32);

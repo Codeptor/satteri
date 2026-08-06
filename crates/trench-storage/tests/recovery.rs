@@ -1843,3 +1843,162 @@ async fn open_reopens_existing_dedicated_database_without_mutating_permissions()
 
     assert_eq!((parent_mode, file_mode), (0o700, 0o600));
 }
+
+#[tokio::test]
+async fn bbo_persist_only_at_bar_close() {
+    use rust_decimal_macros::dec;
+    use trench_core::domain::{Market, Price, Quantity, Side};
+    use trench_core::event::{
+        Bbo, BookLevel, BookSnapshot, MarketEvent, MarketEventKind, TimestampNs, Trade,
+    };
+    use trench_hyperliquid::{ArchiveManifest, ArchiveReader};
+    use trench_storage::parquet::{DataProvenance, ParquetStore};
+    use trench_storage::sqlite::{FIFTEEN_MINUTE_NS, filter_events_for_persistence};
+
+    // Build 20 native markets and a per-tick BBO batch that is 20 * (96 on-close + 99 off-close) + l2Book noise.
+    let markets: Vec<Market> = (0..20)
+        .map(|i| Market::new(format!("MKT{i:02}")).expect("native market"))
+        .collect();
+
+    fn make_bbo(at_ns: i64, seq: u64, market: Market) -> MarketEvent {
+        let event_time = TimestampNs::new(i128::from(at_ns)).expect("bbo event time");
+        let received = TimestampNs::new(i128::from(at_ns) + 1_000_000).expect("bbo received");
+        let bbo = Bbo::new(
+            seq,
+            BookLevel::new(
+                Price::new(dec!(99)).expect("price"),
+                Quantity::new(dec!(1)).expect("qty"),
+            ),
+            BookLevel::new(
+                Price::new(dec!(100)).expect("price"),
+                Quantity::new(dec!(1)).expect("qty"),
+            ),
+        )
+        .expect("bbo");
+        MarketEvent::bbo(event_time, received, market, bbo).expect("bbo event")
+    }
+
+    let mut events = Vec::new();
+    for market in &markets {
+        for bar in 0..96 {
+            let at_ns = bar as i64 * FIFTEEN_MINUTE_NS;
+            // ensure zero not counted as close (our helper excludes 0)
+            let at_ns = if at_ns == 0 { FIFTEEN_MINUTE_NS } else { at_ns };
+            events.push(make_bbo(at_ns, bar as u64, market.clone()));
+        }
+        // also test zero is excluded
+        events.push(make_bbo(0, 9999, market.clone()));
+        for off in 1..100 {
+            let at_ns = off * 1_000_000_000;
+            if at_ns % FIFTEEN_MINUTE_NS != 0 {
+                events.push(make_bbo(at_ns, 1000 + off as u64, market.clone()));
+            }
+        }
+        for seq in 0..5 {
+            let at_ns = seq as i64 * FIFTEEN_MINUTE_NS + 123;
+            let event_time = TimestampNs::new(i128::from(at_ns)).expect("book time");
+            let received = TimestampNs::new(i128::from(at_ns) + 1_000_000).expect("book received");
+            let snap = BookSnapshot::new(
+                seq as u64,
+                vec![BookLevel::new(
+                    Price::new(dec!(99)).expect("price"),
+                    Quantity::new(dec!(1)).expect("qty"),
+                )],
+                vec![BookLevel::new(
+                    Price::new(dec!(100)).expect("price"),
+                    Quantity::new(dec!(1)).expect("qty"),
+                )],
+            );
+            events.push(
+                MarketEvent::book_snapshot(event_time, received, market.clone(), snap)
+                    .expect("book event"),
+            );
+        }
+        // ensure trades are kept
+        let at_ns = 1_000_000_000_i64;
+        events.push(
+            MarketEvent::trade(
+                TimestampNs::new(i128::from(at_ns)).expect("trade time"),
+                TimestampNs::new(i128::from(at_ns) + 1).expect("trade received"),
+                market.clone(),
+                Trade::new(
+                    1,
+                    Side::Buy,
+                    Price::new(dec!(100)).expect("price"),
+                    Quantity::new(dec!(1)).expect("qty"),
+                )
+                .expect("trade"),
+            )
+            .expect("trade event"),
+        );
+    }
+
+    let filtered = filter_events_for_persistence(&events);
+    let bbo_count = filtered
+        .iter()
+        .filter(|e| matches!(e.kind(), MarketEventKind::Bbo(_)))
+        .count();
+    // 96 per market, but we added zero which must be dropped, so still 96 per market
+    assert_eq!(
+        bbo_count,
+        96 * 20,
+        "BBO must be persisted only at 15m bar-close, got {bbo_count}"
+    );
+    let l2_count = filtered
+        .iter()
+        .filter(|e| matches!(e.kind(), MarketEventKind::BookSnapshot(_)))
+        .count();
+    assert_eq!(
+        l2_count, 0,
+        "l2Book must never be persisted, got {l2_count}"
+    );
+
+    // Parquet disabled stub must error (adapted to real ParquetStore::write_events)
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("tmpdir perms");
+    }
+    let parquet_root = tmp.path();
+    // DataProvenance requires b3: digest form and schema hash
+    let provenance = DataProvenance::new(
+        format!("b3:{}", blake3::hash(b"config").to_hex()),
+        format!("b3:{}", blake3::hash(b"code").to_hex()),
+        ParquetStore::schema_hash(),
+    )
+    .expect("provenance");
+    let store = ParquetStore::open(parquet_root, provenance).expect("store open");
+    let trade = MarketEvent::trade(
+        TimestampNs::new(1_000_000_000_i128).expect("trade time"),
+        TimestampNs::new(1_000_000_001_i128).expect("trade received"),
+        Market::new("BTC").expect("market"),
+        Trade::new(
+            42,
+            Side::Buy,
+            Price::new(dec!(100)).expect("price"),
+            Quantity::new(dec!(1)).expect("qty"),
+        )
+        .expect("trade"),
+    )
+    .expect("trade event");
+    assert!(
+        store.write_events(std::slice::from_ref(&trade)).is_err(),
+        "parquet write_events must be disabled in stripped v1"
+    );
+    assert!(
+        store
+            .write_capture_batch(std::slice::from_ref(&trade))
+            .is_err(),
+        "parquet write_capture_batch must be disabled in stripped v1"
+    );
+
+    // Archive disabled stub must error (adapted to real ArchiveReader::open(source_root, manifest))
+    let manifest = ArchiveManifest::new(1_700_000_000_000_i64, Vec::new(), Vec::new())
+        .expect("archive manifest");
+    assert!(
+        ArchiveReader::open("/tmp", manifest).is_err(),
+        "archive must be disabled in stripped v1"
+    );
+}
