@@ -59,6 +59,31 @@ fn trade(event_time: i64, received_at: i64, trade_id: u64) -> MarketEvent {
     .expect("fixture event")
 }
 
+fn source_events(trade_id: u64) -> Vec<MarketEvent> {
+    (0..4)
+        .map(|offset| {
+            let offset = i64::from(offset);
+            trade(
+                1 + offset,
+                2 + offset,
+                trade_id
+                    .checked_mul(10)
+                    .and_then(|base| base.checked_add(u64::try_from(offset).expect("small offset")))
+                    .expect("fixture trade identifier"),
+            )
+        })
+        .collect()
+}
+
+fn source_input_ids(trade_id: u64) -> Vec<EventId> {
+    let mut ids = source_events(trade_id)
+        .into_iter()
+        .map(|event| event.event_id().clone())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
+}
+
 fn secure(root: &TempDir) {
     #[cfg(not(unix))]
     let _ = root;
@@ -78,14 +103,16 @@ fn plan(root: &TempDir, output: &str, trade_id: u64) -> (ParquetStore, VerifiedR
     let provenance = DataProvenance::new(digest('a'), digest('b'), ParquetStore::schema_hash())
         .expect("fixture provenance");
     let store = ParquetStore::open(root.path(), provenance).expect("fixture store");
-    let manifests = store
-        .write_events(&[trade(100, 101, trade_id)])
-        .expect("fixture partition");
+    let events = source_events(trade_id);
+    let manifests = store.write_events(&events).expect("fixture partition");
     let draft = ResearchSourcePlanBuilder::new(range(0, 500), range(500, 1_000))
         .expect("fixture windows")
         .build(
             &store,
-            vec![ResearchMemberLocator::legacy(&manifests[0])],
+            manifests
+                .iter()
+                .map(ResearchMemberLocator::legacy)
+                .collect(),
             Vec::new(),
         )
         .expect("fixture draft");
@@ -95,10 +122,15 @@ fn plan(root: &TempDir, output: &str, trade_id: u64) -> (ParquetStore, VerifiedR
 }
 
 fn witness_shards(decision_id: &EventId) -> Vec<WitnessShard> {
-    let inputs = ['a', 'b', 'c', 'd']
-        .into_iter()
-        .map(event_id)
-        .collect::<Vec<_>>();
+    witness_shards_with_inputs(decision_id, &source_input_ids(1))
+}
+
+fn witness_shards_with_inputs(decision_id: &EventId, inputs: &[EventId]) -> Vec<WitnessShard> {
+    assert_eq!(
+        inputs.len(),
+        4,
+        "fixture needs one raw input per witness kind"
+    );
     vec![
         WitnessShard::recovery(
             "recovery",
@@ -182,10 +214,26 @@ fn decision_with_references(
     feature: WitnessReference,
     risk: WitnessReference,
 ) -> DecisionWitnessIndex {
-    let inputs = ['a', 'b', 'c', 'd']
-        .into_iter()
-        .map(event_id)
-        .collect::<Vec<_>>();
+    decision_with_inputs(
+        decision_character,
+        cutoff_received_at,
+        source_input_ids(1),
+        recovery,
+        universe,
+        feature,
+        risk,
+    )
+}
+
+fn decision_with_inputs(
+    decision_character: char,
+    cutoff_received_at: i64,
+    inputs: Vec<EventId>,
+    recovery: WitnessReference,
+    universe: WitnessReference,
+    feature: WitnessReference,
+    risk: WitnessReference,
+) -> DecisionWitnessIndex {
     DecisionWitnessIndex::new(
         event_id(decision_character),
         cutoff(cutoff_received_at, 99, event_id('d')),
@@ -211,13 +259,33 @@ fn decision(decision_character: char, cutoff_received_at: i64) -> DecisionWitnes
 }
 
 fn writer(plan: &VerifiedResearchSourcePlan) -> ResearchSidecarWriter {
+    writer_with_inputs(plan, source_input_ids(1))
+}
+
+fn writer_with_inputs(
+    plan: &VerifiedResearchSourcePlan,
+    inputs: Vec<EventId>,
+) -> ResearchSidecarWriter {
     ResearchSidecarWriter::new(plan)
         .expect("writer")
-        .with_witness_shards(witness_shards(&event_id('9')))
+        .with_witness_shards(witness_shards_with_inputs(&event_id('9'), &inputs))
         .expect("witness shards")
         .with_decision_index_shards(vec![
-            DecisionIndexShard::new("decisions-0", vec![decision('9', 100)])
-                .expect("decision index shard"),
+            DecisionIndexShard::new(
+                "decisions-0",
+                vec![decision_with_inputs(
+                    '9',
+                    100,
+                    inputs,
+                    WitnessReference::new("recovery", "recovery-record")
+                        .expect("fixture reference"),
+                    WitnessReference::new("universe", "universe-record")
+                        .expect("fixture reference"),
+                    WitnessReference::new("feature", "feature-record").expect("fixture reference"),
+                    WitnessReference::new("risk", "risk-record").expect("fixture reference"),
+                )],
+            )
+            .expect("decision index shard"),
         ])
         .expect("decision shards")
         .with_excluded_gaps(vec![
@@ -259,6 +327,22 @@ fn atomic_publish_reopens_verified_sidecar() {
         WitnessKind::Feature
     );
     assert_eq!(reopened.excluded_gaps().len(), 1);
+}
+
+#[test]
+fn sidecar_rejects_witness_inputs_missing_from_the_verified_source_plan() {
+    let root = TempDir::new().expect("temporary root");
+    secure(&root);
+    let (_store, source_plan) = plan(&root, "source-plan", 1);
+    let final_directory = root.path().join("sidecar");
+    writer_with_inputs(
+        &source_plan,
+        ['a', 'b', 'c', 'd'].into_iter().map(event_id).collect(),
+    )
+    .publish_to(&final_directory)
+    .expect("published sidecar with a forged raw input identifier");
+
+    assert!(ResearchSidecar::open_from(&final_directory, &source_plan).is_err());
 }
 
 #[test]

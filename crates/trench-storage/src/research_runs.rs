@@ -401,15 +401,39 @@ impl AvailabilityRun {
                     reason: "final availability run inspection did not consume every record",
                 });
             }
-            reader.rewind()
+            Ok(())
         });
-        match result {
+        let rewind = reader.rewind();
+        match rewind {
             Ok(file) => {
                 *guard = Some(file);
-                Ok(())
+                result
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn validate_event_ids(&self, event_ids: &[EventId]) -> Result<(), ResearchRunError> {
+        if event_ids.len() > usize::try_from(MAX_RUN_RECORDS).unwrap_or(usize::MAX) {
+            return Err(ResearchRunError::ResourceLimit);
+        }
+        let mut missing = event_ids.iter().collect::<BTreeSet<_>>();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        self.inspect_verified_records(|reader| {
+            while let Some(record) = reader.next_record()? {
+                let key = record.key();
+                missing.remove(key.event_id());
+            }
+            if missing.is_empty() {
+                Ok(())
+            } else {
+                Err(ResearchRunError::InvalidPlan {
+                    reason: "witness event identifier is absent from final availability run",
+                })
+            }
+        })
     }
 
     fn staged_file_name(&self) -> Result<&str, ResearchRunError> {
@@ -502,6 +526,15 @@ impl VerifiedResearchSourcePlan {
     #[must_use]
     pub fn provenance(&self) -> &DataProvenance {
         self.draft.provenance()
+    }
+
+    /// Descriptor-safely verifies raw-witness event identities against the immutable availability
+    /// run without consuming the compiler cursor.
+    ///
+    /// This is an interim ID-only binding. Witness formats will carry complete member/key
+    /// references once every producer can emit them.
+    pub fn validate_event_ids(&self, event_ids: &[EventId]) -> Result<(), ResearchRunError> {
+        self.availability_run.validate_event_ids(event_ids)
     }
 }
 

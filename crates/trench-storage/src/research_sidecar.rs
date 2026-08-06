@@ -39,6 +39,7 @@ const MAX_TOTAL_RECORDS: usize = 65_536;
 const MAX_REFS_PER_DECISION: usize = 8_192;
 const MAX_EXCLUDED_GAPS: usize = 16_384;
 const MAX_IDENTIFIER_BYTES: usize = 256;
+const MAX_RAW_INPUT_EVENT_IDS: usize = 1_000_000;
 
 /// The complete source-availability coordinate committed by every decision.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -406,6 +407,36 @@ impl WitnessRecord {
         }
     }
 
+    fn append_raw_input_event_ids(
+        &self,
+        event_ids: &mut Vec<EventId>,
+    ) -> Result<(), ResearchSidecarError> {
+        match self {
+            Self::Recovery(value) => append_event_ids(
+                event_ids,
+                std::iter::once(value.anchor_event_id.as_str())
+                    .chain(value.backfill_event_ids.iter().map(String::as_str)),
+            ),
+            Self::Universe(value) => append_event_ids(
+                event_ids,
+                value.candidate_event_ids.iter().map(String::as_str),
+            ),
+            Self::Feature(value) => {
+                append_event_ids(event_ids, value.input_event_ids.iter().map(String::as_str))
+            }
+            Self::Risk(value) => append_event_ids(
+                event_ids,
+                value
+                    .venue_constraint_event_ids
+                    .iter()
+                    .map(String::as_str)
+                    .chain(std::iter::once(value.book_event_id.as_str()))
+                    .chain(value.impact_event_ids.iter().map(String::as_str))
+                    .chain(value.funding_event_ids.iter().map(String::as_str)),
+            ),
+        }
+    }
+
     fn validate(&self) -> Result<(), ResearchSidecarError> {
         match self {
             Self::Recovery(value) => value.validate(),
@@ -414,6 +445,23 @@ impl WitnessRecord {
             Self::Risk(value) => value.validate(),
         }
     }
+}
+
+fn append_event_ids<'a>(
+    target: &mut Vec<EventId>,
+    values: impl IntoIterator<Item = &'a str>,
+) -> Result<(), ResearchSidecarError> {
+    for value in values {
+        if target.len() == MAX_RAW_INPUT_EVENT_IDS {
+            return Err(ResearchSidecarError::ResourceLimit);
+        }
+        target.push(EventId::new(value.to_owned()).map_err(|_| {
+            ResearchSidecarError::InvalidSidecar {
+                reason: "raw witness input identifier is invalid",
+            }
+        })?);
+    }
+    Ok(())
 }
 
 impl UniverseWitness {
@@ -776,6 +824,14 @@ impl ResearchSidecar {
     pub fn witness(&self, reference: &WitnessReference) -> Option<&WitnessRecord> {
         self.witnesses
             .get(&(reference.shard.clone(), reference.record_id.clone()))
+    }
+
+    fn raw_input_event_ids(&self) -> Result<Vec<EventId>, ResearchSidecarError> {
+        let mut event_ids = Vec::new();
+        for witness in self.witnesses.values() {
+            witness.append_raw_input_event_ids(&mut event_ids)?;
+        }
+        Ok(event_ids)
     }
 
     #[must_use]
@@ -1317,7 +1373,13 @@ fn open_sidecar(
     let manifest_bytes = read_private_file_at(&directory, SIDECAR_MANIFEST, MAX_MANIFEST_BYTES)?;
     let manifest = parse_manifest(&manifest_bytes)?;
     validate_plan_binding(&manifest, source_plan)?;
-    open_sidecar_at(&directory, &manifest, Some(source_plan))
+    let sidecar = open_sidecar_at(&directory, &manifest, Some(source_plan))?;
+    source_plan
+        .validate_event_ids(&sidecar.raw_input_event_ids()?)
+        .map_err(|_| ResearchSidecarError::InvalidSidecar {
+            reason: "sidecar raw witness inputs are not bound to the verified source plan",
+        })?;
+    Ok(sidecar)
 }
 
 fn open_sidecar_at(
