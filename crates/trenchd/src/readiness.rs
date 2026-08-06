@@ -51,6 +51,10 @@ pub enum RulesBlocker {
     Configuration,
     /// The rules sleeve lacks its required warmed feature history.
     SleeveWarmup,
+    /// No source-bound point-in-time universe witness has been activated.
+    UniverseWitness,
+    /// No source-bound risk-policy/book witness has been activated.
+    RiskWitness,
 }
 
 /// Per-market readiness facts, each set explicitly by the authority loop.
@@ -120,6 +124,8 @@ pub struct Readiness {
     markets: BTreeMap<Market, MarketGates>,
     rules_configuration_valid: bool,
     rules_sleeve_warm: bool,
+    universe_witness_valid: bool,
+    risk_witness_valid: bool,
 }
 
 impl Readiness {
@@ -179,6 +185,16 @@ impl Readiness {
         self.rules_sleeve_warm = value;
     }
 
+    /// Records whether a verified point-in-time universe witness is active.
+    pub fn set_universe_witness_valid(&mut self, value: bool) {
+        self.universe_witness_valid = value;
+    }
+
+    /// Records whether source-bound risk-policy/book witnesses are active.
+    pub fn set_risk_witness_valid(&mut self, value: bool) {
+        self.risk_witness_valid = value;
+    }
+
     /// Returns every global condition currently blocking fresh entries.
     #[must_use]
     pub fn global_blockers(&self) -> BTreeSet<GlobalBlocker> {
@@ -231,6 +247,12 @@ impl Readiness {
         }
         if !self.rules_sleeve_warm {
             blockers.insert(RulesBlocker::SleeveWarmup);
+        }
+        if !self.universe_witness_valid {
+            blockers.insert(RulesBlocker::UniverseWitness);
+        }
+        if !self.risk_witness_valid {
+            blockers.insert(RulesBlocker::RiskWitness);
         }
         blockers
     }
@@ -346,6 +368,8 @@ mod tests {
         gates.set_data_quality_valid(true);
         readiness.set_rules_configuration_valid(true);
         readiness.set_rules_sleeve_warm(true);
+        readiness.set_universe_witness_valid(true);
+        readiness.set_risk_witness_valid(true);
 
         assert!(readiness.global_blockers().is_empty());
         assert!(readiness.rules_entry_ready(&market));
@@ -368,6 +392,8 @@ mod tests {
             Readiness::set_context_capture_current,
             Readiness::set_rules_configuration_valid,
             Readiness::set_rules_sleeve_warm,
+            Readiness::set_universe_witness_valid,
+            Readiness::set_risk_witness_valid,
         ] {
             enabled(&mut readiness, true);
         }
@@ -406,7 +432,12 @@ mod tests {
 
         assert_eq!(
             readiness.rules_blockers(),
-            BTreeSet::from([RulesBlocker::Configuration, RulesBlocker::SleeveWarmup])
+            BTreeSet::from([
+                RulesBlocker::Configuration,
+                RulesBlocker::RiskWitness,
+                RulesBlocker::SleeveWarmup,
+                RulesBlocker::UniverseWitness,
+            ])
         );
         assert!(!readiness.rules_entry_ready(&market));
         assert!(readiness.mandatory_exit_ready(&market));
