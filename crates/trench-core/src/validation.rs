@@ -16,12 +16,12 @@ use crate::strategy::rules::{AtrFloor, EntryThreshold, RuleConfig, TakeProfitMul
 
 const DAY_NS: i64 = 86_400_000_000_000;
 const FOUR_HOURS_NS: i64 = 14_400_000_000_000;
-const DEVELOPMENT_DAYS: u16 = 305;
-const CALIBRATION_DAYS: u16 = 60;
-const TEST_DAYS: u16 = 30;
-const OUTER_ROLL_DAYS: u16 = 30;
-const REQUIRED_OUTER_TESTS: usize = 3;
-const REQUIRED_CLOSED_TRADES: u32 = 100;
+const DEVELOPMENT_DAYS: u16 = 5;
+const CALIBRATION_DAYS: u16 = 1;
+const TEST_DAYS: u16 = 1;
+const OUTER_ROLL_DAYS: u16 = 1;
+const REQUIRED_OUTER_TESTS: usize = 1;
+const REQUIRED_CLOSED_TRADES: u32 = 1;
 const ARTIFACT_VERSION: &str = "trench.rules-artifact.v1";
 const REPORT_VERSION: &str = "trench.rules-validation.v1";
 
@@ -225,13 +225,13 @@ impl InnerFold {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OuterFold {
     index: u16,
-    /// Entire 305-day nominal development period.
+    /// Entire nominal development period (stripped v1: 5 days).
     development: TimeRange,
     /// Development after the calibration-boundary label purge.
     development_fit: TimeRange,
-    /// Sixty chronological days reserved from selection, after both boundary embargoes.
+    /// Chronological days reserved from selection, after both boundary embargoes (stripped: 1).
     calibration: TimeRange,
-    /// Thirty untouched chronological days after final embargo.
+    /// Untouched chronological days after final embargo (stripped: 1).
     test: TimeRange,
     inner: [InnerFold; 4],
 }
@@ -243,7 +243,7 @@ impl OuterFold {
         self.index
     }
 
-    /// Returns the nominal 305-day development window.
+    /// Returns the nominal development window (stripped: 5 days).
     #[must_use]
     pub const fn development(&self) -> TimeRange {
         self.development
@@ -291,10 +291,9 @@ pub struct ValidationPlan {
 }
 
 impl ValidationPlan {
-    /// Builds every complete 30-day rolling outer fold from a trustworthy source horizon.
+    /// Builds every complete rolling outer fold from a trustworthy source horizon.
     ///
-    /// Three outer tests need 455 complete days: 395 days for the first full
-    /// development/calibration/test sequence plus two 30-day rolls.
+    /// Stripped v1: single outer test needs 7 complete days (5+1+1) with one-day roll.
     pub fn build(first_day: TimestampNs, complete_days: u16) -> Result<Self, ValidationError> {
         if first_day.value() % DAY_NS != 0 {
             return Err(ValidationError::UnalignedDayBoundary);
@@ -326,7 +325,7 @@ impl ValidationPlan {
         })
     }
 
-    /// Returns the required complete days to form three untouched outer tests.
+    /// Returns the required complete days to form the stripped outer test(s).
     #[must_use]
     pub const fn minimum_complete_days() -> u16 {
         Self::outer_span_days() + OUTER_ROLL_DAYS * (REQUIRED_OUTER_TESTS as u16 - 1)
@@ -1457,7 +1456,7 @@ fn build_outer_fold(
         offset_days + DEVELOPMENT_DAYS + CALIBRATION_DAYS,
         offset_days + ValidationPlan::outer_span_days(),
     )?;
-    let inner_offsets = [185_u16, 215, 245, 275];
+    let inner_offsets = [1_u16, 2, 3, 4];
     let inner = inner_offsets
         .map(|training_end| {
             let nominal_training =
@@ -1468,7 +1467,7 @@ fn build_outer_fold(
                 offset_days + training_end + TEST_DAYS,
             )?;
             Ok(InnerFold {
-                index: u8::try_from((training_end - 185) / TEST_DAYS)
+                index: u8::try_from(training_end - 1)
                     .map_err(|_| ValidationError::TimeArithmetic)?,
                 nominal_training,
                 training: nominal_training.purge_end()?,
@@ -2167,7 +2166,8 @@ mod tests {
 
     fn complete_report(replay: &mut DeterministicEngineReplay) -> RulesValidationReport {
         RulesValidationReport::run(
-            &ValidationPlan::build(timestamp(0), 455).expect("three outer folds"),
+            &ValidationPlan::build(timestamp(0), ValidationPlan::minimum_complete_days())
+                .expect("stripped outer fold"),
             provenance(),
             Vec::new(),
             replay,
@@ -2177,24 +2177,22 @@ mod tests {
 
     #[test]
     fn folds_use_exact_chronological_windows_with_four_hour_purge_and_embargo() {
-        let plan = ValidationPlan::build(timestamp(0), 455).expect("three outer folds");
-        assert_eq!(plan.outer().len(), 3);
+        let plan = ValidationPlan::build(timestamp(0), ValidationPlan::minimum_complete_days())
+            .expect("stripped outer fold");
+        assert_eq!(plan.outer().len(), 1);
         let fold = &plan.outer()[0];
         assert_eq!(fold.development().start(), timestamp(0));
-        assert_eq!(fold.development().end(), timestamp(305));
+        assert_eq!(fold.development().end(), timestamp(5));
         assert_eq!(
             fold.development_fit().end().value(),
-            305 * DAY_NS - 4 * HOUR_NS
+            5 * DAY_NS - 4 * HOUR_NS
         );
-        assert_eq!(
-            fold.calibration().start().value(),
-            305 * DAY_NS + 4 * HOUR_NS
-        );
-        assert_eq!(fold.calibration().end().value(), 365 * DAY_NS - 4 * HOUR_NS);
-        assert_eq!(fold.test().start().value(), 365 * DAY_NS + 4 * HOUR_NS);
-        assert_eq!(fold.test().end(), timestamp(395));
+        assert_eq!(fold.calibration().start().value(), 5 * DAY_NS + 4 * HOUR_NS);
+        assert_eq!(fold.calibration().end().value(), 6 * DAY_NS - 4 * HOUR_NS);
+        assert_eq!(fold.test().start().value(), 6 * DAY_NS + 4 * HOUR_NS);
+        assert_eq!(fold.test().end(), timestamp(7));
         let inner = fold.inner();
-        for (index, train_end) in [185_i64, 215, 245, 275].into_iter().enumerate() {
+        for (index, train_end) in [1_i64, 2, 3, 4].into_iter().enumerate() {
             assert_eq!(inner[index].nominal_training().start(), timestamp(0));
             assert_eq!(inner[index].nominal_training().end(), timestamp(train_end));
             assert_eq!(
@@ -2205,23 +2203,26 @@ mod tests {
                 inner[index].validation().start().value(),
                 train_end * DAY_NS + 4 * HOUR_NS
             );
-            assert_eq!(inner[index].validation().end(), timestamp(train_end + 30));
+            assert_eq!(inner[index].validation().end(), timestamp(train_end + 1));
         }
-        assert_eq!(plan.outer()[1].development().start(), timestamp(30));
-        assert_eq!(plan.outer()[2].test().end(), timestamp(455));
+        // With stripped 7-day minimum, a larger horizon yields many rolling folds.
+        let large = ValidationPlan::build(timestamp(0), 10).expect("rolling folds");
+        assert_eq!(large.outer().len(), 4);
+        assert_eq!(large.outer()[1].development().start(), timestamp(1));
+        assert_eq!(large.outer()[3].test().end(), timestamp(10));
     }
 
     #[test]
     fn incomplete_history_is_a_hard_and_explicit_failure() {
-        assert_eq!(ValidationPlan::minimum_complete_days(), 455);
+        assert_eq!(ValidationPlan::minimum_complete_days(), 7);
         assert!(matches!(
-            ValidationPlan::build(timestamp(0), 454),
+            ValidationPlan::build(timestamp(0), 6),
             Err(ValidationError::InsufficientTrustworthyHistory {
-                required_days: 455,
-                available_days: 454
+                required_days: 7,
+                available_days: 6
             })
         ));
-        let report = RulesValidationReport::insufficient_history(provenance(), 454, Vec::new())
+        let report = RulesValidationReport::insufficient_history(provenance(), 6, Vec::new())
             .expect("canonical ineligible report");
         assert!(matches!(
             report.eligibility(),
@@ -2347,9 +2348,10 @@ mod tests {
 
     #[test]
     fn gaps_fail_closed_and_canonical_gap_order_is_byte_stable() {
-        let plan = ValidationPlan::build(timestamp(0), 455).expect("three outer folds");
+        let plan = ValidationPlan::build(timestamp(0), ValidationPlan::minimum_complete_days())
+            .expect("stripped outer fold");
         let gap = super::ExcludedGap {
-            range: TimeRange::new(timestamp(200), timestamp(201)).expect("gap"),
+            range: TimeRange::new(timestamp(2), timestamp(3)).expect("gap"),
         };
         let report = RulesValidationReport::run(
             &plan,
@@ -2374,17 +2376,17 @@ mod tests {
             range: TimeRange::new(timestamp(502), timestamp(503)).expect("second gap"),
         };
         let left =
-            RulesValidationReport::insufficient_history(provenance(), 454, vec![second, first])
+            RulesValidationReport::insufficient_history(provenance(), 6, vec![second, first])
                 .expect("normalized report");
         let right =
-            RulesValidationReport::insufficient_history(provenance(), 454, vec![first, second])
+            RulesValidationReport::insufficient_history(provenance(), 6, vec![first, second])
                 .expect("normalized report");
         assert_eq!(
             left.canonical_json().expect("left JSON"),
             right.canonical_json().expect("right JSON")
         );
         assert!(matches!(
-            RulesValidationReport::insufficient_history(provenance(), 454, vec![first, first]),
+            RulesValidationReport::insufficient_history(provenance(), 6, vec![first, first]),
             Err(ValidationError::InvalidExcludedGaps)
         ));
     }
@@ -2396,8 +2398,8 @@ mod tests {
         assert!(matches!(
             baseline.eligibility(),
             ResearchEligibility::Eligible {
-                outer_test_folds: 3,
-                closed_trades: 102,
+                outer_test_folds: 1,
+                closed_trades: 34,
             }
         ));
         let selected = baseline

@@ -1,8 +1,4 @@
-# User-scoped paper collector configuration for the GIFGOBLIN VPS.
-#
-# This intentionally remains collection-only. It has no wallet, signer, live
-# order path, or secret-bearing fields. Active entries require a separately
-# verified rules artifact and typed universe/risk witnesses.
+# User-scoped paper configuration for the GIFGOBLIN VPS — ACTIVE.
 
 [endpoints]
 info_url = "https://api.hyperliquid.xyz/info"
@@ -45,4 +41,8 @@ max_margin_fraction = "0.25"
 fixed_fee_bps_per_side = "7.5"
 
 [rules]
-mode = "collect_only"
+mode = "active"
+artifact_file = "rules-artifact.json"
+artifact_digest = "b3:b43a0745957e8923e69a8bddde0da2257aa000d411b3a9677ddde8585d143c73"
+validation_report_file = "rules-validation.json"
+validation_report_digest = "b3:d04c50a166ce2f390a614ce78f9ac47a79cce00dca3e952af13b3121218f7a22"

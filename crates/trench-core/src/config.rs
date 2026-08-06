@@ -1618,4 +1618,22 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn active_requires_artifact_and_report_pair() {
+        // Stripped v1 keeps EXAMPLE as collect_only; verify the 4-field gate via a
+        // constructed active config so the workspace can stay `cargo test --workspace` green
+        // while `deploy/config/gifgoblin-user.toml` carries the real active pair.
+        let active_toml = active_config("rules-artifact.json", "rules-validation.json");
+        let cfg = PaperConfig::from_toml(&active_toml).expect("active must parse");
+        assert_eq!(cfg.rules().mode(), RulesMode::Active);
+        let active = cfg
+            .rules()
+            .active()
+            .expect("active mode must carry artifact state");
+        assert!(!active.artifact_file().is_empty());
+        assert!(active.artifact_digest().starts_with("b3:"));
+        assert!(!active.validation_report_file().is_empty());
+        assert!(active.validation_report_digest().starts_with("b3:"));
+    }
 }

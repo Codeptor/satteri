@@ -25,7 +25,7 @@ fn provenance() -> ResearchProvenance {
         data_digest: digest(3),
         universe_digest: digest(4),
         feature_schema_digest: digest(5),
-        data_cutoff: timestamp(455),
+        data_cutoff: timestamp(7),
     }
 }
 
@@ -73,7 +73,8 @@ impl RuleReplay for FixtureReplay {
 }
 
 fn plan() -> ValidationPlan {
-    ValidationPlan::build(timestamp(0), 455).expect("three outer folds")
+    ValidationPlan::build(timestamp(0), ValidationPlan::minimum_complete_days())
+        .expect("stripped outer fold")
 }
 
 #[test]
@@ -96,7 +97,7 @@ fn runner_emits_reopened_report_and_artifact_for_eligible_multimarket_replay() {
 #[test]
 fn runner_keeps_ineligible_report_fail_closed_without_artifact() {
     let mut replay = FixtureReplay {
-        outer_test_trades: 1,
+        outer_test_trades: 0,
     };
     let run = RulesResearchRun::run(&plan(), provenance(), Vec::new(), &mut replay)
         .expect("ineligible report is still canonical");

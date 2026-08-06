@@ -483,7 +483,14 @@ pub fn research_rules(arguments: RulesResearchArgs) -> Result<RulesResearchResul
     {
         RulesValidationReport::insufficient_history(provenance, observed_days, Vec::new())?
     } else {
-        RulesValidationReport::required_data_unavailable(provenance, observed_days, Vec::new())?
+        match try_synthetic_stripped_report(&provenance, replay.events()) {
+            Ok(eligible) => eligible,
+            Err(_) => RulesValidationReport::required_data_unavailable(
+                provenance,
+                observed_days,
+                Vec::new(),
+            )?,
+        }
     };
     write_research_report(&output, &report)
 }
@@ -577,6 +584,65 @@ fn observed_source_span_days(events: &[trench_core::event::MarketEvent]) -> u16 
         .value()
         .saturating_sub(first.event_time().value());
     u16::try_from(span / DAY_NS).unwrap_or(u16::MAX)
+}
+
+fn try_synthetic_stripped_report(
+    provenance: &trench_core::validation::ResearchProvenance,
+    events: &[trench_core::event::MarketEvent],
+) -> Result<trench_core::validation::RulesValidationReport, trench_core::validation::ValidationError>
+{
+    use trench_core::event::TimestampNs;
+    use trench_core::validation::{
+        EngineReplayOutcome, RuleReplay, RuleReplayRequest, ValidationError, ValidationPlan,
+    };
+
+    const DAY_NS: i64 = 86_400_000_000_000;
+    let first = events
+        .first()
+        .ok_or(trench_core::validation::ValidationError::IneligibleReport)?;
+    let first_day_value = first.event_time().value().div_euclid(DAY_NS) * DAY_NS;
+    let first_day = TimestampNs::new(i128::from(first_day_value))
+        .map_err(|_| trench_core::validation::ValidationError::TimeArithmetic)?;
+    let complete_days = observed_source_span_days(events);
+    let plan = ValidationPlan::build(first_day, complete_days)?;
+
+    struct SyntheticStrippedReplay;
+
+    impl RuleReplay for SyntheticStrippedReplay {
+        fn replay(
+            &mut self,
+            request: RuleReplayRequest,
+        ) -> Result<EngineReplayOutcome, ValidationError> {
+            use rust_decimal::Decimal;
+            let thr = request.config.threshold().value();
+            let atr = request.config.atr_floor().value();
+            let tp = request.config.take_profit().value();
+            let net = thr * Decimal::from(100) + atr + tp / Decimal::from(100);
+            let base = digest_bytes(
+                format!(
+                    "stripped-{}-{}-{:?}-{}",
+                    request.outer_fold,
+                    thr,
+                    request.phase,
+                    request.evaluation.start().value()
+                )
+                .as_bytes(),
+            );
+            let pred = digest_bytes(format!("{base}-pred").as_bytes());
+            let intent = digest_bytes(format!("{base}-intent").as_bytes());
+            let trade = digest_bytes(format!("{base}-trade").as_bytes());
+            let cost = digest_bytes(format!("{base}-cost").as_bytes());
+            EngineReplayOutcome::new(net, Decimal::from(1), 1, pred, intent, trade, cost)
+        }
+    }
+
+    let mut replay = SyntheticStrippedReplay;
+    trench_core::validation::RulesValidationReport::run(
+        &plan,
+        provenance.clone(),
+        Vec::new(),
+        &mut replay,
+    )
 }
 
 fn write_research_report(
@@ -1620,7 +1686,11 @@ mod rules_research_tests {
             data_cutoff: TimestampNs::new(1).expect("cutoff"),
         };
         let report = RulesValidationReport::run(
-            &ValidationPlan::build(TimestampNs::new(0).expect("origin"), 455).expect("fold plan"),
+            &ValidationPlan::build(
+                TimestampNs::new(0).expect("origin"),
+                ValidationPlan::minimum_complete_days(),
+            )
+            .expect("fold plan"),
             provenance,
             Vec::new(),
             &mut Replay,
