@@ -34,6 +34,33 @@ const MAX_COMPILED_EXCLUSIONS: usize = 16_384;
 const MAX_COMPILED_RECOVERY_WITNESSES: usize = 65_536;
 const MAX_EXECUTABLE_BOOK_AGE_NS: i64 = 1_000_000_000;
 
+/// Typed source contracts that are required before a timely decision can be
+/// admitted to the authoritative rules replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TypedWitnessKind {
+    /// A descriptor-bound recovery completion and boundary proof.
+    Recovery,
+    /// Raw point-in-time universe selector inputs.
+    Universe,
+    /// Recomputed common and long-horizon feature inputs.
+    Feature,
+    /// Raw venue/book/impact/funding inputs for the frozen risk policy.
+    Risk,
+}
+
+/// Honest readiness result for the typed-witness hand-off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypedWitnessStatus {
+    /// The causal source pass produced no timely decision boundaries.
+    NoTimelyDecisions,
+    /// Decisions exist, but one or more typed contracts must still be supplied
+    /// by the dedicated recomputation APIs.
+    Pending {
+        decision_count: usize,
+        missing: Vec<TypedWitnessKind>,
+    },
+}
+
 /// Closed reasons for a causal exclusion produced directly from verified facts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ResearchExclusionReason {
@@ -124,6 +151,36 @@ impl ResearchCompileResult {
     #[must_use]
     pub fn recovery_witnesses(&self) -> &[RecoveryWitness] {
         &self.recovery_witnesses
+    }
+
+    /// Reports which typed contracts are still absent from this causal pass.
+    ///
+    /// Recovery evidence is compiled here because it is descriptor-bound and
+    /// opaque. Universe, feature, and risk witnesses deliberately remain
+    /// explicit recomputation outputs: their scalar inputs cannot be inferred
+    /// safely from an arbitrary normalized event stream. This diagnostic is
+    /// therefore preferable to silently manufacturing selector, feature, or
+    /// sizing values.
+    #[must_use]
+    pub fn typed_witness_status(&self) -> TypedWitnessStatus {
+        if self.decisions.is_empty() {
+            return TypedWitnessStatus::NoTimelyDecisions;
+        }
+        let mut missing = Vec::with_capacity(4);
+        if self.recovery_witnesses.len() < self.decisions.len() {
+            missing.push(TypedWitnessKind::Recovery);
+        }
+        // These three contracts require raw scalar inputs and independent
+        // recomputation APIs; the causal availability pass cannot derive them.
+        missing.extend([
+            TypedWitnessKind::Universe,
+            TypedWitnessKind::Feature,
+            TypedWitnessKind::Risk,
+        ]);
+        TypedWitnessStatus::Pending {
+            decision_count: self.decisions.len(),
+            missing,
+        }
     }
 
     /// Converts an excluded-only result into the typed immutable sidecar writer.

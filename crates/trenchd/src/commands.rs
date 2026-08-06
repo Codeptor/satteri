@@ -19,7 +19,9 @@ use trench_hyperliquid::{
 };
 use trench_storage::parquet::{DataProvenance, ParquetError, ParquetStore};
 use trench_storage::replay::{ReplayError, ReplayPlan};
-use trench_storage::research_compile::{ResearchCompileError, ResearchEvidenceCompiler};
+use trench_storage::research_compile::{
+    ResearchCompileError, ResearchEvidenceCompiler, TypedWitnessStatus,
+};
 use trench_storage::research_plan::{
     ResearchMemberLocator, ResearchPlanError, ResearchSourcePlanBuilder,
 };
@@ -458,6 +460,23 @@ pub fn research_rules(arguments: RulesResearchArgs) -> Result<RulesResearchResul
         excluded_gaps = causal.excluded_gaps().len(),
         "validated causal source run before rules research"
     );
+    match causal.typed_witness_status() {
+        TypedWitnessStatus::NoTimelyDecisions => {
+            tracing::info!(
+                "no timely decisions were admitted; typed universe/feature/risk witnesses were not required"
+            );
+        }
+        TypedWitnessStatus::Pending {
+            decision_count,
+            ref missing,
+        } => {
+            tracing::warn!(
+                decision_count,
+                missing = ?missing,
+                "rules research remains fail-closed: source facts cannot infer typed universe/feature/risk contracts"
+            );
+        }
+    }
     let provenance = research_provenance(&loaded.bytes, &plan, replay.events())?;
     let observed_days = observed_source_span_days(replay.events());
     let report = if observed_days < trench_core::validation::ValidationPlan::minimum_complete_days()

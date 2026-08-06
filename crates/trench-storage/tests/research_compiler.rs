@@ -17,7 +17,9 @@ use trench_storage::{
         RecoveryOutcomeSource, RecoveryOutcomeStore, RecoveryRequestCursors,
         RecoverySourceReference,
     },
-    research_compile::{ResearchEvidenceCompiler, ResearchExclusionReason},
+    research_compile::{
+        ResearchEvidenceCompiler, ResearchExclusionReason, TypedWitnessKind, TypedWitnessStatus,
+    },
     research_plan::{ResearchMemberLocator, ResearchSourcePlanBuilder},
     research_runs::AvailabilityKey,
 };
@@ -298,6 +300,10 @@ fn late_candle_is_excluded_at_original_boundary() {
         compiled.excluded_gaps()[0].reason(),
         ResearchExclusionReason::LateSource
     );
+    assert_eq!(
+        compiled.typed_witness_status(),
+        TypedWitnessStatus::NoTimelyDecisions
+    );
 }
 
 #[test]
@@ -313,6 +319,18 @@ fn exact_boundary_candle_never_admits_the_first_later_fact() {
     assert_eq!(
         compiled.decisions()[0].source_event_ids(),
         &[candle.event_id().clone()]
+    );
+    assert_eq!(
+        compiled.typed_witness_status(),
+        TypedWitnessStatus::Pending {
+            decision_count: 1,
+            missing: vec![
+                TypedWitnessKind::Recovery,
+                TypedWitnessKind::Universe,
+                TypedWitnessKind::Feature,
+                TypedWitnessKind::Risk,
+            ],
+        }
     );
 }
 
