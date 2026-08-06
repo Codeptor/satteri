@@ -35,7 +35,10 @@ use trench_core::{
     validation::TimeRange,
 };
 
-use crate::research_runs::{AvailabilitySourceReference, VerifiedResearchSourcePlan};
+use crate::{
+    feature_replay::FeatureInputWitness,
+    research_runs::{AvailabilitySourceReference, VerifiedResearchSourcePlan},
+};
 
 const SIDECAR_VERSION: u8 = 1;
 const SIDECAR_MANIFEST: &str = "research-sidecar.json";
@@ -681,6 +684,7 @@ pub struct UniverseWitness {
     cutoff: AvailabilityCutoff,
     source_range: RangeWire,
     candidate_references: Vec<AvailabilitySourceReference>,
+    candidate_inputs: Vec<UniverseCandidateInput>,
     expected_snapshot_digest: String,
     expected_activation_digest: String,
 }
@@ -701,11 +705,45 @@ impl UniverseWitness {
             cutoff,
             source_range: RangeWire::new(source_range),
             candidate_references,
+            candidate_inputs: Vec::new(),
             expected_snapshot_digest: expected_snapshot_digest.into(),
             expected_activation_digest: expected_activation_digest.into(),
         };
         value.validate()?;
         Ok(value)
+    }
+
+    /// Creates a universe witness carrying the checked raw selector inputs used
+    /// to recompute its snapshot and activation commitments.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_inputs(
+        record_id: impl Into<String>,
+        hour_at: TimestampNs,
+        cutoff: AvailabilityCutoff,
+        source_range: TimeRange,
+        candidate_references: Vec<AvailabilitySourceReference>,
+        candidate_inputs: Vec<UniverseCandidateInput>,
+        expected_snapshot_digest: impl Into<String>,
+        expected_activation_digest: impl Into<String>,
+    ) -> Result<Self, ResearchSidecarError> {
+        let value = Self {
+            record_id: record_id.into(),
+            hour_at_ns: hour_at.value(),
+            cutoff,
+            source_range: RangeWire::new(source_range),
+            candidate_references,
+            candidate_inputs,
+            expected_snapshot_digest: expected_snapshot_digest.into(),
+            expected_activation_digest: expected_activation_digest.into(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Returns the raw candidate inputs carried by this witness.
+    #[must_use]
+    pub fn candidate_inputs(&self) -> &[UniverseCandidateInput] {
+        &self.candidate_inputs
     }
 }
 
@@ -718,6 +756,7 @@ pub struct FeatureWitness {
     cutoff: AvailabilityCutoff,
     source_range: RangeWire,
     input_references: Vec<AvailabilitySourceReference>,
+    input_witness: Option<FeatureInputWitness>,
     expected_snapshot_digest: String,
     expected_long_history_digest: String,
 }
@@ -741,11 +780,46 @@ impl FeatureWitness {
             cutoff,
             source_range: RangeWire::new(source_range),
             input_references,
+            input_witness: None,
             expected_snapshot_digest: expected_snapshot_digest.into(),
             expected_long_history_digest: expected_long_history_digest.into(),
         };
         value.validate()?;
         Ok(value)
+    }
+
+    /// Creates a feature witness carrying the exact source-bound recomputation contract.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_input_witness(
+        record_id: impl Into<String>,
+        decision_id: EventId,
+        decision_at: TimestampNs,
+        cutoff: AvailabilityCutoff,
+        source_range: TimeRange,
+        input_witness: FeatureInputWitness,
+        expected_snapshot_digest: impl Into<String>,
+        expected_long_history_digest: impl Into<String>,
+    ) -> Result<Self, ResearchSidecarError> {
+        let input_references = input_witness.input_references().to_vec();
+        let value = Self {
+            record_id: record_id.into(),
+            decision_id: decision_id.as_str().to_owned(),
+            decision_at_ns: decision_at.value(),
+            cutoff,
+            source_range: RangeWire::new(source_range),
+            input_references,
+            input_witness: Some(input_witness),
+            expected_snapshot_digest: expected_snapshot_digest.into(),
+            expected_long_history_digest: expected_long_history_digest.into(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Returns the nested exact feature-input contract, if populated.
+    #[must_use]
+    pub const fn input_witness(&self) -> Option<&FeatureInputWitness> {
+        self.input_witness.as_ref()
     }
 }
 
@@ -792,6 +866,12 @@ impl RawRiskWitness {
         };
         value.validate()?;
         Ok(value)
+    }
+
+    /// Returns the expected frozen policy digest.
+    #[must_use]
+    pub fn expected_policy_digest(&self) -> &str {
+        &self.expected_policy_digest
     }
 }
 
@@ -908,6 +988,24 @@ impl UniverseWitness {
         self.cutoff.validate()?;
         self.source_range.range()?;
         validate_references(&self.candidate_references)?;
+        if self.candidate_inputs.len() > self.candidate_references.len() {
+            return Err(ResearchSidecarError::InvalidSidecar {
+                reason: "universe candidate inputs exceed their source references",
+            });
+        }
+        let mut markets = BTreeSet::new();
+        for input in &self.candidate_inputs {
+            input
+                .to_candidate()
+                .map_err(|_| ResearchSidecarError::InvalidSidecar {
+                    reason: "universe candidate input is invalid",
+                })?;
+            if !markets.insert(input.market()) {
+                return Err(ResearchSidecarError::InvalidSidecar {
+                    reason: "universe candidate inputs contain duplicate markets",
+                });
+            }
+        }
         validate_digest(&self.expected_snapshot_digest)?;
         validate_digest(&self.expected_activation_digest)?;
         Ok(())
@@ -934,6 +1032,20 @@ impl FeatureWitness {
         self.cutoff.validate()?;
         self.source_range.range()?;
         validate_references(&self.input_references)?;
+        if let Some(input_witness) = &self.input_witness {
+            if input_witness.input_references() != self.input_references {
+                return Err(ResearchSidecarError::InvalidSidecar {
+                    reason: "feature input witness references do not match its sidecar references",
+                });
+            }
+            if input_witness.decision_event_id() != self.decision_id
+                || input_witness.decision_at_ns() != self.decision_at_ns
+            {
+                return Err(ResearchSidecarError::InvalidSidecar {
+                    reason: "feature input witness decision coordinate does not match",
+                });
+            }
+        }
         validate_digest(&self.expected_snapshot_digest)?;
         validate_digest(&self.expected_long_history_digest)
     }
@@ -1450,17 +1562,19 @@ fn validate_digest(value: &str) -> Result<(), ResearchSidecarError> {
             reason: "digest lacks BLAKE3 prefix",
         });
     };
-    if value.len() != DIGEST_BYTES
-        || hex.len() != blake3::OUT_LEN * 2
-        || !hex
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if value.len() != DIGEST_BYTES || !is_lower_hex(hex) {
         return Err(ResearchSidecarError::InvalidSidecar {
             reason: "digest is not canonical lowercase BLAKE3",
         });
     }
     Ok(())
+}
+
+fn is_lower_hex(value: &str) -> bool {
+    value.len() == blake3::OUT_LEN * 2
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_references<'a>(
