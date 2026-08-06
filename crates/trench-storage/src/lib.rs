@@ -1,5 +1,6 @@
 //! Durable storage and deterministic replay for paper-trading records.
 
+pub mod feature_replay;
 pub mod parquet;
 pub mod recovery_outcomes;
 pub mod replay;
