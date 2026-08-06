@@ -69,6 +69,108 @@ pub struct AvailabilityKey {
     event_id: EventId,
 }
 
+/// A path-free reference to one exact fact in the immutable availability run.
+///
+/// Event identities are only unique within their committed source-member and
+/// availability coordinate. Research artifacts therefore retain all four
+/// components instead of treating an event ID as sufficient evidence.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AvailabilitySourceReference {
+    member_manifest_digest: String,
+    received_at_ns: i64,
+    event_time_ns: i64,
+    event_id: String,
+}
+
+impl AvailabilitySourceReference {
+    /// Builds one checked reference from the exact source-member and availability key.
+    pub fn new(
+        member_manifest_digest: impl Into<String>,
+        received_at: TimestampNs,
+        event_time: TimestampNs,
+        event_id: EventId,
+    ) -> Result<Self, ResearchRunError> {
+        let value = Self {
+            member_manifest_digest: member_manifest_digest.into(),
+            received_at_ns: received_at.value(),
+            event_time_ns: event_time.value(),
+            event_id: event_id.as_str().to_owned(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Returns the exact selected source-member commitment.
+    #[must_use]
+    pub fn member_manifest_digest(&self) -> &str {
+        &self.member_manifest_digest
+    }
+
+    /// Returns the complete availability key committed by this reference.
+    #[must_use]
+    pub fn key(&self) -> AvailabilityKey {
+        AvailabilityKey {
+            received_at: TimestampNs::new(i128::from(self.received_at_ns))
+                .expect("validated source reference receipt timestamp"),
+            event_time: TimestampNs::new(i128::from(self.event_time_ns))
+                .expect("validated source reference event timestamp"),
+            event_id: EventId::new(self.event_id.clone())
+                .expect("validated source reference event identifier"),
+        }
+    }
+
+    /// Returns the local receipt coordinate.
+    #[must_use]
+    pub fn received_at(&self) -> TimestampNs {
+        TimestampNs::new(i128::from(self.received_at_ns))
+            .expect("validated source reference receipt timestamp")
+    }
+
+    /// Returns the source event-time coordinate.
+    #[must_use]
+    pub fn event_time(&self) -> TimestampNs {
+        TimestampNs::new(i128::from(self.event_time_ns))
+            .expect("validated source reference event timestamp")
+    }
+
+    /// Returns the canonical normalized event identity.
+    #[must_use]
+    pub fn event_id(&self) -> EventId {
+        EventId::new(self.event_id.clone()).expect("validated source reference event identifier")
+    }
+
+    fn from_record(record: &AvailabilityRecord) -> Self {
+        Self {
+            member_manifest_digest: record.member_manifest_digest.clone(),
+            received_at_ns: record.event.received_at().value(),
+            event_time_ns: record.event.event_time().value(),
+            event_id: record.event.event_id().as_str().to_owned(),
+        }
+    }
+
+    /// Verifies this serialized reference is structurally a valid availability coordinate.
+    pub fn validate(&self) -> Result<(), ResearchRunError> {
+        validate_digest(&self.member_manifest_digest)?;
+        AvailabilityKey::new(
+            TimestampNs::new(i128::from(self.received_at_ns)).map_err(|_| {
+                ResearchRunError::InvalidRun {
+                    reason: "source reference receipt timestamp is invalid",
+                }
+            })?,
+            TimestampNs::new(i128::from(self.event_time_ns)).map_err(|_| {
+                ResearchRunError::InvalidRun {
+                    reason: "source reference event timestamp is invalid",
+                }
+            })?,
+            EventId::new(self.event_id.clone()).map_err(|_| ResearchRunError::InvalidRun {
+                reason: "source reference event identifier is invalid",
+            })?,
+        )?;
+        Ok(())
+    }
+}
+
 impl AvailabilityKey {
     /// Builds one checked source availability coordinate.
     pub fn new(
@@ -142,6 +244,12 @@ impl AvailabilityRecord {
             event_time: self.event.event_time(),
             event_id: self.event.event_id().clone(),
         }
+    }
+
+    /// Returns a complete immutable reference to this record in its source member.
+    #[must_use]
+    pub fn source_reference(&self) -> AvailabilitySourceReference {
+        AvailabilitySourceReference::from_record(self)
     }
 
     /// Returns the normalized source event.
@@ -413,24 +521,26 @@ impl AvailabilityRun {
         }
     }
 
-    fn validate_event_ids(&self, event_ids: &[EventId]) -> Result<(), ResearchRunError> {
-        if event_ids.len() > usize::try_from(MAX_RUN_RECORDS).unwrap_or(usize::MAX) {
+    fn validate_source_references(
+        &self,
+        references: &[AvailabilitySourceReference],
+    ) -> Result<(), ResearchRunError> {
+        if references.len() > usize::try_from(MAX_RUN_RECORDS).unwrap_or(usize::MAX) {
             return Err(ResearchRunError::ResourceLimit);
         }
-        let mut missing = event_ids.iter().collect::<BTreeSet<_>>();
+        let mut missing = references.iter().collect::<BTreeSet<_>>();
         if missing.is_empty() {
             return Ok(());
         }
         self.inspect_verified_records(|reader| {
             while let Some(record) = reader.next_record()? {
-                let key = record.key();
-                missing.remove(key.event_id());
+                missing.remove(&record.source_reference());
             }
             if missing.is_empty() {
                 Ok(())
             } else {
                 Err(ResearchRunError::InvalidPlan {
-                    reason: "witness event identifier is absent from final availability run",
+                    reason: "raw witness source reference is absent from final availability run",
                 })
             }
         })
@@ -528,13 +638,13 @@ impl VerifiedResearchSourcePlan {
         self.draft.provenance()
     }
 
-    /// Descriptor-safely verifies raw-witness event identities against the immutable availability
-    /// run without consuming the compiler cursor.
-    ///
-    /// This is an interim ID-only binding. Witness formats will carry complete member/key
-    /// references once every producer can emit them.
-    pub fn validate_event_ids(&self, event_ids: &[EventId]) -> Result<(), ResearchRunError> {
-        self.availability_run.validate_event_ids(event_ids)
+    /// Descriptor-safely verifies complete raw-witness source references against the immutable
+    /// final availability run without consuming the compiler cursor.
+    pub fn validate_source_references(
+        &self,
+        references: &[AvailabilitySourceReference],
+    ) -> Result<(), ResearchRunError> {
+        self.availability_run.validate_source_references(references)
     }
 }
 

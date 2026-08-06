@@ -18,7 +18,9 @@ use crate::{
         MAX_TOTAL_RECOVERY_PROOF_REFERENCES, ReconciledRecoveryOutcome, RecoveryOutcomeError,
         RecoveryOutcomeStatus, RecoverySourceReference,
     },
-    research_runs::{AvailabilityKey, ResearchRunError, VerifiedResearchSourcePlan},
+    research_runs::{
+        AvailabilityKey, AvailabilitySourceReference, ResearchRunError, VerifiedResearchSourcePlan,
+    },
     research_sidecar::{
         AvailabilityCutoff, ExcludedGap, ExclusionReason, RecoverySource, RecoveryStatus,
         RecoveryWitness, ResearchSidecarError, ResearchSidecarWriter,
@@ -314,12 +316,12 @@ impl ResearchEvidenceCompiler {
                         RecoveryStatus::Complete,
                         RecoverySource::Captured,
                         outcome.completed_through(),
-                        recovery_anchor.key().event_id().clone(),
+                        availability_source_reference(recovery_anchor)?,
                         outcome
                             .backfill_references()
                             .iter()
-                            .map(|reference| reference.key().event_id().clone())
-                            .collect(),
+                            .map(availability_source_reference)
+                            .collect::<Result<Vec<_>, _>>()?,
                         outcome.result_digest(),
                     )?,
                     MAX_COMPILED_RECOVERY_WITNESSES,
@@ -350,6 +352,18 @@ impl ResearchEvidenceCompiler {
             recovery_witnesses,
         })
     }
+}
+
+fn availability_source_reference(
+    reference: &RecoverySourceReference,
+) -> Result<AvailabilitySourceReference, ResearchRunError> {
+    let key = reference.key();
+    AvailabilitySourceReference::new(
+        reference.member_manifest_digest(),
+        key.received_at(),
+        key.event_time(),
+        key.event_id().clone(),
+    )
 }
 
 fn ordered_recovery_outcomes(

@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use trench_core::{domain::EventId, event::TimestampNs, validation::TimeRange};
 
-use crate::research_runs::VerifiedResearchSourcePlan;
+use crate::research_runs::{AvailabilitySourceReference, VerifiedResearchSourcePlan};
 
 const SIDECAR_VERSION: u8 = 1;
 const SIDECAR_MANIFEST: &str = "research-sidecar.json";
@@ -39,7 +39,7 @@ const MAX_TOTAL_RECORDS: usize = 65_536;
 const MAX_REFS_PER_DECISION: usize = 8_192;
 const MAX_EXCLUDED_GAPS: usize = 16_384;
 const MAX_IDENTIFIER_BYTES: usize = 256;
-const MAX_RAW_INPUT_EVENT_IDS: usize = 1_000_000;
+const MAX_RAW_INPUT_REFERENCES: usize = 1_000_000;
 
 /// The complete source-availability coordinate committed by every decision.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -172,8 +172,8 @@ pub struct RecoveryWitness {
     status: RecoveryStatus,
     source: RecoverySource,
     completed_at_ns: i64,
-    anchor_event_id: String,
-    backfill_event_ids: Vec<String>,
+    anchor: AvailabilitySourceReference,
+    backfill_references: Vec<AvailabilitySourceReference>,
     expected_boundary_digest: String,
 }
 
@@ -187,8 +187,8 @@ impl RecoveryWitness {
         status: RecoveryStatus,
         source: RecoverySource,
         completed_at: TimestampNs,
-        anchor_event_id: EventId,
-        backfill_event_ids: Vec<EventId>,
+        anchor: AvailabilitySourceReference,
+        backfill_references: Vec<AvailabilitySourceReference>,
         expected_boundary_digest: impl Into<String>,
     ) -> Result<Self, ResearchSidecarError> {
         let value = Self {
@@ -199,11 +199,8 @@ impl RecoveryWitness {
             status,
             source,
             completed_at_ns: completed_at.value(),
-            anchor_event_id: anchor_event_id.as_str().to_owned(),
-            backfill_event_ids: backfill_event_ids
-                .into_iter()
-                .map(|id| id.as_str().to_owned())
-                .collect(),
+            anchor,
+            backfill_references,
             expected_boundary_digest: expected_boundary_digest.into(),
         };
         value.validate()?;
@@ -218,7 +215,7 @@ pub struct UniverseWitness {
     hour_at_ns: i64,
     cutoff: AvailabilityCutoff,
     source_range: RangeWire,
-    candidate_event_ids: Vec<String>,
+    candidate_references: Vec<AvailabilitySourceReference>,
     expected_snapshot_digest: String,
     expected_activation_digest: String,
 }
@@ -229,7 +226,7 @@ impl UniverseWitness {
         hour_at: TimestampNs,
         cutoff: AvailabilityCutoff,
         source_range: TimeRange,
-        candidate_event_ids: Vec<EventId>,
+        candidate_references: Vec<AvailabilitySourceReference>,
         expected_snapshot_digest: impl Into<String>,
         expected_activation_digest: impl Into<String>,
     ) -> Result<Self, ResearchSidecarError> {
@@ -238,10 +235,7 @@ impl UniverseWitness {
             hour_at_ns: hour_at.value(),
             cutoff,
             source_range: RangeWire::new(source_range),
-            candidate_event_ids: candidate_event_ids
-                .into_iter()
-                .map(|id| id.as_str().to_owned())
-                .collect(),
+            candidate_references,
             expected_snapshot_digest: expected_snapshot_digest.into(),
             expected_activation_digest: expected_activation_digest.into(),
         };
@@ -258,7 +252,7 @@ pub struct FeatureWitness {
     decision_at_ns: i64,
     cutoff: AvailabilityCutoff,
     source_range: RangeWire,
-    input_event_ids: Vec<String>,
+    input_references: Vec<AvailabilitySourceReference>,
     expected_snapshot_digest: String,
     expected_long_history_digest: String,
 }
@@ -271,7 +265,7 @@ impl FeatureWitness {
         decision_at: TimestampNs,
         cutoff: AvailabilityCutoff,
         source_range: TimeRange,
-        input_event_ids: Vec<EventId>,
+        input_references: Vec<AvailabilitySourceReference>,
         expected_snapshot_digest: impl Into<String>,
         expected_long_history_digest: impl Into<String>,
     ) -> Result<Self, ResearchSidecarError> {
@@ -281,10 +275,7 @@ impl FeatureWitness {
             decision_at_ns: decision_at.value(),
             cutoff,
             source_range: RangeWire::new(source_range),
-            input_event_ids: input_event_ids
-                .into_iter()
-                .map(|id| id.as_str().to_owned())
-                .collect(),
+            input_references,
             expected_snapshot_digest: expected_snapshot_digest.into(),
             expected_long_history_digest: expected_long_history_digest.into(),
         };
@@ -301,10 +292,10 @@ pub struct RawRiskWitness {
     decision_at_ns: i64,
     cutoff: AvailabilityCutoff,
     source_range: RangeWire,
-    venue_constraint_event_ids: Vec<String>,
-    book_event_id: String,
-    impact_event_ids: Vec<String>,
-    funding_event_ids: Vec<String>,
+    venue_constraint_references: Vec<AvailabilitySourceReference>,
+    book_reference: AvailabilitySourceReference,
+    impact_references: Vec<AvailabilitySourceReference>,
+    funding_references: Vec<AvailabilitySourceReference>,
     expected_policy_digest: String,
 }
 
@@ -316,10 +307,10 @@ impl RawRiskWitness {
         decision_at: TimestampNs,
         cutoff: AvailabilityCutoff,
         source_range: TimeRange,
-        venue_constraint_event_ids: Vec<EventId>,
-        book_event_id: EventId,
-        impact_event_ids: Vec<EventId>,
-        funding_event_ids: Vec<EventId>,
+        venue_constraint_references: Vec<AvailabilitySourceReference>,
+        book_reference: AvailabilitySourceReference,
+        impact_references: Vec<AvailabilitySourceReference>,
+        funding_references: Vec<AvailabilitySourceReference>,
         expected_policy_digest: impl Into<String>,
     ) -> Result<Self, ResearchSidecarError> {
         let value = Self {
@@ -328,19 +319,10 @@ impl RawRiskWitness {
             decision_at_ns: decision_at.value(),
             cutoff,
             source_range: RangeWire::new(source_range),
-            venue_constraint_event_ids: venue_constraint_event_ids
-                .into_iter()
-                .map(|id| id.as_str().to_owned())
-                .collect(),
-            book_event_id: book_event_id.as_str().to_owned(),
-            impact_event_ids: impact_event_ids
-                .into_iter()
-                .map(|id| id.as_str().to_owned())
-                .collect(),
-            funding_event_ids: funding_event_ids
-                .into_iter()
-                .map(|id| id.as_str().to_owned())
-                .collect(),
+            venue_constraint_references,
+            book_reference,
+            impact_references,
+            funding_references,
             expected_policy_digest: expected_policy_digest.into(),
         };
         value.validate()?;
@@ -407,32 +389,27 @@ impl WitnessRecord {
         }
     }
 
-    fn append_raw_input_event_ids(
+    fn append_raw_input_references(
         &self,
-        event_ids: &mut Vec<EventId>,
+        references: &mut Vec<AvailabilitySourceReference>,
     ) -> Result<(), ResearchSidecarError> {
         match self {
-            Self::Recovery(value) => append_event_ids(
-                event_ids,
-                std::iter::once(value.anchor_event_id.as_str())
-                    .chain(value.backfill_event_ids.iter().map(String::as_str)),
+            Self::Recovery(value) => append_references(
+                references,
+                std::iter::once(&value.anchor).chain(value.backfill_references.iter()),
             ),
-            Self::Universe(value) => append_event_ids(
-                event_ids,
-                value.candidate_event_ids.iter().map(String::as_str),
-            ),
-            Self::Feature(value) => {
-                append_event_ids(event_ids, value.input_event_ids.iter().map(String::as_str))
+            Self::Universe(value) => {
+                append_references(references, value.candidate_references.iter())
             }
-            Self::Risk(value) => append_event_ids(
-                event_ids,
+            Self::Feature(value) => append_references(references, value.input_references.iter()),
+            Self::Risk(value) => append_references(
+                references,
                 value
-                    .venue_constraint_event_ids
+                    .venue_constraint_references
                     .iter()
-                    .map(String::as_str)
-                    .chain(std::iter::once(value.book_event_id.as_str()))
-                    .chain(value.impact_event_ids.iter().map(String::as_str))
-                    .chain(value.funding_event_ids.iter().map(String::as_str)),
+                    .chain(std::iter::once(&value.book_reference))
+                    .chain(value.impact_references.iter())
+                    .chain(value.funding_references.iter()),
             ),
         }
     }
@@ -447,19 +424,15 @@ impl WitnessRecord {
     }
 }
 
-fn append_event_ids<'a>(
-    target: &mut Vec<EventId>,
-    values: impl IntoIterator<Item = &'a str>,
+fn append_references<'a>(
+    target: &mut Vec<AvailabilitySourceReference>,
+    values: impl IntoIterator<Item = &'a AvailabilitySourceReference>,
 ) -> Result<(), ResearchSidecarError> {
     for value in values {
-        if target.len() == MAX_RAW_INPUT_EVENT_IDS {
+        if target.len() == MAX_RAW_INPUT_REFERENCES {
             return Err(ResearchSidecarError::ResourceLimit);
         }
-        target.push(EventId::new(value.to_owned()).map_err(|_| {
-            ResearchSidecarError::InvalidSidecar {
-                reason: "raw witness input identifier is invalid",
-            }
-        })?);
+        target.push(value.clone());
     }
     Ok(())
 }
@@ -469,7 +442,7 @@ impl UniverseWitness {
         validate_identifier(&self.record_id)?;
         self.cutoff.validate()?;
         self.source_range.range()?;
-        validate_event_ids(&self.candidate_event_ids)?;
+        validate_references(&self.candidate_references)?;
         validate_digest(&self.expected_snapshot_digest)?;
         validate_digest(&self.expected_activation_digest)?;
         Ok(())
@@ -483,8 +456,7 @@ impl RecoveryWitness {
         self.cutoff.validate()?;
         self.source_range.range()?;
         TimestampNs::new(i128::from(self.completed_at_ns))?;
-        validate_digest(&self.anchor_event_id)?;
-        validate_event_ids(&self.backfill_event_ids)?;
+        validate_references(std::iter::once(&self.anchor).chain(self.backfill_references.iter()))?;
         validate_digest(&self.expected_boundary_digest)
     }
 }
@@ -496,7 +468,7 @@ impl FeatureWitness {
         TimestampNs::new(i128::from(self.decision_at_ns))?;
         self.cutoff.validate()?;
         self.source_range.range()?;
-        validate_event_ids(&self.input_event_ids)?;
+        validate_references(&self.input_references)?;
         validate_digest(&self.expected_snapshot_digest)?;
         validate_digest(&self.expected_long_history_digest)
     }
@@ -509,10 +481,13 @@ impl RawRiskWitness {
         TimestampNs::new(i128::from(self.decision_at_ns))?;
         self.cutoff.validate()?;
         self.source_range.range()?;
-        validate_event_ids(&self.venue_constraint_event_ids)?;
-        validate_digest(&self.book_event_id)?;
-        validate_event_ids(&self.impact_event_ids)?;
-        validate_event_ids(&self.funding_event_ids)?;
+        validate_references(
+            self.venue_constraint_references
+                .iter()
+                .chain(std::iter::once(&self.book_reference))
+                .chain(self.impact_references.iter())
+                .chain(self.funding_references.iter()),
+        )?;
         validate_digest(&self.expected_policy_digest)
     }
 }
@@ -654,7 +629,7 @@ pub struct DecisionWitnessIndex {
     decision_id: String,
     cutoff: AvailabilityCutoff,
     source_range: RangeWire,
-    input_event_ids: Vec<String>,
+    input_references: Vec<AvailabilitySourceReference>,
     recovery: WitnessReference,
     universe: WitnessReference,
     feature: WitnessReference,
@@ -667,7 +642,7 @@ impl DecisionWitnessIndex {
         decision_id: EventId,
         cutoff: AvailabilityCutoff,
         source_range: TimeRange,
-        input_event_ids: Vec<EventId>,
+        input_references: Vec<AvailabilitySourceReference>,
         recovery: WitnessReference,
         universe: WitnessReference,
         feature: WitnessReference,
@@ -677,10 +652,7 @@ impl DecisionWitnessIndex {
             decision_id: decision_id.as_str().to_owned(),
             cutoff,
             source_range: RangeWire::new(source_range),
-            input_event_ids: input_event_ids
-                .into_iter()
-                .map(|id| id.as_str().to_owned())
-                .collect(),
+            input_references,
             recovery,
             universe,
             feature,
@@ -712,10 +684,10 @@ impl DecisionWitnessIndex {
         validate_digest(&self.decision_id)?;
         self.cutoff.validate()?;
         self.source_range.range()?;
-        if self.input_event_ids.len() > MAX_REFS_PER_DECISION {
+        if self.input_references.len() > MAX_REFS_PER_DECISION {
             return Err(ResearchSidecarError::ResourceLimit);
         }
-        validate_event_ids(&self.input_event_ids)?;
+        validate_references(&self.input_references)?;
         for reference in [&self.recovery, &self.universe, &self.feature, &self.risk] {
             validate_component(&reference.shard)?;
             validate_identifier(&reference.record_id)?;
@@ -826,12 +798,14 @@ impl ResearchSidecar {
             .get(&(reference.shard.clone(), reference.record_id.clone()))
     }
 
-    fn raw_input_event_ids(&self) -> Result<Vec<EventId>, ResearchSidecarError> {
-        let mut event_ids = Vec::new();
+    fn raw_input_references(
+        &self,
+    ) -> Result<Vec<AvailabilitySourceReference>, ResearchSidecarError> {
+        let mut references = Vec::new();
         for witness in self.witnesses.values() {
-            witness.append_raw_input_event_ids(&mut event_ids)?;
+            witness.append_raw_input_references(&mut references)?;
         }
-        Ok(event_ids)
+        Ok(references)
     }
 
     #[must_use]
@@ -1024,19 +998,29 @@ fn validate_digest(value: &str) -> Result<(), ResearchSidecarError> {
     Ok(())
 }
 
-fn validate_event_ids(ids: &[String]) -> Result<(), ResearchSidecarError> {
-    if ids.len() > MAX_REFS_PER_DECISION {
-        return Err(ResearchSidecarError::ResourceLimit);
-    }
-    let mut prior: Option<&str> = None;
-    for id in ids {
-        validate_digest(id)?;
-        if prior.is_some_and(|previous| previous >= id.as_str()) {
+fn validate_references<'a>(
+    references: impl IntoIterator<Item = &'a AvailabilitySourceReference>,
+) -> Result<(), ResearchSidecarError> {
+    let mut count = 0_usize;
+    let mut prior: Option<&AvailabilitySourceReference> = None;
+    for reference in references {
+        count = count
+            .checked_add(1)
+            .ok_or(ResearchSidecarError::ResourceLimit)?;
+        if count > MAX_REFS_PER_DECISION {
+            return Err(ResearchSidecarError::ResourceLimit);
+        }
+        reference
+            .validate()
+            .map_err(|_| ResearchSidecarError::InvalidSidecar {
+                reason: "raw source reference is invalid",
+            })?;
+        if prior.is_some_and(|previous| previous >= reference) {
             return Err(ResearchSidecarError::InvalidSidecar {
-                reason: "event identifiers are not strictly ordered",
+                reason: "raw source references are not strictly ordered",
             });
         }
-        prior = Some(id.as_str());
+        prior = Some(reference);
     }
     Ok(())
 }
@@ -1252,32 +1236,27 @@ fn validate_cross_contract(
             }
             match record {
                 WitnessRecord::Recovery(value) => {
-                    required_inputs.insert(value.anchor_event_id.as_str());
-                    required_inputs.extend(value.backfill_event_ids.iter().map(String::as_str));
+                    required_inputs.insert(&value.anchor);
+                    required_inputs.extend(value.backfill_references.iter());
                 }
                 WitnessRecord::Universe(value) => {
-                    required_inputs.extend(value.candidate_event_ids.iter().map(String::as_str));
+                    required_inputs.extend(value.candidate_references.iter());
                 }
                 WitnessRecord::Feature(value) => {
-                    required_inputs.extend(value.input_event_ids.iter().map(String::as_str));
+                    required_inputs.extend(value.input_references.iter());
                 }
                 WitnessRecord::Risk(value) => {
-                    required_inputs
-                        .extend(value.venue_constraint_event_ids.iter().map(String::as_str));
-                    required_inputs.insert(value.book_event_id.as_str());
-                    required_inputs.extend(value.impact_event_ids.iter().map(String::as_str));
-                    required_inputs.extend(value.funding_event_ids.iter().map(String::as_str));
+                    required_inputs.extend(value.venue_constraint_references.iter());
+                    required_inputs.insert(&value.book_reference);
+                    required_inputs.extend(value.impact_references.iter());
+                    required_inputs.extend(value.funding_references.iter());
                 }
             }
         }
-        let declared = decision
-            .input_event_ids
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
+        let declared = decision.input_references.iter().collect::<Vec<_>>();
         if declared != required_inputs.into_iter().collect::<Vec<_>>() {
             return Err(ResearchSidecarError::InvalidSidecar {
-                reason: "decision input identifiers do not exactly bind referenced raw inputs",
+                reason: "decision input references do not exactly bind referenced raw inputs",
             });
         }
     }
@@ -1375,9 +1354,9 @@ fn open_sidecar(
     validate_plan_binding(&manifest, source_plan)?;
     let sidecar = open_sidecar_at(&directory, &manifest, Some(source_plan))?;
     source_plan
-        .validate_event_ids(&sidecar.raw_input_event_ids()?)
+        .validate_source_references(&sidecar.raw_input_references()?)
         .map_err(|_| ResearchSidecarError::InvalidSidecar {
-            reason: "sidecar raw witness inputs are not bound to the verified source plan",
+            reason: "sidecar raw witness references are not bound to the verified source plan",
         })?;
     Ok(sidecar)
 }
