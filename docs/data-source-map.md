@@ -133,6 +133,44 @@ source of trading truth.
 - Preserve raw source bytes long enough to reproduce every promoted decision;
   cold-archive them after the hot operational window is compacted.
 
+## Storage topology
+
+The measured current 18-market collector writes roughly 640--700 GiB for a
+30-day raw window in its present SQLite plus uncompressed-Parquet format. The
+existing GIFGOBLIN filesystem has 193 GB total capacity, so it cannot be the
+sole historical store.
+
+### Recommended: B2 archive plus local hot working storage
+
+Use [Backblaze B2](https://www.backblaze.com/cloud-storage) as the canonical
+immutable archive and keep only the active/replay working set on local disk.
+B2 is S3-compatible, supports Object Lock, charges no upload bandwidth, and
+currently lists storage at $0.005/GB-month after the first 10 GB; egress is
+free up to three times the monthly stored volume, then $0.01/GB.
+
+At the measured rate this is approximately $3--$4/month for one 30-day raw
+window, before any transfer beyond the free allowance. A 545-day raw archive
+would be roughly $60--$70/month before transfers.
+
+Never place SQLite directly on object storage. Upload closed, content-addressed
+Parquet/source bundles and manifests, then stage exact shards locally for
+replay/compiler jobs.
+
+### When a separate disk-only VPS is justified
+
+Choose a separate storage VPS only when we need a continuously mounted,
+high-throughput hot filesystem for replay/import and its monthly price is below
+the equivalent block-volume cost. It must be in the same region/private
+network, run no wallet or Telegram services, and still replicate immutable
+bundles to B2; a single storage VPS disk is not a backup.
+
+DigitalOcean block volumes are operationally simple but list 1,000 GiB at
+$100/month and 2,000 GiB at about $200/month, making them poor archival value
+compared with B2: [pricing](https://docs.digitalocean.com/products/volumes/details/pricing/).
+
+Decision: provision B2 first. Add a separate 1--2 TB hot storage host only if
+the 24-hour compression/throughput benchmark shows the live compiler needs it.
+
 ## Current status
 
 | Item | Status |
