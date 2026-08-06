@@ -7,6 +7,7 @@ use std::{
     fs::File,
     io::{self, Read},
     path::Path,
+    str::FromStr,
 };
 
 #[cfg(unix)]
@@ -21,9 +22,18 @@ use rustix::fs::{
     unlinkat,
 };
 
-use serde::{Deserialize, Serialize};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
-use trench_core::{domain::EventId, event::TimestampNs, validation::TimeRange};
+use trench_core::{
+    domain::{Bps, DomainError, EventId, Market, Usdc},
+    event::TimestampNs,
+    universe::{
+        DepthProfile, HistoryQuality, ListingState, MarketDataAvailability, SidedDepth,
+        UniverseCandidate, UniverseError, UniverseLiquidity,
+    },
+    validation::TimeRange,
+};
 
 use crate::research_runs::{AvailabilitySourceReference, VerifiedResearchSourcePlan};
 
@@ -129,6 +139,461 @@ impl RangeWire {
             TimestampNs::new(i128::from(self.end_ns))?,
         )?)
     }
+}
+
+const UNIVERSE_CANDIDATE_INPUT_DIGEST_DOMAIN: &str = "trench.research.universe-candidate-input.v1";
+
+/// A checked directional depth profile retained as canonical raw scalar inputs.
+///
+/// This is deliberately not a [`DepthProfile`]: it is the serialized source input
+/// from which the core domain profile is deterministically reconstructed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UniverseDepthInput {
+    at_10_bps_usdc: String,
+    at_25_bps_usdc: String,
+    at_50_bps_usdc: String,
+}
+
+impl UniverseDepthInput {
+    /// Creates a canonical, monotonic directional depth input.
+    pub fn new(
+        at_10_bps_usdc: Decimal,
+        at_25_bps_usdc: Decimal,
+        at_50_bps_usdc: Decimal,
+    ) -> Result<Self, UniverseCandidateInputError> {
+        let value = Self {
+            at_10_bps_usdc: canonical_decimal(at_10_bps_usdc),
+            at_25_bps_usdc: canonical_decimal(at_25_bps_usdc),
+            at_50_bps_usdc: canonical_decimal(at_50_bps_usdc),
+        };
+        value.to_depth()?;
+        Ok(value)
+    }
+
+    /// Returns the executable notional inside ten basis points.
+    pub fn at_10_bps_usdc(&self) -> Result<Decimal, UniverseCandidateInputError> {
+        parse_canonical_decimal(&self.at_10_bps_usdc, "at_10_bps_usdc")
+    }
+
+    /// Returns the executable notional inside twenty-five basis points.
+    pub fn at_25_bps_usdc(&self) -> Result<Decimal, UniverseCandidateInputError> {
+        parse_canonical_decimal(&self.at_25_bps_usdc, "at_25_bps_usdc")
+    }
+
+    /// Returns the executable notional inside fifty basis points.
+    pub fn at_50_bps_usdc(&self) -> Result<Decimal, UniverseCandidateInputError> {
+        parse_canonical_decimal(&self.at_50_bps_usdc, "at_50_bps_usdc")
+    }
+
+    fn to_depth(&self) -> Result<SidedDepth, UniverseCandidateInputError> {
+        Ok(SidedDepth::new(
+            Usdc::new(self.at_10_bps_usdc()?)?,
+            Usdc::new(self.at_25_bps_usdc()?)?,
+            Usdc::new(self.at_50_bps_usdc()?)?,
+        )?)
+    }
+}
+
+/// Exact listing state retained by a raw universe-candidate input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UniverseListingStateInput {
+    Active,
+    Delisted,
+    Paused,
+}
+
+impl From<ListingState> for UniverseListingStateInput {
+    fn from(value: ListingState) -> Self {
+        match value {
+            ListingState::Active => Self::Active,
+            ListingState::Delisted => Self::Delisted,
+            ListingState::Paused => Self::Paused,
+        }
+    }
+}
+
+impl From<UniverseListingStateInput> for ListingState {
+    fn from(value: UniverseListingStateInput) -> Self {
+        match value {
+            UniverseListingStateInput::Active => Self::Active,
+            UniverseListingStateInput::Delisted => Self::Delisted,
+            UniverseListingStateInput::Paused => Self::Paused,
+        }
+    }
+}
+
+/// Canonical raw scalar witness for one [`UniverseCandidate`].
+///
+/// It contains no selector output, activation, membership, rank, score, or
+/// admission state. The surrounding [`UniverseWitness`] retains the complete
+/// source references that bind these inputs to the verified source plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UniverseCandidateInput {
+    market: String,
+    native_perpetual: bool,
+    listing_state: UniverseListingStateInput,
+    live_mid: bool,
+    live_mark: bool,
+    live_metadata: bool,
+    venue_max_leverage: u16,
+    usable_calendar_days: u16,
+    trailing_seven_day_coverage: String,
+    detailed_feed_fresh: bool,
+    feed_continuity: String,
+    trailing_day_notional_usdc: String,
+    open_interest_notional_usdc: String,
+    effective_spread_bps: String,
+    bid_depth: UniverseDepthInput,
+    ask_depth: UniverseDepthInput,
+    digest: String,
+}
+
+impl UniverseCandidateInput {
+    /// Creates one canonical raw input from all selector scalar inputs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        market: Market,
+        native_perpetual: bool,
+        listing_state: ListingState,
+        live_mid: bool,
+        live_mark: bool,
+        live_metadata: bool,
+        venue_max_leverage: u16,
+        usable_calendar_days: u16,
+        trailing_seven_day_coverage: Decimal,
+        detailed_feed_fresh: bool,
+        feed_continuity: Decimal,
+        trailing_day_notional_usdc: Decimal,
+        open_interest_notional_usdc: Decimal,
+        effective_spread_bps: Decimal,
+        bid_depth: UniverseDepthInput,
+        ask_depth: UniverseDepthInput,
+    ) -> Result<Self, UniverseCandidateInputError> {
+        let mut value = Self {
+            market: market.as_str().to_owned(),
+            native_perpetual,
+            listing_state: listing_state.into(),
+            live_mid,
+            live_mark,
+            live_metadata,
+            venue_max_leverage,
+            usable_calendar_days,
+            trailing_seven_day_coverage: canonical_decimal(trailing_seven_day_coverage),
+            detailed_feed_fresh,
+            feed_continuity: canonical_decimal(feed_continuity),
+            trailing_day_notional_usdc: canonical_decimal(trailing_day_notional_usdc),
+            open_interest_notional_usdc: canonical_decimal(open_interest_notional_usdc),
+            effective_spread_bps: canonical_decimal(effective_spread_bps),
+            bid_depth,
+            ask_depth,
+            digest: String::new(),
+        };
+        value.build_candidate()?;
+        value.digest = value.expected_digest()?;
+        Ok(value)
+    }
+
+    /// Returns the stable candidate market identifier.
+    #[must_use]
+    pub fn market(&self) -> &str {
+        &self.market
+    }
+
+    /// Returns whether discovery classified this market as a native perpetual.
+    #[must_use]
+    pub const fn native_perpetual(&self) -> bool {
+        self.native_perpetual
+    }
+
+    /// Returns the frozen market lifecycle state.
+    #[must_use]
+    pub const fn listing_state(&self) -> UniverseListingStateInput {
+        self.listing_state
+    }
+
+    /// Returns whether a midpoint was available at this candidate boundary.
+    #[must_use]
+    pub const fn has_live_mid(&self) -> bool {
+        self.live_mid
+    }
+
+    /// Returns whether a venue mark was available at this candidate boundary.
+    #[must_use]
+    pub const fn has_live_mark(&self) -> bool {
+        self.live_mark
+    }
+
+    /// Returns whether venue metadata was available at this candidate boundary.
+    #[must_use]
+    pub const fn has_live_metadata(&self) -> bool {
+        self.live_metadata
+    }
+
+    /// Returns the advertised venue maximum leverage.
+    #[must_use]
+    pub const fn venue_max_leverage(&self) -> u16 {
+        self.venue_max_leverage
+    }
+
+    /// Returns complete local fifteen-minute history in calendar days.
+    #[must_use]
+    pub const fn usable_calendar_days(&self) -> u16 {
+        self.usable_calendar_days
+    }
+
+    /// Returns the canonical trailing-seven-day required-bar coverage.
+    pub fn trailing_seven_day_coverage(&self) -> Result<Decimal, UniverseCandidateInputError> {
+        parse_canonical_decimal(
+            &self.trailing_seven_day_coverage,
+            "trailing_seven_day_coverage",
+        )
+    }
+
+    /// Returns whether the detailed feed was fresh during the scoring window.
+    #[must_use]
+    pub const fn detailed_feed_fresh(&self) -> bool {
+        self.detailed_feed_fresh
+    }
+
+    /// Returns the canonical normalized detailed-feed continuity metric.
+    pub fn feed_continuity(&self) -> Result<Decimal, UniverseCandidateInputError> {
+        parse_canonical_decimal(&self.feed_continuity, "feed_continuity")
+    }
+
+    /// Returns the canonical trailing 24-hour notional volume in synthetic USDC.
+    pub fn trailing_day_notional_usdc(&self) -> Result<Decimal, UniverseCandidateInputError> {
+        parse_canonical_decimal(
+            &self.trailing_day_notional_usdc,
+            "trailing_day_notional_usdc",
+        )
+    }
+
+    /// Returns the canonical mark-notionalized open interest in synthetic USDC.
+    pub fn open_interest_notional_usdc(&self) -> Result<Decimal, UniverseCandidateInputError> {
+        parse_canonical_decimal(
+            &self.open_interest_notional_usdc,
+            "open_interest_notional_usdc",
+        )
+    }
+
+    /// Returns the canonical median effective spread in basis points.
+    pub fn effective_spread_bps(&self) -> Result<Decimal, UniverseCandidateInputError> {
+        parse_canonical_decimal(&self.effective_spread_bps, "effective_spread_bps")
+    }
+
+    /// Returns the frozen sell-side depth input.
+    #[must_use]
+    pub const fn bid_depth(&self) -> &UniverseDepthInput {
+        &self.bid_depth
+    }
+
+    /// Returns the frozen buy-side depth input.
+    #[must_use]
+    pub const fn ask_depth(&self) -> &UniverseDepthInput {
+        &self.ask_depth
+    }
+
+    /// Returns the canonical commitment over every raw selector scalar.
+    #[must_use]
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    /// Reconstructs the core candidate after checking canonical scalar syntax and digest.
+    pub fn to_candidate(&self) -> Result<UniverseCandidate, UniverseCandidateInputError> {
+        self.validate()?;
+        self.build_candidate()
+    }
+
+    /// Alias for recomputing the core domain candidate from this raw witness.
+    pub fn recompute(&self) -> Result<UniverseCandidate, UniverseCandidateInputError> {
+        self.to_candidate()
+    }
+
+    fn build_candidate(&self) -> Result<UniverseCandidate, UniverseCandidateInputError> {
+        let market = Market::new(self.market.clone())?;
+        let availability = MarketDataAvailability::new(
+            self.listing_state.into(),
+            self.live_mid,
+            self.live_mark,
+            self.live_metadata,
+            self.venue_max_leverage,
+        );
+        let history = HistoryQuality::new(
+            self.usable_calendar_days,
+            parse_canonical_decimal(
+                &self.trailing_seven_day_coverage,
+                "trailing_seven_day_coverage",
+            )?,
+            self.detailed_feed_fresh,
+            parse_canonical_decimal(&self.feed_continuity, "feed_continuity")?,
+        )?;
+        let liquidity = UniverseLiquidity::new(
+            Usdc::new(parse_canonical_decimal(
+                &self.trailing_day_notional_usdc,
+                "trailing_day_notional_usdc",
+            )?)?,
+            Usdc::new(parse_canonical_decimal(
+                &self.open_interest_notional_usdc,
+                "open_interest_notional_usdc",
+            )?)?,
+            Bps::new(parse_canonical_decimal(
+                &self.effective_spread_bps,
+                "effective_spread_bps",
+            )?)?,
+            DepthProfile::new(self.bid_depth.to_depth()?, self.ask_depth.to_depth()?),
+        );
+        Ok(UniverseCandidate::new(
+            market,
+            self.native_perpetual,
+            availability,
+            history,
+            liquidity,
+        ))
+    }
+
+    fn validate(&self) -> Result<(), UniverseCandidateInputError> {
+        self.build_candidate()?;
+        if self.digest != self.expected_digest()? {
+            return Err(UniverseCandidateInputError::DigestMismatch);
+        }
+        Ok(())
+    }
+
+    fn expected_digest(&self) -> Result<String, UniverseCandidateInputError> {
+        let bytes = serde_json::to_vec(&UniverseCandidateInputDigestWire::from(self))?;
+        Ok(digest_bytes(UNIVERSE_CANDIDATE_INPUT_DIGEST_DOMAIN, &bytes))
+    }
+}
+
+impl<'de> Deserialize<'de> for UniverseCandidateInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = UniverseCandidateInputWire::deserialize(deserializer)?;
+        let value = Self {
+            market: value.market,
+            native_perpetual: value.native_perpetual,
+            listing_state: value.listing_state,
+            live_mid: value.live_mid,
+            live_mark: value.live_mark,
+            live_metadata: value.live_metadata,
+            venue_max_leverage: value.venue_max_leverage,
+            usable_calendar_days: value.usable_calendar_days,
+            trailing_seven_day_coverage: value.trailing_seven_day_coverage,
+            detailed_feed_fresh: value.detailed_feed_fresh,
+            feed_continuity: value.feed_continuity,
+            trailing_day_notional_usdc: value.trailing_day_notional_usdc,
+            open_interest_notional_usdc: value.open_interest_notional_usdc,
+            effective_spread_bps: value.effective_spread_bps,
+            bid_depth: value.bid_depth,
+            ask_depth: value.ask_depth,
+            digest: value.digest,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UniverseCandidateInputWire {
+    market: String,
+    native_perpetual: bool,
+    listing_state: UniverseListingStateInput,
+    live_mid: bool,
+    live_mark: bool,
+    live_metadata: bool,
+    venue_max_leverage: u16,
+    usable_calendar_days: u16,
+    trailing_seven_day_coverage: String,
+    detailed_feed_fresh: bool,
+    feed_continuity: String,
+    trailing_day_notional_usdc: String,
+    open_interest_notional_usdc: String,
+    effective_spread_bps: String,
+    bid_depth: UniverseDepthInput,
+    ask_depth: UniverseDepthInput,
+    digest: String,
+}
+
+#[derive(Serialize)]
+struct UniverseCandidateInputDigestWire<'a> {
+    market: &'a str,
+    native_perpetual: bool,
+    listing_state: UniverseListingStateInput,
+    live_mid: bool,
+    live_mark: bool,
+    live_metadata: bool,
+    venue_max_leverage: u16,
+    usable_calendar_days: u16,
+    trailing_seven_day_coverage: &'a str,
+    detailed_feed_fresh: bool,
+    feed_continuity: &'a str,
+    trailing_day_notional_usdc: &'a str,
+    open_interest_notional_usdc: &'a str,
+    effective_spread_bps: &'a str,
+    bid_depth: &'a UniverseDepthInput,
+    ask_depth: &'a UniverseDepthInput,
+}
+
+impl<'a> From<&'a UniverseCandidateInput> for UniverseCandidateInputDigestWire<'a> {
+    fn from(value: &'a UniverseCandidateInput) -> Self {
+        Self {
+            market: &value.market,
+            native_perpetual: value.native_perpetual,
+            listing_state: value.listing_state,
+            live_mid: value.live_mid,
+            live_mark: value.live_mark,
+            live_metadata: value.live_metadata,
+            venue_max_leverage: value.venue_max_leverage,
+            usable_calendar_days: value.usable_calendar_days,
+            trailing_seven_day_coverage: &value.trailing_seven_day_coverage,
+            detailed_feed_fresh: value.detailed_feed_fresh,
+            feed_continuity: &value.feed_continuity,
+            trailing_day_notional_usdc: &value.trailing_day_notional_usdc,
+            open_interest_notional_usdc: &value.open_interest_notional_usdc,
+            effective_spread_bps: &value.effective_spread_bps,
+            bid_depth: &value.bid_depth,
+            ask_depth: &value.ask_depth,
+        }
+    }
+}
+
+/// Failure while checking or reconstructing a raw universe-candidate witness.
+#[derive(Debug, Error)]
+pub enum UniverseCandidateInputError {
+    #[error(
+        "universe candidate input field `{field}` must use canonical normalized decimal syntax"
+    )]
+    InvalidDecimal { field: &'static str },
+    #[error("universe candidate input digest does not match its raw scalar contents")]
+    DigestMismatch,
+    #[error(transparent)]
+    Domain(#[from] DomainError),
+    #[error(transparent)]
+    Universe(#[from] UniverseError),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+}
+
+fn canonical_decimal(value: Decimal) -> String {
+    value.normalize().to_string()
+}
+
+fn parse_canonical_decimal(
+    value: &str,
+    field: &'static str,
+) -> Result<Decimal, UniverseCandidateInputError> {
+    let decimal = Decimal::from_str(value)
+        .map_err(|_| UniverseCandidateInputError::InvalidDecimal { field })?;
+    if canonical_decimal(decimal) != value {
+        return Err(UniverseCandidateInputError::InvalidDecimal { field });
+    }
+    Ok(decimal)
 }
 
 /// One normalized unavailable interval. Adjacent equal-reason intervals normalize to one gap.
