@@ -174,16 +174,6 @@ enum CaptureOutput {
     Rejected(ContextCaptureError),
 }
 
-/// Whether a complete capture can cross the durable authority boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CaptureSourcePreflight {
-    /// Every capture fact is new and the full batch can be persisted atomically.
-    AllNew,
-    /// Every capture fact is already verified immutable history, so this retry
-    /// must leave all daemon state unchanged.
-    HistoricalNoOp,
-}
-
 /// Explicit UTC receipt-time source used only by the read-only I/O adapter.
 #[derive(Debug, Clone, Copy)]
 struct SystemReceiptClock;
@@ -1135,9 +1125,8 @@ async fn admit_capture_output(
 ) -> Result<StreamScopeAction, AppError> {
     match output {
         CaptureOutput::Captured(batch) => {
-            if preflight_capture_sources(authority, batch.events())?
-                == CaptureSourcePreflight::HistoricalNoOp
-            {
+            let fresh_events = capture_fresh_events(authority, batch.events())?;
+            if fresh_events.is_empty() {
                 tracing::debug!(
                     events = batch.events().len(),
                     captured_at_ns = batch.captured_at().value(),
@@ -1146,8 +1135,8 @@ async fn admit_capture_output(
                 );
                 return Ok(StreamScopeAction::None);
             }
-            parquet_store.write_capture_batch(batch.events())?;
-            for event in batch.events().iter().cloned() {
+            parquet_store.write_capture_batch(&fresh_events)?;
+            for event in fresh_events.iter().cloned() {
                 admit_market_event(writer, authority, event, recovery_sender).await?;
             }
             scheduler.complete(true);
@@ -1819,26 +1808,38 @@ fn is_verified_historical_source_retry(
     })
 }
 
-/// Preflights a complete context capture without mutating authority state.
+/// Selects the fresh source rows from one complete context capture.
 ///
-/// A capture is indivisible: accepting a subset would bind its dynamic scope
-/// to facts that were never admitted in the same durable capture boundary.
-fn preflight_capture_sources(
+/// Context requests intentionally overlap their rolling history windows. Rows
+/// that are already durable are omitted from the new atomic capture commit,
+/// while changed payloads or regressed receipt times remain integrity errors.
+fn capture_fresh_events(
     authority: &AuthorityState,
     events: &[MarketEvent],
-) -> Result<CaptureSourcePreflight, AppError> {
-    let historical_count = events.iter().try_fold(0_usize, |count, event| {
-        Ok::<_, AppError>(
-            count + usize::from(is_verified_historical_source_retry(authority, event)?),
-        )
-    })?;
-    if historical_count == 0 {
-        return Ok(CaptureSourcePreflight::AllNew);
+) -> Result<Vec<MarketEvent>, AppError> {
+    let mut fresh = Vec::with_capacity(events.len());
+    for event in events {
+        let Some(historical) = authority.historical_sources.get(event.event_id()) else {
+            fresh.push(event.clone());
+            continue;
+        };
+        if historical == event || capture_source_equivalent(historical, event) {
+            continue;
+        }
+        return Err(AppError::HistoricalSourceConflict {
+            event_id: event.event_id().as_str().to_owned(),
+        });
     }
-    if historical_count == events.len() {
-        return Ok(CaptureSourcePreflight::HistoricalNoOp);
-    }
-    Err(AppError::MixedHistoricalCapture)
+    Ok(fresh)
+}
+
+/// Compares a context retry's immutable source payload while allowing its
+/// local receipt time to advance on a later REST capture.
+fn capture_source_equivalent(existing: &MarketEvent, incoming: &MarketEvent) -> bool {
+    existing.event_time() == incoming.event_time()
+        && existing.market() == incoming.market()
+        && existing.kind() == incoming.kind()
+        && incoming.received_at() >= existing.received_at()
 }
 
 /// Persists and routes one live source fact after the restart-evidence fence.
@@ -2129,10 +2130,6 @@ pub enum AppError {
         /// Reused normalized source identity.
         event_id: String,
     },
-    /// A complete context capture combined exact historical retries with new
-    /// facts, so no atomic source/scope transition can be proved.
-    #[error("context capture mixed historical retries with new source facts")]
-    MixedHistoricalCapture,
     /// Persisted recovery control evidence was malformed, edited, or did not
     /// bind to its anchored raw L2 source fact.
     #[error("persisted recovery evidence was invalid")]
@@ -2751,7 +2748,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mixed_historical_capture_fails_closed_before_every_mutation() {
+    async fn mixed_historical_capture_filters_retries_and_persists_fresh_facts() {
         let (capture, request, _server) = mounted_context_capture(None).await;
         let batch = capture
             .capture(&request, &SystemReceiptClock)
@@ -2784,7 +2781,6 @@ mod tests {
         let _ = authority.live.replace_persisted_scope(vec![btc()]);
         let scope_before = authority.live.scope.clone();
         let epoch_before = authority.live.epoch;
-        let readiness_before = authority.readiness.snapshot();
         let mut scheduler = CaptureScheduler::new(vec![btc()]);
         let _ = scheduler
             .dispatch(current_timestamp())
@@ -2792,7 +2788,7 @@ mod tests {
             .expect("in-flight capture");
         let config = PaperConfig::from_toml(PAPER_CONFIG).expect("fixture config");
 
-        let error = admit_capture_output(
+        let action = admit_capture_output(
             &store,
             &mut writer,
             &mut authority,
@@ -2802,25 +2798,30 @@ mod tests {
             None,
         )
         .await
-        .expect_err("a mixed historical capture cannot cross an atomic boundary");
+        .expect("overlapping historical rows are filtered before fresh commit");
 
-        assert!(matches!(error, AppError::MixedHistoricalCapture));
-        assert!(
-            scheduler.in_flight(),
-            "the failed batch must not complete the schedule"
-        );
-        assert!(store.partitions().expect("source partitions").is_empty());
         assert_eq!(
+            action,
+            StreamScopeAction::Start {
+                scope: authority.live.scope.clone(),
+                epoch: authority.live.epoch,
+                shutdown_prior: false,
+            }
+        );
+        assert!(
+            !scheduler.in_flight(),
+            "a fresh capture completes its schedule"
+        );
+        assert!(
             writer
                 .journal_counts()
                 .await
                 .expect("journal counts")
-                .events,
-            0
+                .events
+                > 0
         );
-        assert_eq!(authority.live.scope, scope_before);
-        assert_eq!(authority.live.epoch, epoch_before);
-        assert_eq!(authority.readiness.snapshot(), readiness_before);
+        assert_ne!(authority.live.scope, scope_before);
+        assert!(authority.live.epoch > epoch_before);
     }
 
     #[tokio::test]
