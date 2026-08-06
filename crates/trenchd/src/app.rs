@@ -1787,8 +1787,9 @@ async fn admit_market_event(
 /// Filters a source retry against immutable evidence verified during restart.
 ///
 /// This must run before a public source fact reaches either durable store. An
-/// exact retry is already durable; a reused identity with changed evidence is
-/// an integrity failure and never becomes a new source fact.
+/// same-payload retries are already durable; a reused identity with changed
+/// payload or a regressed receipt is an integrity failure and never becomes a
+/// new source fact.
 fn is_verified_historical_source_retry(
     authority: &AuthorityState,
     event: &MarketEvent,
@@ -1796,10 +1797,10 @@ fn is_verified_historical_source_retry(
     let Some(historical) = authority.historical_sources.get(event.event_id()) else {
         return Ok(false);
     };
-    if historical == event {
+    if historical == event || source_payload_equivalent(historical, event) {
         tracing::debug!(
             event_id = event.event_id().as_str(),
-            "dropping exact source retry already verified during restart reconstruction"
+            "dropping source retry with verified immutable payload"
         );
         return Ok(true);
     }
@@ -1823,7 +1824,7 @@ fn capture_fresh_events(
             fresh.push(event.clone());
             continue;
         };
-        if historical == *event || capture_source_equivalent(&historical, event) {
+        if historical == *event || source_payload_equivalent(&historical, event) {
             continue;
         }
         return Err(AppError::HistoricalSourceConflict {
@@ -1833,9 +1834,9 @@ fn capture_fresh_events(
     Ok(fresh)
 }
 
-/// Compares a context retry's immutable source payload while allowing its
-/// local receipt time to advance on a later REST capture.
-fn capture_source_equivalent(existing: &MarketEvent, incoming: &MarketEvent) -> bool {
+/// Compares a retry's immutable source payload while allowing its local receipt
+/// time to advance on a later REST/WS observation.
+fn source_payload_equivalent(existing: &MarketEvent, incoming: &MarketEvent) -> bool {
     existing.event_time() == incoming.event_time()
         && existing.market() == incoming.market()
         && existing.kind() == incoming.kind()
@@ -3024,24 +3025,42 @@ mod tests {
             reconstructed_boundary,
             "dropping a historic retry must not alter source-clock or late-source state"
         );
-        let conflicting_receipt = MarketEvent::trade(
+        let repeated_receipt = MarketEvent::trade(
             timestamp(BASE_NS),
             timestamp(BASE_NS + 1),
             btc(),
             Trade::new(1, Side::Buy, price(100), quantity(1)).expect("fixture trade"),
         )
-        .expect("same source identity with altered receipt evidence");
-        assert_eq!(conflicting_receipt.event_id(), committed.event_id());
-        assert_ne!(conflicting_receipt, committed);
+        .expect("same source identity with later receipt evidence");
+        assert_eq!(repeated_receipt.event_id(), committed.event_id());
+        assert_ne!(repeated_receipt, committed);
+        let admitted = persist_live_market_event(
+            &store,
+            &mut restarted_writer,
+            &mut restored.authority,
+            repeated_receipt,
+            None,
+        )
+        .await
+        .expect("a same-payload retry with a later receipt is safe to drop");
+        assert!(!admitted);
+        let conflicting_payload = MarketEvent::trade(
+            timestamp(BASE_NS),
+            timestamp(BASE_NS + 1),
+            btc(),
+            Trade::new(1, Side::Buy, price(101), quantity(1)).expect("changed trade payload"),
+        )
+        .expect("same source identity with changed payload");
+        assert_eq!(conflicting_payload.event_id(), committed.event_id());
         let conflict = persist_live_market_event(
             &store,
             &mut restarted_writer,
             &mut restored.authority,
-            conflicting_receipt,
+            conflicting_payload,
             None,
         )
         .await
-        .expect_err("changed receipt evidence must fail closed rather than be dropped");
+        .expect_err("changed payload evidence must fail closed");
         assert!(matches!(
             conflict,
             AppError::HistoricalSourceConflict { .. }
