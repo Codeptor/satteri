@@ -1,0 +1,21 @@
+{
+  "name": "mem0",
+  "version": "0.1.0",
+  "description": "Persistent Mem0 memory for Codex through the hosted MCP server.",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Mem0",
+    "shortDescription": "Persist and retrieve project memory in Codex.",
+    "longDescription": "Connect Codex to Mem0's hosted MCP server for searchable project memory. The API key stays in the local environment and is never stored in this repository.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": [
+      "Save durable project decisions and retrieve relevant memory when needed."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}
