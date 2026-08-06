@@ -42,6 +42,10 @@ const CAPTURE_RESULT_CHANNEL_CAPACITY: usize = 1;
 const RECOVERY_CHANNEL_CAPACITY: usize = 16;
 const RECOVERY_PENDING_CAPACITY: usize = 128;
 const MAXIMUM_BOOK_AGE_NS: i64 = 1_000_000_000;
+/// Live source facts are committed in short bounded batches so one Parquet
+/// partition is not created for every individual WebSocket message.
+const LIVE_SOURCE_BATCH_CAPACITY: usize = 1_024;
+const LIVE_SOURCE_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// One requested daemon lifecycle mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -441,6 +445,12 @@ pub async fn run(
         cadence(config.feed().universe_refresh_seconds()),
     );
     capture_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut live_flush_clock = tokio::time::interval_at(
+        tokio::time::Instant::now() + LIVE_SOURCE_FLUSH_INTERVAL,
+        LIVE_SOURCE_FLUSH_INTERVAL,
+    );
+    live_flush_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut live_pending = Vec::with_capacity(LIVE_SOURCE_BATCH_CAPACITY);
     loop {
         flush_recovery_inputs(&recovery_sender, &mut authority);
         let restart_at = authority.live.restart_at;
@@ -469,6 +479,14 @@ pub async fn run(
             output = capture_result_receiver.recv(), if capture_results_open => {
                 match output {
                     Some(output) => {
+                        flush_live_source_batch(
+                            &parquet_store,
+                            &mut writer,
+                            &mut authority,
+                            &mut live_pending,
+                            Some(&recovery_sender),
+                        )
+                        .await?;
                         let stream_action = admit_capture_output(
                             &parquet_store,
                             &mut writer,
@@ -497,19 +515,17 @@ pub async fn run(
             output = receive_live(&mut authority.live.stream) => {
                 match output {
                     Some(WsOutput::MarketEvent(event)) => {
-                        let admitted = persist_live_market_event(
-                            &parquet_store,
-                            &mut writer,
-                            &mut authority,
-                            event.clone(),
-                            Some(&recovery_sender),
-                        )
-                        .await?;
-                        if admitted && matches!(event.kind(), MarketEventKind::BookSnapshot(_))
-                            && authority.live.observe_l2(event.market())
-                        {
-                            authority.readiness.set_stream_connected(true);
-                            authority.live.restart_attempt = 0;
+                        live_pending.push(event);
+                        if live_pending.len() >= LIVE_SOURCE_BATCH_CAPACITY {
+                            let committed = flush_live_source_batch(
+                                &parquet_store,
+                                &mut writer,
+                                &mut authority,
+                                &mut live_pending,
+                                Some(&recovery_sender),
+                            )
+                            .await?;
+                            update_live_l2_readiness(&mut authority, &committed);
                         }
                     }
                     Some(WsOutput::Gap(gap)) => {
@@ -549,6 +565,17 @@ pub async fn run(
                     stream_action,
                     &mut authority.readiness,
                 ).await;
+            }
+            _ = live_flush_clock.tick(), if !live_pending.is_empty() => {
+                let committed = flush_live_source_batch(
+                    &parquet_store,
+                    &mut writer,
+                    &mut authority,
+                    &mut live_pending,
+                    Some(&recovery_sender),
+                )
+                .await?;
+                update_live_l2_readiness(&mut authority, &committed);
             }
             output = recovery_result_receiver.recv(), if recovery_results_open => {
                 match output {
@@ -619,6 +646,14 @@ pub async fn run(
         }
     }
 
+    flush_live_source_batch(
+        &parquet_store,
+        &mut writer,
+        &mut authority,
+        &mut live_pending,
+        Some(&recovery_sender),
+    )
+    .await?;
     cancellation.cancel();
     notify_systemd(&[NotifyState::Stopping]);
     drop(capture_sender);
@@ -1810,6 +1845,7 @@ fn preflight_capture_sources(
 ///
 /// `false` means a verified historical retry was dropped without mutating
 /// Parquet, SQLite, the engine, or recovery input state.
+#[cfg(test)]
 async fn persist_live_market_event(
     parquet_store: &ParquetStore,
     writer: &mut EngineWriter,
@@ -1817,12 +1853,69 @@ async fn persist_live_market_event(
     event: MarketEvent,
     recovery_sender: Option<&mpsc::Sender<RecoveryInput>>,
 ) -> Result<bool, AppError> {
-    if is_verified_historical_source_retry(authority, &event)? {
-        return Ok(false);
+    Ok(!persist_live_market_events(
+        parquet_store,
+        writer,
+        authority,
+        vec![event],
+        recovery_sender,
+    )
+    .await?
+    .is_empty())
+}
+
+/// Commits a bounded live-source batch before routing any member through the
+/// authority. Exact restart retries are dropped; every new fact is durable in
+/// one Parquet write before it can affect SQLite or recovery state.
+async fn persist_live_market_events(
+    parquet_store: &ParquetStore,
+    writer: &mut EngineWriter,
+    authority: &mut AuthorityState,
+    events: Vec<MarketEvent>,
+    recovery_sender: Option<&mpsc::Sender<RecoveryInput>>,
+) -> Result<Vec<MarketEvent>, AppError> {
+    let mut fresh = Vec::with_capacity(events.len());
+    for event in events {
+        if !is_verified_historical_source_retry(authority, &event)? {
+            fresh.push(event);
+        }
     }
-    parquet_store.write_events(std::slice::from_ref(&event))?;
-    admit_market_event(writer, authority, event, recovery_sender).await?;
-    Ok(true)
+    if fresh.is_empty() {
+        return Ok(fresh);
+    }
+    parquet_store.write_events(&fresh)?;
+    for event in fresh.iter().cloned() {
+        admit_market_event(writer, authority, event, recovery_sender).await?;
+    }
+    Ok(fresh)
+}
+
+/// Flushes pending live facts and returns the exact committed batch for stream
+/// readiness updates. The buffer is drained only after the Parquet write and
+/// authority admissions succeed.
+async fn flush_live_source_batch(
+    parquet_store: &ParquetStore,
+    writer: &mut EngineWriter,
+    authority: &mut AuthorityState,
+    pending: &mut Vec<MarketEvent>,
+    recovery_sender: Option<&mpsc::Sender<RecoveryInput>>,
+) -> Result<Vec<MarketEvent>, AppError> {
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+    let events = std::mem::take(pending);
+    persist_live_market_events(parquet_store, writer, authority, events, recovery_sender).await
+}
+
+fn update_live_l2_readiness(authority: &mut AuthorityState, events: &[MarketEvent]) {
+    for event in events {
+        if matches!(event.kind(), MarketEventKind::BookSnapshot(_))
+            && authority.live.observe_l2(event.market())
+        {
+            authority.readiness.set_stream_connected(true);
+            authority.live.restart_attempt = 0;
+        }
+    }
 }
 
 fn source_is_late(authority: &AuthorityState, source: &MarketEvent) -> Result<bool, AppError> {
