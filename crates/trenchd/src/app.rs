@@ -436,6 +436,7 @@ pub async fn run(
         flush_recovery_inputs(&recovery_sender, &mut authority);
         let restart_at = authority.live.restart_at;
         tokio::select! {
+            biased;
             result = &mut stop => {
                 result?;
                 break;
