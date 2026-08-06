@@ -45,7 +45,11 @@ const CAPTURE_BATCH_MANIFEST_FILE: &str = "capture-batch.json";
 const PARTITION_SCHEMA_VERSION: u8 = 1;
 const CAPTURE_BATCH_SCHEMA_VERSION: u8 = 1;
 const MAX_EVENTS_PER_BATCH: usize = 100_000;
-const MAX_DISCOVERED_PARTITIONS: usize = 4_096;
+// Live WebSocket batches are immutable and content-addressed. A high-rate
+// source therefore creates many small partitions over a session; keep the
+// discovery bound finite while allowing a full paper-trading day before the
+// writer-owned retention path compacts or expires raw evidence.
+const MAX_DISCOVERED_PARTITIONS: usize = 1_048_576;
 const MAX_PARTITIONS_PER_CAPTURE_BATCH: usize = 1_024;
 const MAX_BOOK_LEVELS_PER_EVENT: usize = 2_000;
 const MAX_EVENT_WIRE_BYTES: usize = 64 * 1_024;
