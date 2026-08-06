@@ -4,13 +4,14 @@
 //! approval seal stay inside risk until the core engine consumes a matching
 //! [`OrderIntent`] exactly once against the same immutable input snapshot.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, str::FromStr};
 
 use blake3::Hasher;
 use rust_decimal::{
     Decimal, RoundingStrategy,
     prelude::{FromPrimitive, ToPrimitive},
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::domain::{Bps, DomainError, Leverage, Price, Quantity, Side, Usdc};
@@ -30,6 +31,8 @@ const MAX_TRADE_RISK_FRACTION: Decimal = Decimal::from_parts(5, 0, 0, false, 3);
 const MAX_OUTSTANDING_APPROVALS: usize = 64;
 const APPROVED_ENTRY_SLIPPAGE_BPS: Decimal = Decimal::from_parts(50, 0, 0, false, 0);
 const RISK_QUOTE_DOMAIN: &str = "trench.risk-quote.v1";
+const RISK_POLICY_WIRE_VERSION: u16 = 1;
+const RISK_POLICY_DIGEST_DOMAIN: &str = "trench.risk-policy.v1";
 
 /// Frozen venue limits used by the deterministic isolated sizing solver.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -513,11 +516,60 @@ impl RiskPolicy {
         }
     }
 
-    /// Returns the deterministic commitment for the frozen venue constraints,
-    /// costs, limits, and executable-book binding.
+    /// Returns the versioned canonical digest for the complete frozen risk policy.
+    ///
+    /// The digest commits to the executable-book binding, venue constraints,
+    /// maintenance tiers, impact ladder, conservative fees/funding, and risk
+    /// limits. It is suitable for binding an offline replay to its exact
+    /// checked policy artifact.
+    pub fn canonical_digest(&self) -> Result<String, RiskPolicyWireError> {
+        risk_policy_digest(&self.to_wire_without_digest())
+    }
+
+    /// Returns canonical immutable JSON bytes for offline policy replay.
+    ///
+    /// The serialized digest is recomputed from the versioned canonical wire
+    /// on reopen; callers cannot supply mutable policy fields separately.
+    pub fn canonical_json(&self) -> Result<Vec<u8>, RiskPolicyWireError> {
+        serde_json::to_vec(&self.to_wire()?).map_err(|_| RiskPolicyWireError::InvalidJson)
+    }
+
+    /// Reopens a canonical risk-policy artifact and verifies every committed
+    /// field through the production input constructors.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unknown/version-mismatched fields, noncanonical decimal syntax,
+    /// invalid input combinations, digest mismatches, and byte encodings that
+    /// differ from the canonical serialization.
+    pub fn from_canonical_json(bytes: &[u8]) -> Result<Self, RiskPolicyWireError> {
+        let wire: RiskPolicyWire =
+            serde_json::from_slice(bytes).map_err(|_| RiskPolicyWireError::InvalidJson)?;
+        if wire.version != RISK_POLICY_WIRE_VERSION {
+            return Err(RiskPolicyWireError::UnsupportedVersion {
+                version: wire.version,
+            });
+        }
+        if serde_json::to_vec(&wire).map_err(|_| RiskPolicyWireError::InvalidJson)? != bytes {
+            return Err(RiskPolicyWireError::NonCanonicalEncoding);
+        }
+        let policy = Self::from_wire(&wire)?;
+        if wire.digest != policy.canonical_digest()? {
+            return Err(RiskPolicyWireError::DigestMismatch);
+        }
+        if policy.to_wire()? != wire {
+            return Err(RiskPolicyWireError::NonCanonicalEncoding);
+        }
+        Ok(policy)
+    }
+
+    /// Returns the legacy deterministic commitment for the frozen policy.
+    ///
+    /// Engine approval seals retain this established digest. Offline replay
+    /// should use [`Self::canonical_digest`] and [`Self::canonical_json`].
     #[must_use]
     pub fn commitment_digest(&self) -> String {
-        let mut hasher = Hasher::new_derive_key("trench.risk-policy.v1");
+        let mut hasher = Hasher::new_derive_key(RISK_POLICY_DIGEST_DOMAIN);
         for value in [
             self.book_digest.clone(),
             self.constraints.quantity_decimals.to_string(),
@@ -575,6 +627,344 @@ impl RiskPolicy {
     pub fn matches_book_digest(&self, book_digest: &str) -> bool {
         self.book_digest == book_digest
     }
+
+    fn to_wire_without_digest(&self) -> RiskPolicyWireWithoutDigest {
+        RiskPolicyWireWithoutDigest {
+            version: RISK_POLICY_WIRE_VERSION,
+            book_digest: self.book_digest.clone(),
+            constraints: VenueConstraintsWire::from_constraints(&self.constraints),
+            costs: ConservativeCostsWire::from_costs(&self.costs),
+            limits: RiskLimitsWire::from_limits(self.limits),
+        }
+    }
+
+    fn to_wire(&self) -> Result<RiskPolicyWire, RiskPolicyWireError> {
+        let content = self.to_wire_without_digest();
+        Ok(RiskPolicyWire {
+            version: content.version,
+            book_digest: content.book_digest,
+            constraints: content.constraints,
+            costs: content.costs,
+            limits: content.limits,
+            digest: self.canonical_digest()?,
+        })
+    }
+
+    fn from_wire(wire: &RiskPolicyWire) -> Result<Self, RiskPolicyWireError> {
+        if !is_blake3_digest(&wire.book_digest) {
+            return Err(RiskPolicyWireError::InvalidDigest);
+        }
+        Ok(Self {
+            book_digest: wire.book_digest.clone(),
+            constraints: wire.constraints.to_constraints()?,
+            costs: wire.costs.to_costs()?,
+            limits: wire.limits.to_limits()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RiskPolicyWire {
+    version: u16,
+    book_digest: String,
+    constraints: VenueConstraintsWire,
+    costs: ConservativeCostsWire,
+    limits: RiskLimitsWire,
+    digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct RiskPolicyWireWithoutDigest {
+    version: u16,
+    book_digest: String,
+    constraints: VenueConstraintsWire,
+    costs: ConservativeCostsWire,
+    limits: RiskLimitsWire,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VenueConstraintsWire {
+    quantity_decimals: u8,
+    minimum_notional_usdc: String,
+    maximum_notional_usdc: String,
+    maximum_executable_notional_usdc: String,
+    maximum_leverage: u8,
+    maintenance_tiers: Vec<MaintenanceTierWire>,
+}
+
+impl VenueConstraintsWire {
+    fn from_constraints(constraints: &VenueConstraints) -> Self {
+        Self {
+            quantity_decimals: constraints.quantity_decimals(),
+            minimum_notional_usdc: canonical_decimal(constraints.minimum_notional().value()),
+            maximum_notional_usdc: canonical_decimal(constraints.maximum_notional().value()),
+            maximum_executable_notional_usdc: canonical_decimal(
+                constraints.maximum_executable_notional().value(),
+            ),
+            maximum_leverage: constraints.maximum_leverage().value(),
+            maintenance_tiers: constraints
+                .maintenance_tiers()
+                .as_slice()
+                .iter()
+                .copied()
+                .map(MaintenanceTierWire::from_tier)
+                .collect(),
+        }
+    }
+
+    fn to_constraints(&self) -> Result<VenueConstraints, RiskPolicyWireError> {
+        let minimum_notional = parse_usdc(&self.minimum_notional_usdc, "minimum_notional_usdc")?;
+        let maximum_notional = parse_usdc(&self.maximum_notional_usdc, "maximum_notional_usdc")?;
+        let maximum_executable_notional = parse_usdc(
+            &self.maximum_executable_notional_usdc,
+            "maximum_executable_notional_usdc",
+        )?;
+        let maximum_leverage = Leverage::new(self.maximum_leverage)
+            .map_err(|error| invalid_policy_field("maximum_leverage", error))?;
+        let maintenance_tiers = MaintenanceTiers::new(
+            self.maintenance_tiers
+                .iter()
+                .map(MaintenanceTierWire::to_tier)
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+        .map_err(|error| invalid_policy_field("maintenance_tiers", error))?;
+        VenueConstraints::new(
+            self.quantity_decimals,
+            minimum_notional,
+            maximum_notional,
+            maximum_executable_notional,
+            maximum_leverage,
+            maintenance_tiers,
+        )
+        .map_err(|error| invalid_policy_field("constraints", error))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceTierWire {
+    lower_notional_usdc: String,
+    upper_notional_usdc: Option<String>,
+    maintenance_rate: String,
+    maintenance_deduction_usdc: String,
+}
+
+impl MaintenanceTierWire {
+    fn from_tier(tier: crate::risk::liquidation::MaintenanceTier) -> Self {
+        Self {
+            lower_notional_usdc: canonical_decimal(tier.lower_notional().value()),
+            upper_notional_usdc: tier
+                .upper_notional()
+                .map(|upper| canonical_decimal(upper.value())),
+            maintenance_rate: canonical_decimal(tier.maintenance_rate()),
+            maintenance_deduction_usdc: canonical_decimal(tier.maintenance_deduction().value()),
+        }
+    }
+
+    fn to_tier(&self) -> Result<crate::risk::liquidation::MaintenanceTier, RiskPolicyWireError> {
+        crate::risk::liquidation::MaintenanceTier::new(
+            parse_usdc(
+                &self.lower_notional_usdc,
+                "maintenance_tiers.lower_notional_usdc",
+            )?,
+            self.upper_notional_usdc
+                .as_deref()
+                .map(|value| parse_usdc(value, "maintenance_tiers.upper_notional_usdc"))
+                .transpose()?,
+            parse_canonical_decimal(&self.maintenance_rate, "maintenance_tiers.maintenance_rate")?,
+            parse_usdc(
+                &self.maintenance_deduction_usdc,
+                "maintenance_tiers.maintenance_deduction_usdc",
+            )?,
+        )
+        .map_err(|error| invalid_policy_field("maintenance_tiers", error))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConservativeCostsWire {
+    entry_fee_fraction: String,
+    exit_fee_fraction: String,
+    impact_curve: Vec<ImpactBandWire>,
+    current_funding_fraction: String,
+    trailing_p99_funding_fraction: String,
+    funding_timestamps: u16,
+}
+
+impl ConservativeCostsWire {
+    fn from_costs(costs: &ConservativeCosts) -> Self {
+        Self {
+            entry_fee_fraction: canonical_decimal(costs.entry_fee_fraction),
+            exit_fee_fraction: canonical_decimal(costs.exit_fee_fraction),
+            impact_curve: costs
+                .impact_curve
+                .0
+                .iter()
+                .copied()
+                .map(ImpactBandWire::from_band)
+                .collect(),
+            current_funding_fraction: canonical_decimal(costs.current_funding_fraction),
+            trailing_p99_funding_fraction: canonical_decimal(costs.trailing_p99_funding_fraction),
+            funding_timestamps: costs.funding_timestamps,
+        }
+    }
+
+    fn to_costs(&self) -> Result<ConservativeCosts, RiskPolicyWireError> {
+        ConservativeCosts::new(
+            parse_canonical_decimal(&self.entry_fee_fraction, "entry_fee_fraction")?,
+            parse_canonical_decimal(&self.exit_fee_fraction, "exit_fee_fraction")?,
+            ImpactCurve::new(
+                self.impact_curve
+                    .iter()
+                    .map(ImpactBandWire::to_band)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .map_err(|error| invalid_policy_field("impact_curve", error))?,
+            parse_canonical_decimal(&self.current_funding_fraction, "current_funding_fraction")?,
+            parse_canonical_decimal(
+                &self.trailing_p99_funding_fraction,
+                "trailing_p99_funding_fraction",
+            )?,
+            self.funding_timestamps,
+        )
+        .map_err(|error| invalid_policy_field("costs", error))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImpactBandWire {
+    upper_notional_usdc: Option<String>,
+    current_fraction: String,
+    trailing_p99_fraction: String,
+}
+
+impl ImpactBandWire {
+    fn from_band(band: ImpactBand) -> Self {
+        Self {
+            upper_notional_usdc: band
+                .upper_notional
+                .map(|upper| canonical_decimal(upper.value())),
+            current_fraction: canonical_decimal(band.current_fraction),
+            trailing_p99_fraction: canonical_decimal(band.trailing_p99_fraction),
+        }
+    }
+
+    fn to_band(&self) -> Result<ImpactBand, RiskPolicyWireError> {
+        ImpactBand::new(
+            self.upper_notional_usdc
+                .as_deref()
+                .map(|value| parse_usdc(value, "impact_curve.upper_notional_usdc"))
+                .transpose()?,
+            parse_canonical_decimal(&self.current_fraction, "impact_curve.current_fraction")?,
+            parse_canonical_decimal(
+                &self.trailing_p99_fraction,
+                "impact_curve.trailing_p99_fraction",
+            )?,
+        )
+        .map_err(|error| invalid_policy_field("impact_curve", error))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RiskLimitsWire {
+    risk_budget_usdc: String,
+    margin_cap_fraction: String,
+    liquidation_stop_multiple: String,
+}
+
+impl RiskLimitsWire {
+    fn from_limits(limits: RiskLimits) -> Self {
+        Self {
+            risk_budget_usdc: canonical_decimal(limits.risk_budget().value()),
+            margin_cap_fraction: canonical_decimal(limits.margin_cap_fraction()),
+            liquidation_stop_multiple: canonical_decimal(limits.liquidation_stop_multiple()),
+        }
+    }
+
+    fn to_limits(&self) -> Result<RiskLimits, RiskPolicyWireError> {
+        RiskLimits::new(
+            parse_usdc(&self.risk_budget_usdc, "risk_budget_usdc")?,
+            parse_canonical_decimal(&self.margin_cap_fraction, "margin_cap_fraction")?,
+            parse_canonical_decimal(&self.liquidation_stop_multiple, "liquidation_stop_multiple")?,
+        )
+        .map_err(|error| invalid_policy_field("limits", error))
+    }
+}
+
+fn canonical_decimal(value: Decimal) -> String {
+    value.normalize().to_string()
+}
+
+fn parse_canonical_decimal(
+    value: &str,
+    field: &'static str,
+) -> Result<Decimal, RiskPolicyWireError> {
+    let decimal = Decimal::from_str(value).map_err(|_| RiskPolicyWireError::InvalidField {
+        field,
+        message: "must be a decimal".to_owned(),
+    })?;
+    if canonical_decimal(decimal) != value {
+        return Err(RiskPolicyWireError::InvalidField {
+            field,
+            message: "must use canonical normalized decimal syntax".to_owned(),
+        });
+    }
+    Ok(decimal)
+}
+
+fn parse_usdc(value: &str, field: &'static str) -> Result<Usdc, RiskPolicyWireError> {
+    Usdc::new(parse_canonical_decimal(value, field)?)
+        .map_err(|error| invalid_policy_field(field, error))
+}
+
+fn invalid_policy_field(field: &'static str, error: impl std::fmt::Display) -> RiskPolicyWireError {
+    RiskPolicyWireError::InvalidField {
+        field,
+        message: error.to_string(),
+    }
+}
+
+fn risk_policy_digest(wire: &RiskPolicyWireWithoutDigest) -> Result<String, RiskPolicyWireError> {
+    let bytes = serde_json::to_vec(wire).map_err(|_| RiskPolicyWireError::InvalidJson)?;
+    let mut hasher = Hasher::new_derive_key(RISK_POLICY_DIGEST_DOMAIN);
+    hasher.update(&bytes);
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Canonical risk-policy artifact verification failed.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum RiskPolicyWireError {
+    /// The artifact could not be decoded as the supported schema.
+    #[error("risk policy artifact is not valid JSON")]
+    InvalidJson,
+    /// The artifact version is unknown.
+    #[error("unsupported risk policy artifact version {version}")]
+    UnsupportedVersion {
+        /// Rejected wire version.
+        version: u16,
+    },
+    /// A checked policy field was invalid or noncanonical.
+    #[error("invalid risk policy field {field}: {message}")]
+    InvalidField {
+        /// Field path in the immutable wire.
+        field: &'static str,
+        /// Checked-constructor or canonicalization error.
+        message: String,
+    },
+    /// The executable-book binding did not use the required BLAKE3 form.
+    #[error("risk policy book digest must be a 64-character hexadecimal BLAKE3 digest")]
+    InvalidDigest,
+    /// The artifact bytes or reconstructed values differed from the canonical wire.
+    #[error("risk policy artifact is not canonically encoded")]
+    NonCanonicalEncoding,
+    /// The serialized digest did not match the recomputed canonical commitment.
+    #[error("risk policy artifact digest did not match canonical content")]
+    DigestMismatch,
 }
 
 impl RiskRequest {
@@ -1598,7 +1988,7 @@ mod tests {
 
     use super::{
         ConservativeCosts, ImpactBand, ImpactCurve, RiskEngine, RiskInputError, RiskLimits,
-        RiskRejection, RiskRequest, RiskSnapshot, VenueConstraints,
+        RiskPolicyWireError, RiskRejection, RiskRequest, RiskSnapshot, VenueConstraints,
     };
     use crate::domain::{Leverage, Market, Price, Side, Sleeve, Usdc};
     use crate::event::TimestampNs;
@@ -1834,6 +2224,84 @@ mod tests {
         assert_eq!(
             commitment,
             "ee42c395675ce042201689e6d17b22161b5bbef7bdcecd84b2142cf8a234ecb6"
+        );
+    }
+
+    #[test]
+    fn canonical_policy_wire_round_trips_all_frozen_risk_inputs() {
+        let policy = request(costs(), dec!(0.5)).into_policy();
+        let bytes = policy.canonical_json().expect("canonical policy wire");
+        let reopened = super::RiskPolicy::from_canonical_json(&bytes).expect("verified policy");
+
+        assert_eq!(reopened, policy);
+        assert_eq!(
+            reopened.canonical_digest().expect("canonical digest"),
+            policy.canonical_digest().expect("canonical digest")
+        );
+        assert_eq!(reopened.canonical_json().expect("canonical wire"), bytes);
+
+        let wire: serde_json::Value = serde_json::from_slice(&bytes).expect("policy JSON");
+        assert!(wire["constraints"]["maintenance_tiers"].is_array());
+        assert!(wire["costs"]["impact_curve"].is_array());
+        assert!(wire["costs"]["entry_fee_fraction"].is_string());
+        assert!(wire["costs"]["current_funding_fraction"].is_string());
+        assert!(wire["limits"]["risk_budget_usdc"].is_string());
+    }
+
+    #[test]
+    fn canonical_policy_wire_rejects_tampered_inputs_and_digest() {
+        let policy = request(costs(), dec!(0.5)).into_policy();
+        let text = String::from_utf8(policy.canonical_json().expect("canonical wire"))
+            .expect("UTF-8 JSON");
+
+        let changed_limit = text.replace(
+            "\"risk_budget_usdc\":\"0.5\"",
+            "\"risk_budget_usdc\":\"0.6\"",
+        );
+        assert_ne!(changed_limit, text);
+        assert_eq!(
+            super::RiskPolicy::from_canonical_json(changed_limit.as_bytes()),
+            Err(RiskPolicyWireError::DigestMismatch)
+        );
+
+        let forged_digest = text.replace("\"digest\":\"", "\"digest\":\"f");
+        assert_eq!(
+            super::RiskPolicy::from_canonical_json(forged_digest.as_bytes()),
+            Err(RiskPolicyWireError::DigestMismatch)
+        );
+    }
+
+    #[test]
+    fn canonical_policy_wire_rejects_noncanonical_and_unchecked_values() {
+        let policy = request(costs(), dec!(0.5)).into_policy();
+        let text = String::from_utf8(policy.canonical_json().expect("canonical wire"))
+            .expect("UTF-8 JSON");
+
+        let noncanonical_decimal = text.replace(
+            "\"entry_fee_fraction\":\"0.00075\"",
+            "\"entry_fee_fraction\":\"0.000750\"",
+        );
+        assert_eq!(
+            super::RiskPolicy::from_canonical_json(noncanonical_decimal.as_bytes()),
+            Err(RiskPolicyWireError::InvalidField {
+                field: "entry_fee_fraction",
+                message: "must use canonical normalized decimal syntax".to_owned(),
+            })
+        );
+
+        let invalid_leverage = text.replace("\"maximum_leverage\":20", "\"maximum_leverage\":4");
+        assert!(matches!(
+            super::RiskPolicy::from_canonical_json(invalid_leverage.as_bytes()),
+            Err(RiskPolicyWireError::InvalidField {
+                field: "maximum_leverage",
+                ..
+            })
+        ));
+
+        let unknown_field = format!("{},\"unexpected\":true}}", &text[..text.len() - 1]);
+        assert_eq!(
+            super::RiskPolicy::from_canonical_json(unknown_field.as_bytes()),
+            Err(RiskPolicyWireError::InvalidJson)
         );
     }
 
