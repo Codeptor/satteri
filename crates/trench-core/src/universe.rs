@@ -1396,7 +1396,7 @@ fn exclusion_reasons(
     candidate: &UniverseCandidate,
 ) -> Result<Vec<UniverseExclusionReason>, UniverseError> {
     let mut reasons = Vec::new();
-    if !candidate.is_native_perpetual() {
+    if candidate.market().as_str().contains(':') || !candidate.is_native_perpetual() {
         reasons.push(UniverseExclusionReason::NotNativePerpetual);
     }
     match candidate.availability().listing_state() {
@@ -2544,6 +2544,87 @@ mod tests {
                 .expect("old market must be represented")
                 .exclusion_reasons()
                 .contains(&UniverseExclusionReason::NotNativePerpetual)
+        );
+    }
+
+    #[test]
+    fn native_dynamic_20_10_gates() {
+        let cfg = crate::config::PaperConfig::from_toml(include_str!(
+            "../../../config/paper.example.toml"
+        ))
+        .expect("config must be valid");
+        assert_eq!(cfg.feed().tradeable_market_count(), 20);
+        assert_eq!(cfg.feed().warm_buffer_market_count(), 10);
+
+        let mut candidates = (1..=30)
+            .map(|index| candidate(&format!("N{index:02}"), index))
+            .collect::<Vec<_>>();
+        candidates.push(UniverseCandidate::new(
+            Market::new("xyz:SNDK").expect("market must be valid"),
+            true,
+            MarketDataAvailability::new(ListingState::Active, true, true, true, 20),
+            HistoryQuality::new(30, dec!(0.995), true, dec!(1)).expect("history must be valid"),
+            UniverseLiquidity::new(
+                Usdc::new(dec!(10_000_000)).expect("volume must be valid"),
+                Usdc::new(dec!(5_000_000)).expect("oi must be valid"),
+                Bps::new(dec!(10)).expect("spread must be valid"),
+                DepthProfile::new(
+                    SidedDepth::new(
+                        Usdc::new(dec!(60_000)).expect("depth must be valid"),
+                        Usdc::new(dec!(70_000)).expect("depth must be valid"),
+                        Usdc::new(dec!(80_000)).expect("depth must be valid"),
+                    )
+                    .expect("depth must be valid"),
+                    SidedDepth::new(
+                        Usdc::new(dec!(60_000)).expect("depth must be valid"),
+                        Usdc::new(dec!(70_000)).expect("depth must be valid"),
+                        Usdc::new(dec!(80_000)).expect("depth must be valid"),
+                    )
+                    .expect("depth must be valid"),
+                ),
+            ),
+        ));
+
+        let snapshot = UniverseSelector::select(timestamp(HOUR_NS), candidates)
+            .expect("selection must be valid");
+        let tradeable = snapshot
+            .entries()
+            .filter(|entry| entry.membership() == Membership::Tradeable)
+            .collect::<Vec<_>>();
+        let warm = snapshot
+            .entries()
+            .filter(|entry| entry.membership() == Membership::Warm)
+            .collect::<Vec<_>>();
+
+        assert_eq!(tradeable.len(), 20, "native tradeable must be 20");
+        assert_eq!(warm.len(), 10, "native warm must be 10");
+        assert!(
+            tradeable
+                .iter()
+                .all(|entry| !entry.market().as_str().contains(':')),
+            "HIP-3 dex-qualified markets must not be tradeable"
+        );
+        assert!(
+            warm.iter()
+                .all(|entry| !entry.market().as_str().contains(':')),
+            "HIP-3 dex-qualified markets must not be warm"
+        );
+        let sndk = snapshot
+            .entry(&Market::new("xyz:SNDK").expect("market must be valid"))
+            .expect("SNDK must be represented");
+        assert!(
+            sndk.exclusion_reasons()
+                .contains(&UniverseExclusionReason::NotNativePerpetual),
+            "dex-qualified SNDK must be excluded via NotNativePerpetual"
+        );
+        assert_eq!(sndk.membership(), Membership::Absent);
+        assert!(
+            sndk.exclusion_reasons()
+                .iter()
+                .filter(|reason| **reason == UniverseExclusionReason::NotNativePerpetual)
+                .count()
+                == 1,
+            "NotNativePerpetual must appear exactly once"
         );
     }
 }
