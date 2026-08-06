@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a deterministic, paper-only Rust service that ingests public Hyperliquid data and runs the independently accounted `rules_only` strategy through realistic risk and execution simulation.
+**Goal:** Build a deterministic, paper-only Rust service that ingests public Hyperliquid native and HIP-3 perp-DEX data and runs the independently accounted `rules_only` strategy through realistic risk and execution simulation.
 
 **Architecture:** A pure `trench-core` crate owns deterministic domain logic, features, rules, risk, fills, and ledger transitions. Read-only venue I/O lives in `trench-hyperliquid`, persistence lives in `trench-storage`, and the `trenchd` binary is the only async orchestrator and SQLite writer. Raw analytical events go to atomic Parquet partitions; transactional decisions go through one SQLite WAL writer.
 
@@ -12,7 +12,7 @@
 
 ## Scope and execution order
 
-This is phase 1 of the approved [paper-bot design](../specs/2026-08-03-trench-paper-trading-bot-design.md). It produces a complete `rules_only` paper bot and deterministic replay tool. It deliberately does not create Python, ML, Telegram, wallet, signing, Trench order-submission, or Hyperliquid `/exchange` code. Run this plan before the ML and VPS plans.
+This is phase 1 of the approved [paper-bot design](../specs/2026-08-03-trench-paper-trading-bot-design.md). It produces a complete `rules_only` paper bot and deterministic replay tool across native and eligible HIP-3 perp DEXes. It deliberately does not create Python, ML, Telegram, wallet, signing, Trench order-submission, or Hyperliquid `/exchange` code. Run this plan before the ML and VPS plans.
 
 Use `@test-driven-development`, `@rust-best-practices`, `@rust-async-patterns`, `@api-security-best-practices`, and `@SQLite Database Expert` while executing. Never modify or commit operator-supplied package and reference inputs kept outside version control.
 
@@ -35,7 +35,7 @@ crates/trench-core/
   src/event.rs                                 normalized point-in-time market events
   src/book.rs                                  order-book state and deterministic depth walking
   src/candle.rs                                trade aggregation and completed bars
-  src/universe.rs                              hourly hard gates and liquidity ranking
+  src/universe.rs                              hourly native + HIP-3 hard gates and liquidity ranking
   src/features/mod.rs                          point-in-time feature snapshot API
   src/features/common.rs                       indicators shared by both future strategies
   src/features/rules.rs                        six interpretable signal families
@@ -56,7 +56,7 @@ crates/trench-core/
 crates/trench-hyperliquid/
   Cargo.toml
   src/lib.rs                                   exports only read-only clients
-  src/info.rs                                  `/info` REST requests and response types
+  src/info.rs                                  `/info` REST requests, DEX qualification, and response types
   src/ws.rs                                    public WebSocket subscriptions/reconnect
   src/archive.rs                               explicit local official-archive importer
   src/normalize.rs                             wire payload to trench-core event conversion
@@ -82,6 +82,7 @@ tests/fixtures/
   stream/basic.jsonl                           deterministic captured-event fixture
   stream/gap-and-partial.jsonl                 gap/partial-exit fixture
   meta/native-perps.json                       point-in-time metadata fixture
+  meta/hip3-perps.json                         point-in-time HIP-3 DEX/status/oracle fixture
 ```
 
 ## Invariants used by every task
@@ -275,10 +276,11 @@ git commit -m "feat(storage): add atomic SQLite event journal"
 - Modify: `crates/trench-hyperliquid/src/lib.rs`
 - Create: `crates/trench-hyperliquid/tests/read_only_surface.rs`
 - Create: `tests/fixtures/meta/native-perps.json`
+- Create: `tests/fixtures/meta/hip3-perps.json`
 
 - [ ] **Step 1: Write failing fixture and endpoint tests**
 
-Use `wiremock` to require `POST /info` with only these request variants: `metaAndAssetCtxs`, `allMids`, `l2Book`, `candleSnapshot`, and historical funding. Deserialize the fixture and assert BTC/ETH/SOL are ordinary native-perp rows with point-in-time leverage/precision. Assert the public client base type exposes no action URL or signer.
+Use `wiremock` to require only read-only `POST /info` variants: `perpDexs`, `allPerpMetas`, `perpDexStatus`, `perpDexLimits`, DEX-qualified `metaAndAssetCtxs`, `allMids`, `l2Book`, `candleSnapshot`, and historical funding. Deserialize both fixtures and assert BTC/ETH/SOL are native-perp rows while `xyz:SNDK` retains its DEX-qualified identity, isolated-only mode, oracle/context fields, fee/limit metadata, and point-in-time leverage/precision. Assert the public client base type exposes no action URL or signer.
 
 - [ ] **Step 2: Verify failure**
 
@@ -288,7 +290,7 @@ Expected: FAIL because `InfoClient` is absent.
 
 - [ ] **Step 3: Implement the constrained client**
 
-`InfoClient` owns one validated HTTPS `/info` URL and `reqwest::Client`; the URL constructor must require HTTPS except in tests. Model decimal strings as strings at the wire boundary and convert through checked domain constructors. Set connect/request deadlines, a descriptive user agent, bounded response size, and explicit status/body errors. Do not add a generic JSON request method to the public API.
+`InfoClient` owns one validated HTTPS `/info` URL and `reqwest::Client`; the URL constructor must require HTTPS except in tests. Model decimal strings as strings at the wire boundary and convert through checked domain constructors. Set connect/request deadlines, a descriptive user agent, bounded response size, and explicit status/body errors. Require an explicit DEX parameter for HIP-3 requests and preserve `(perp_dex, coin)` in every normalized response. Do not add a generic JSON request method to the public API.
 
 - [ ] **Step 4: Test malformed and oversized responses**
 
@@ -452,16 +454,16 @@ git add crates/trench-hyperliquid
 git commit -m "feat(data): reconcile market data gaps"
 ```
 
-### Task 8: Implement the dynamic native-perp universe
+### Task 8: Implement the dynamic native + HIP-3 perp universe
 
 **Files:**
 - Create: `crates/trench-core/src/universe.rs`
 - Modify: `crates/trench-core/src/lib.rs`
-- Test: inline unit tests using `tests/fixtures/meta/native-perps.json`
+- Test: inline unit tests using `tests/fixtures/meta/native-perps.json` and `tests/fixtures/meta/hip3-perps.json`
 
 - [ ] **Step 1: Write failing hard-gate and ranking tests**
 
-Cover every hard gate from design section 6.2. Construct 31 eligible markets with tied metrics and prove deterministic market-symbol tie-breaking, ranks 1-20 tradeable, 21-30 warm-only, and 31 absent. Prove a hard-gate failure removes a member immediately while a rank change activates only at the next completed strategy bar. BTC, ETH, and SOL must pass or fail by identical logic.
+Cover every common and venue-specific hard gate from design section 6.2. Construct native and HIP-3 candidates with tied metrics and prove deterministic `(perp_dex, coin)` tie-breaking, ranks 1-20 tradeable, 21-30 warm-only, and 31 absent. Prove a DEX status/oracle/fee/OI failure removes only that DEX's members immediately while a rank change activates only at the next completed strategy bar. BTC, ETH, SOL, XRP, and `xyz:SNDK` must pass or fail by declared gates, never by symbol special cases.
 
 - [ ] **Step 2: Verify failure**
 
@@ -471,7 +473,7 @@ Expected: FAIL because `UniverseSelector` is absent.
 
 - [ ] **Step 3: Implement structural eligibility and frozen scoring**
 
-Use the fixed 500 USDC probe and exact hard thresholds. Compute robust cross-sectional percentiles and score `0.30*volume + 0.20*OI + 0.30*inverse_spread + 0.15*depth + 0.05*continuity`. Return a complete snapshot with metric inputs, ranks, memberships, and machine-readable exclusion reasons. The selector accepts an explicit hourly timestamp and point-in-time history coverage; it has no strategy/risk input.
+Use the fixed 500 USDC probe and exact hard thresholds. Apply common gates first, then native or HIP-3 venue gates for status, isolated margin, oracle freshness/divergence, fee scale, session availability, and DEX/asset OI capacity. Compute robust cross-sectional percentiles and score `0.30*volume + 0.20*OI + 0.30*inverse_spread + 0.15*depth + 0.05*continuity` only after conservative venue costs are known. Return a complete snapshot with DEX/venue-family inputs, ranks, memberships, and machine-readable exclusion reasons. The selector accepts an explicit hourly timestamp and point-in-time history coverage; it has no strategy/risk input.
 
 - [ ] **Step 4: Run universe tests**
 
@@ -483,7 +485,47 @@ Expected: PASS with stable ordering.
 
 ```bash
 git add crates/trench-core
-git commit -m "feat(universe): select deep native perp markets"
+git commit -m "feat(universe): select deep native and HIP-3 perp markets"
+```
+
+### Task 8A: Add HIP-3 status, oracle, fee, and settlement witnesses
+
+**Files:**
+- Modify: `crates/trench-core/src/domain.rs`
+- Modify: `crates/trench-core/src/config.rs`
+- Modify: `crates/trench-core/src/event.rs`
+- Modify: `crates/trench-hyperliquid/src/info.rs`
+- Modify: `crates/trench-hyperliquid/src/ws.rs`
+- Modify: `crates/trench-hyperliquid/src/normalize.rs`
+- Modify: `crates/trenchd/src/readiness.rs`
+- Test: DEX-qualified replay and readiness fixtures
+
+- [ ] **Step 1: Write failing HIP-3 safety tests**
+
+Prove that a qualified asset ID cannot collide with a native symbol; stale or
+divergent oracle context blocks fresh entries; an inactive/settled DEX blocks
+only its markets; unknown fee scale or exhausted OI capacity rejects the
+candidate; isolated-only metadata is required; and a halt/settlement event
+produces a durable mandatory-exit/venue-settlement transition rather than a
+synthetic book fill.
+
+- [ ] **Step 2: Implement typed venue witnesses**
+
+Normalize DEX status, oracle heartbeat/source, external price, fee scale,
+collateral, margin mode, asset/DEX OI caps, and halt/settlement transitions as
+explicit events. Persist their source and availability timestamps and bind
+them into universe, risk, replay, and artifact digests. A HIP-3 readiness
+failure is scoped to the affected DEX/market unless it is a global storage or
+connection failure.
+
+- [ ] **Step 3: Run focused tests and commit**
+
+```bash
+cargo test -p trench-core hip3
+cargo test -p trench-hyperliquid --test read_only_surface
+cargo test -p trenchd readiness::tests
+git add crates/trench-core crates/trench-hyperliquid crates/trenchd
+git commit -m "feat(hip3): enforce venue and oracle witnesses"
 ```
 
 ### Task 9: Implement the auditable rules strategy
@@ -836,7 +878,7 @@ Assert each outer fold uses 305 development days, 60 chronological no-tuning cal
 
 - [ ] **Step 2: Write a failing authoritative-selection test**
 
-Replay every candidate/fold through the same universe, sealed risk quote, paper broker, executable-book marking, fees, funding, and ledger engine used at runtime. Assert selection uses median inner-fold net expectancy then lower turnover, never calibration/test outcomes. Require three outer tests and 100 aggregate closed trades before forward eligibility; insufficient trustworthy history returns a hard ineligible report.
+Replay every candidate/fold through the same native + HIP-3 universe, sealed risk quote, paper broker, executable-book marking, venue-qualified fees, funding, oracle/status handling, and ledger engine used at runtime. Assert selection uses median inner-fold net expectancy then lower turnover, never calibration/test outcomes. Emit native, HIP-3 DEX, and combined descriptive slices; require every included HIP-3 DEX/asset to pass its own fee/oracle/status/OI/settlement checks rather than allowing aggregate performance to hide a venue failure. Require three outer tests and 100 aggregate closed trades before forward eligibility; insufficient trustworthy history returns a hard ineligible report.
 
 - [ ] **Step 3: Verify failure**
 
@@ -871,4 +913,4 @@ git commit -m "feat(research): validate and freeze rules strategy"
 
 ## Phase-1 completion gate
 
-Phase 1 is complete only when the workspace gate passes, both golden replays are deterministic, `rules_only` can collect public data and maintain an auditable 100-USDC ledger, failures preserve or force-close exposure exactly as specified, the static boundary check proves no live-action or Telegram surface exists, and the rules research command either produces a valid frozen outer-fold artifact or truthfully reports insufficient history. Statistical robustness, generic replacement shadows, and final forward promotion are completed in phase 2; do not begin that plan against a failing phase-1 baseline.
+Phase 1 is complete only when the workspace gate passes, both golden replays are deterministic, `rules_only` can collect native and DEX-qualified HIP-3 public data and maintain an auditable 100-USDC ledger, venue-specific failures preserve or force-close exposure exactly as specified, the static boundary check proves no live-action or Telegram surface exists, and the rules research command either produces valid frozen outer-fold artifacts or truthfully reports insufficient history per venue family. Statistical robustness, generic replacement shadows, and final forward promotion are completed in phase 2; do not begin that plan against a failing phase-1 baseline.

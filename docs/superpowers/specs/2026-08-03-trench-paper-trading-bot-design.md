@@ -2,6 +2,7 @@
 
 **Date:** 2026-08-03
 **Status:** Approved
+**Last revised:** 2026-08-06 (HIP-3 venue-family extension)
 **Project root:** repository root (`./`)
 
 ## 1. Decision summary
@@ -11,7 +12,7 @@ Build a paper-only, market-data-driven perpetual-futures research and execution 
 1. `rules_only`
 2. `ml_champion`
 
-Each ledger starts with exactly 100 synthetic USDC. Both receive the same point-in-time market events and the same paper-broker and risk rules, but they never share signals, positions, PnL, loss limits, or model output. The system may trade long or short across a dynamic universe that includes SOL whenever it passes the same liquidity rules as every other asset.
+Each ledger starts with exactly 100 synthetic USDC. Both receive the same point-in-time market events and the same paper-broker and risk rules, but they never share signals, positions, PnL, loss limits, or model output. The system may trade long or short across a dynamic universe of native and HIP-3 perpetuals. Every candidate retains its perp DEX identity and must pass venue-specific oracle, status, fee, margin, history, and liquidity gates; HIP-3 volume alone never makes a market eligible.
 
 The first deployment uses public Hyperliquid mainnet data and cannot send an order. It has no wallet address requirement, signer, private key, builder-fee approval, deposit, faucet balance, or live executor. Adaptive isolated leverage from 5x through 20x is simulated and validated; it does not authorize live leverage.
 
@@ -21,7 +22,7 @@ Telegram is completely outside this project. There is no Telegram credential sch
 
 - Produce deterministic, replayable paper execution from real public market data.
 - Compare an interpretable multi-timeframe rules strategy with a separately validated ML strategy.
-- Monitor every listed native perp cheaply, then concentrate detailed analysis on a dynamic deep-liquidity universe.
+- Monitor every listed perp across supported perp DEXes cheaply, then concentrate detailed analysis on a dynamic deep-liquidity universe.
 - Model fees, spread, book depth, slippage, latency, funding, partial fills, and liquidation before attributing alpha.
 - Protect a 100 USDC account with hard, strategy-independent risk constraints.
 - Support 15-minute and 1-hour decision sleeves without allowing simultaneous positions within one ledger.
@@ -36,7 +37,7 @@ Telegram is completely outside this project. There is no Telegram credential sch
 - Telegram or any human-call ledger.
 - Market making, sub-second/HFT execution, or running a Hyperliquid node.
 - Spot trading, options, portfolio margin, cross margin, or multi-position portfolios.
-- HIP-3/deployer perps in the first universe. Their venue-specific fees and historical coverage require separate validation.
+- Treating native and HIP-3 perps as interchangeable. HIP-3 markets are included as a separately gated venue family and require their own fee, oracle, status, halt/settlement, and historical-coverage evidence.
 - Online learning or self-modifying strategy parameters.
 - Using an LLM to generate trades.
 - Storing unbounded raw order-book data.
@@ -51,6 +52,7 @@ The supplied `@trench/perps-sdk` v0.1.0 package materials expose REST reads and 
 Therefore:
 
 - Rust consumes Hyperliquid public REST and WebSocket APIs directly for research and paper trading.
+- The read-only adapter must query the perp-DEX list/status/limits and the `dex`-qualified metadata/context surfaces required for HIP-3; native-perp requests use the default DEX.
 - The Trench SDK is the eventual live-action adapter, not the market-data engine.
 - A Bun/TypeScript `trench-executor` remains a future process boundary only. It is absent from the paper deployment and cannot be reached by the paper daemon.
 - The paper build must not import a private-key signer, expose an `/exchange` action path, or accept wallet-related environment variables.
@@ -123,19 +125,23 @@ An open position can always enter mandatory-exit handling when an executable boo
 
 ### 6.1 Feeds
 
-Use public mainnet data without an account:
+Use public mainnet data without an account. A market identity is `(perp_dex, coin)`: the native DEX uses an empty `perp_dex`, while a HIP-3 asset is serialized with its DEX prefix (for example, `xyz:SNDK`).
 
 - `allMids` for cheap whole-universe monitoring.
-- `metaAndAssetCtxs`/perp metadata for listing state, size precision, maximum leverage, day notional volume, open interest, funding, mark, oracle, and impact prices.
+- `perpDexs`, `allPerpMetas`, `perpDexStatus`, and `perpDexLimits` for the supported DEX set, DEX health, collateral/margin constraints, and open-interest limits.
+- `metaAndAssetCtxs`/perp metadata for listing state, size precision, maximum leverage, day notional volume, open interest, funding, mark, oracle, external price, and impact prices. HIP-3 requests always include the qualified `dex` parameter.
 - `l2Book`, `bbo`, and `trades` for detailed execution and microstructure data.
+- `allDexsAssetCtxs` or the equivalent DEX-qualified WebSocket subscriptions for live HIP-3 context; a native-only subscription is not sufficient for a HIP-3 candidate.
 - 15-minute and 1-hour candles, derived from normalized trades and reconciled against exchange candles.
-- Historical L2 snapshots and asset contexts from the official requester-pays archive where needed, while treating missing/archive-lagged periods as unavailable rather than imputing them optimistically.
+- Historical L2 snapshots and asset contexts from the official requester-pays archive where available, while treating missing/archive-lagged HIP-3 periods as unavailable rather than imputing them optimistically. The API's funding-history surface is used for each DEX; candles remain derived/reconciled data, not a substitute for missing books.
 
-All internal timestamps are UTC. Exchange time is authoritative for event ordering; local receipt time is retained to measure latency. Duplicate trades use `(block_time, coin, tid)` as the identity. Candle identity is `(coin, interval, open_time)`.
+All internal timestamps are UTC. Exchange time is authoritative for event ordering; local receipt time is retained to measure latency. Duplicate trades use `(perp_dex, block_time, coin, tid)` as the identity. Candle identity is `(perp_dex, coin, interval, open_time)`.
 
-### 6.2 Eligibility
+### 6.2 Eligibility and venue families
 
-The first version considers native perps only. Discovery runs hourly using only information available at that time. Structural eligibility is intentionally independent of strategy output and risk sizing. A market must satisfy every hard gate:
+Discovery runs hourly using only information available at that time. Structural eligibility is independent of strategy output and risk sizing. Native and HIP-3 candidates share the common gates below, but HIP-3 candidates must additionally pass the explicit venue-family gates that follow. A single DEX status/oracle failure removes only that DEX's candidates; it does not block healthy native markets.
+
+Every candidate must satisfy the common hard gates:
 
 - not delisted or paused;
 - live mid, mark, and metadata;
@@ -147,19 +153,31 @@ The first version considers native perps only. Discovery runs hourly using only 
 - median effective spread no greater than 15 bps;
 - executable depth inside 50 bps at least 100 times a fixed 500 USDC probe notional.
 
-Eligible markets receive a robust liquidity score: 30% trailing notional-volume percentile, 20% open-interest percentile, 30% inverse effective-spread percentile, 15% depth percentile at 10/25/50 bps, and 5% feed continuity/freshness. Percentile values are computed cross-sectionally from the structurally eligible set and the formula is frozen for the run.
+Native candidates use the default perp DEX and its point-in-time margin/fee metadata. HIP-3 candidates must also satisfy all of the following:
 
-The tradeable universe is exactly ranks 1-20 at the latest completed hourly snapshot. Ranks 21-30 form a non-tradeable warm buffer that retains detailed subscriptions and features to make later entry deterministic. A hard-gate failure removes a market immediately from both sets; there is no delayed grace period. Hourly rank changes become tradeable at the next completed strategy bar. Trade-time cost and depth are then recomputed at the risk-sized notional; failing either check rejects that intent without changing universe rank.
+- the perp DEX is active according to `perpDexStatus`, its collateral asset is accepted, and the asset is not halted or in settlement;
+- the market is isolated-only (the simulator rejects any HIP-3 metadata that would permit or require cross margin);
+- oracle, external-perp, mark, and local executable prices are present, causally timestamped, and fresh; a missing update beyond the venue's documented stale-price boundary is an immediate exclusion;
+- the oracle source identity and update cadence are recorded, and mark/oracle/external-price divergence stays inside the frozen artifact's stress bound;
+- the asset and DEX open-interest limits are known from metadata, and the available cap exceeds the risk-sized probe with the configured safety buffer;
+- the exact venue fee scale and any deployer fee are known at the decision time. The published HIP-3 rule is two times the usual validator-operated perp fee, but the simulator uses the higher of the published rule and the point-in-time metadata rather than assuming a discount;
+- underlying/session availability and oracle availability are represented as typed exclusions. No bar, funding path, or fill is synthesized across a closed or unavailable source interval.
 
-Every universe snapshot and exclusion reason is stored. Backtests reconstruct the point-in-time universe; they may not use today's listings or liquidity to select historical assets. BTC, ETH, and SOL receive no special treatment.
+Eligible markets receive a robust liquidity score: 30% trailing notional-volume percentile, 20% open-interest percentile, 30% inverse effective-spread percentile, 15% depth percentile at 10/25/50 bps, and 5% feed continuity/freshness. The score is evaluated only after venue-specific fee and status gates, so HIP-3 turnover cannot outrank a native market solely because it ignores higher execution costs. Percentile values are computed cross-sectionally from the structurally eligible set and the formula is frozen for the run. Reports retain native-vs-HIP-3 and per-DEX sub-scores.
+
+The combined tradeable universe is exactly ranks 1-20 at the latest completed hourly snapshot. Ranks 21-30 form a non-tradeable warm buffer that retains detailed subscriptions and features to make later entry deterministic. Every snapshot carries the DEX and venue-family identity, and every DEX-level status transition is persisted. A hard-gate failure removes a market immediately from both sets; there is no delayed grace period. Hourly rank changes become tradeable at the next completed strategy bar. Trade-time cost, oracle freshness, status, OI capacity, and depth are recomputed at the risk-sized notional; failing any check rejects that intent without changing universe rank.
+
+Every universe snapshot and exclusion reason is stored. Backtests reconstruct the point-in-time universe; they may not use today's listings or liquidity to select historical assets. BTC, ETH, SOL, XRP, SNDK, or any other symbol receives no special treatment.
 
 ### 6.3 Data quality behavior
 
 - A WebSocket disconnect stops new entries immediately.
 - Reconnect obtains a fresh snapshot, backfills recoverable gaps, and rebuilds indicators before readiness returns.
 - Stale books, crossed books, non-monotonic timestamps, missing candles, or abnormal price jumps quarantine that market.
+- A stale/missing HIP-3 oracle, DEX halt, settlement transition, collateral-status change, or exhausted OI cap quarantines the affected market/DEX and blocks fresh entries there.
 - No mid-price fallback is allowed for execution when a valid book is absent.
 - Open paper positions remain recorded during a gap; stops are executed at the first subsequent executable price and the gap is flagged. The simulator never invents a favorable fill.
+- If a HIP-3 market is halted or settled, the paper ledger records a venue-settlement event at the authoritative mark when available; otherwise it remains unresolved and fails validation rather than inventing an exit fill.
 
 ## 7. Decision model
 
@@ -303,17 +321,24 @@ Every accepted trade also records counterfactual margin, liquidation path, retur
 
 ### 8.3 Margin mode
 
-All simulated positions use isolated margin. Cross margin and portfolio margin are invalid configuration values. A future live adapter must issue `updateLeverage(..., mode: "isolated")` and reconcile the venue response before entry, but this action is outside the paper milestone.
+All simulated positions use isolated margin. Cross margin and portfolio margin are invalid configuration values. This is mandatory for HIP-3 because builder-deployed perps are isolated-only under the current protocol. A future live adapter must issue `updateLeverage(..., mode: "isolated")` and reconcile the venue response before entry, but this action is outside the paper milestone.
 
 ## 9. Paper execution
 
 ### 9.1 Cost model
 
-Primary results assume taker execution at the lowest Hyperliquid fee tier:
+Primary results use the point-in-time venue fee snapshot for the candidate. The current native-perp baseline is the lowest Hyperliquid taker tier:
 
 - Hyperliquid perp taker fee: 4.5 bps per side.
 - Trench builder fee: 3.0 bps per filled order, frozen from the supplied `@trench/perps-sdk` v0.1.0 package materials as a paper-simulation assumption rather than a public venue-fee claim.
 - Fixed fee subtotal: 7.5 bps per side, approximately 15 bps round trip before spread, depth slippage, latency, and funding.
+
+HIP-3 uses a venue-qualified fee path:
+
+- The published HIP-3 user fee rule is 2x the usual validator-operated perp fee; at the current native baseline that is 9 bps per side before the Trench paper builder-fee assumption.
+- The simulator records the exact DEX/asset fee scale and deployer fee when exposed by metadata and uses the greater conservative value if the rule and metadata disagree.
+- A missing, stale, or ambiguous HIP-3 fee snapshot makes the candidate ineligible. Native fee assumptions are never silently reused for HIP-3.
+- Reports separate native venue fees, HIP-3 venue/deployer fees, the Trench paper builder fee, spread, depth, latency, funding, and any halt/settlement loss.
 
 The fee schedule and any asset-specific fee modifier are snapshotted with each run. Unknown fee state uses the more expensive plausible value or makes the asset ineligible. Discounts, staking, referrals, and maker rebates are not assumed.
 
@@ -351,8 +376,10 @@ Rules and ML are validated separately. Shared dates, data, and costs are permitt
 - Within the 305 development days, four expanding inner folds train on days 1-185, 1-215, 1-245, and 1-275 respectively and validate on each following 30-day block. The selected configuration is refit on all 305 development days; ML calibration alone uses the next 60 days.
 - Purging removes samples whose four-bar label/holding horizon overlaps the next fold; a four-hour embargo is applied at every boundary.
 - Universe membership, scalers, feature selection, hyperparameters, calibration, and thresholds are fit only within each training fold.
+- Market keys include `(perp_dex, coin)` in every fold, feature, cost, funding, and label join. Native data may not be substituted for HIP-3 data, and one HIP-3 DEX may not borrow another DEX's oracle, fee, or continuity history.
+- Native and HIP-3 results are reported separately as primary slices. A combined report is descriptive only; a HIP-3 DEX/asset cannot pass promotion from aggregate performance that hides its own fee, oracle, halt, OI-cap, or settlement failures.
 - At least three outer test folds and 100 aggregate closed trades are required before a version may enter forward paper evaluation. Test windows are concatenated once for evaluation and never reused for tuning.
-- Delisted/new assets and missing-history periods remain point-in-time correct.
+- Delisted/new assets, HIP-3 DEX deployments, halt/settlement periods, and missing-history periods remain point-in-time correct. Insufficient HIP-3 history means forward collection only, not synthetic backfill or automatic promotion.
 - Every experiment stores code commit, data manifest, universe snapshots, config hash, random seeds, model digest, and package lock.
 
 Insufficient trustworthy history is a hard research failure, not permission to shorten a fold or fill gaps synthetically. The daemon may collect forward data while a strategy remains ineligible for promotion.
@@ -461,6 +488,7 @@ Required alerts include process restart loops, WS disconnect/gap, stale market, 
 ### Rust
 
 - Unit tests for feature math, event ordering, universe gates, fee/funding/PnL math, isolated sizing, leverage selection, liquidation distance, breakers, and ledger independence.
+- HIP-3-specific tests for DEX-qualified asset IDs, status/oracle freshness, fee scaling, isolated-only metadata, OI-cap rejection, halt/settlement handling, and native/HIP-3 ledger and replay separation.
 - Property tests for conservation of cash/equity, no position above limits, no negative fill size, monotonic loss budgets, and deterministic replay.
 - Golden recorded-stream replays with byte-stable ledger outcomes for a fixed build/config.
 - Integration tests for snapshot/reconnect/backfill, duplicates, out-of-order events, partial fills, price gaps, SQLite restart, and Parquet crash recovery.
@@ -483,7 +511,7 @@ Required alerts include process restart loops, WS disconnect/gap, stale market, 
 ## 14. Acceptance criteria for the paper milestone
 
 - Continuous public mainnet market ingestion with automatic reconnect and explicit gap accounting.
-- Hourly point-in-time universe selection with SOL treated like every other market.
+- Hourly point-in-time universe selection across native and eligible HIP-3 perps, with SOL, XRP, SNDK, and every other market treated by the same declared score plus their venue-specific gates.
 - Independent `rules_only` and `ml_champion` ledgers, each starting at 100.00 USDC.
 - 15-minute and 1-hour sleeves produce auditable signals without cross-strategy leakage.
 - All orders pass the stated isolated 5x–20x risk engine and realistic paper broker.
@@ -512,6 +540,10 @@ Required alerts include process restart loops, WS disconnect/gap, stale market, 
 - [Hyperliquid WebSocket API](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket)
 - [Hyperliquid WebSocket subscriptions](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions)
 - [Hyperliquid perpetual metadata](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals)
+- [Hyperliquid HIP-3 builder-deployed perpetuals](https://hyperliquid.gitbook.io/hyperliquid-docs/hyperliquid-improvement-proposals-hips/hip-3-builder-deployed-perpetuals)
+- [Hyperliquid HIP-3 deployer actions, oracle updates, and OI caps](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/hip-3-deployer-actions)
+- [Hyperliquid asset IDs](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/asset-ids)
+- [Hyperliquid protocol risks](https://hyperliquid.gitbook.io/hyperliquid-docs/risks)
 - [Hyperliquid fee schedule](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees)
 - [Hyperliquid liquidations](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/liquidations)
 - [Hyperliquid margin tiers](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/margin-tiers)
